@@ -351,3 +351,37 @@ class OnboardingJob(StrictModel):
     user_id: uuid.UUID
     profile_version: int = Field(ge=1)
     profile: OnboardingProfile
+
+
+class RepositorySearchFilters(StrictModel):
+    # Language is the indexed primary language; topics use canonical slugs.
+    languages: list[Annotated[str, StringConstraints(min_length=1, max_length=64)]] = Field(default_factory=list, max_length=10)
+    topics: list[Annotated[str, StringConstraints(min_length=1, max_length=100, pattern=r"^[a-z0-9][a-z0-9-]*$")]] = Field(default_factory=list, max_length=10)
+
+
+class RepositorySearchRequest(StrictModel):
+    schema_version: Literal[2]
+    search_id: uuid.UUID
+    query: Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=512)]
+    limit: int = Field(ge=1, le=100, strict=True)
+    exclude_repo_ids: list[uuid.UUID] = Field(default_factory=list, max_length=500)
+    filters: RepositorySearchFilters = Field(default_factory=RepositorySearchFilters)
+
+    @field_validator("exclude_repo_ids")
+    @classmethod
+    def unique_search_exclusions(cls, values: list[uuid.UUID]) -> list[uuid.UUID]:
+        if len(set(values)) != len(values):
+            raise ValueError("repository exclusions must be unique")
+        return values
+
+
+class RepositorySearchHit(StrictModel):
+    repo_id: uuid.UUID
+    score: float = Field(ge=-1.0, le=1.0, allow_inf_nan=False)
+
+
+class RepositorySearchResponse(StrictModel):
+    schema_version: Literal[2]
+    search_id: uuid.UUID
+    embedding_version: ShortText
+    items: list[RepositorySearchHit] = Field(max_length=100)

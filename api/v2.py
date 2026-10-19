@@ -19,6 +19,8 @@ from api.contracts import (
     RepositoryJob,
     RepositoryFeaturePatch,
     RepositoryRefreshJob,
+    RepositorySearchRequest,
+    RepositorySearchResponse,
 )
 from api.runtime import (
     ServiceCapacityError,
@@ -31,6 +33,7 @@ from api.runtime import (
 from api.metrics import record_recommendation, render_prometheus
 from config import constant_time_secret_matches, internal_api_header_name
 from embedding.qdrant_store import QdrantRepositoryStore
+from embedding.embeddings import SentenceTransformerEmbedder
 from embedding.runtime import (
     EmbeddingCapacityError,
     EmbeddingDeadlineExceeded,
@@ -38,6 +41,7 @@ from embedding.runtime import (
     embedding_timeout_seconds,
     embedding_warmup_enabled,
     repository_embedding_pipeline,
+    shared_embedding_model,
     run_embedding_job,
     shutdown_embedding_runtime,
     user_onboarding_pipeline,
@@ -1077,3 +1081,18 @@ async def metrics() -> PlainTextResponse:
         ),
         media_type="text/plain; version=0.0.4; charset=utf-8",
     )
+
+
+def _search_repository_job(request: RepositorySearchRequest):
+    from api.search import search_repositories
+    return search_repositories(request, retriever(), SentenceTransformerEmbedder(model=shared_embedding_model()))
+
+
+@router.post("/search/repositories", response_model=RepositorySearchResponse, dependencies=[Depends(require_internal_secret)])
+async def repository_search(request: RepositorySearchRequest):
+    try:
+        return await asyncio.wait_for(run_embedding_job(_search_repository_job, request), timeout=4.0)
+    except (asyncio.TimeoutError, EmbeddingCapacityError) as exc:
+        raise HTTPException(status_code=503, detail="Semantic search is temporarily unavailable.") from exc
+    except Exception as exc:
+        raise _operation_error("repository_search", exc, request_id=str(request.search_id)) from exc
