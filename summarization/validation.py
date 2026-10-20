@@ -36,6 +36,8 @@ _README_SECTION = re.compile(
 )
 _WORD = re.compile(r"[a-z0-9]+(?:['’-][a-z0-9]+)?", re.IGNORECASE)
 _SENTENCE_END = re.compile(r"[.!?](?:[\"')\]]+)?(?=\s|$)")
+_HTML = re.compile(r"<(?:/?[A-Za-z]|!)[^<>]*>")
+_IDENTIFIER = re.compile(r"\w+")
 
 
 class SummaryValidationError(ValueError):
@@ -119,11 +121,56 @@ def _near_copy(summary: str, source: str) -> bool:
     )
 
 
+def _contains_inline_formatting(value: str) -> bool:
+    """Find paired emphasis/HTML with one scan, preserving Python identifiers."""
+    value = value[:MAX_PREPROCESS_CHARS]
+    if _HTML.search(value):
+        return True
+    # A standalone __identifier__ is valid Python prose. Protect complete word
+    # tokens, while multiword __emphasized phrases__ remain formatting.
+    identifiers: dict[int, int] = {}
+    for match in _IDENTIFIER.finditer(value):
+        token = match.group(0)
+        if len(token) > 4 and token.startswith("__") and token.endswith("__") and token[2:-2].isidentifier():
+            identifiers[match.start()] = match.end()
+
+    openers: set[str] = set()
+    index = 0
+    while index < len(value):
+        if index in identifiers:
+            index = identifiers[index]
+            continue
+        marker = value[index]
+        if marker == "\\":
+            index += 2
+            continue
+        if marker not in "*_~":
+            index += 1
+            continue
+        end = index + 1
+        while end < len(value) and value[end] == marker:
+            end += 1
+        previous = value[index - 1] if index else " "
+        following = value[end] if end < len(value) else " "
+        can_open = not following.isspace()
+        can_close = not previous.isspace()
+        if marker == "_":
+            can_open = can_open and not (previous.isalnum() or previous == "_")
+            can_close = can_close and not (following.isalnum() or following == "_")
+        if marker != "~" or end - index >= 2:
+            if can_close and marker in openers:
+                return True
+            if can_open:
+                openers.add(marker)
+        index = end
+    return False
+
+
 def _unsafe_text(value: str) -> list[str]:
     reasons: list[str] = []
     if "\n" in value or "\r" in value:
         reasons.append("summary must be one paragraph")
-    if _MARKDOWN.search(value) or contains_inline_markdown_link(value):
+    if _MARKDOWN.search(value) or contains_inline_markdown_link(value) or _contains_inline_formatting(value):
         reasons.append("summary contains Markdown structure or code")
     if _COMMAND.search(value):
         reasons.append("summary contains a command or installation instruction")

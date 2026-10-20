@@ -30,7 +30,12 @@ class GitHubGraphQLClientError(RuntimeError):
 GitHubClientError = GitHubGraphQLClientError
 
 
-def _failed_repository_aliases(errors: Any, aliases: set[str]) -> set[str]:
+def _failed_repository_aliases(
+    errors: Any,
+    aliases: set[str],
+    *,
+    ignored_child_fields: set[str] | None = None,
+) -> set[str]:
     """Keep unaffected rows only when GraphQL identifies the failed field."""
     failed: set[str] = set()
     if not isinstance(errors, list):
@@ -43,6 +48,13 @@ def _failed_repository_aliases(errors: Any, aliases: set[str]) -> set[str]:
             continue
         if path[0] not in aliases:
             raise GitHubClientError("GraphQL error identifies an unknown repository field")
+        if (
+            ignored_child_fields
+            and len(path) > 1
+            and isinstance(path[1], str)
+            and path[1] in ignored_child_fields
+        ):
+            continue
         failed.add(path[0])
     return failed
 
@@ -140,7 +152,14 @@ class GitHubGraphQLClient:
         response = self.execute(GET_REPOSITORY_QUERY, variables)
         if not response:
             return None
-        if _failed_repository_aliases(response.get("errors") or [], {"repository"}):
+        # This legacy single-repository query also selects README aliases.
+        # Their failures cannot invalidate resolved metadata, but metadata or
+        # unlocated errors must still retry rather than erase saved fields.
+        if _failed_repository_aliases(
+            response.get("errors") or [],
+            {"repository"},
+            ignored_child_fields={alias for alias, _path in README_CANDIDATES},
+        ):
             raise GitHubClientError("repository metadata fields failed; retry acquisition")
         data = response.get("data", {})
         repo = data.get("repository") if isinstance(data, dict) else None
@@ -148,6 +167,19 @@ class GitHubGraphQLClient:
             not isinstance(repo, dict) or "description" not in repo
         ):
             raise GitHubClientError("repository description was not resolved")
+        if _failed_repository_aliases(response.get("errors") or [], {"repository"}) and not (
+            isinstance(repo, dict)
+            and any(
+                isinstance(repo.get(alias), dict)
+                and isinstance(repo[alias].get("text"), str)
+                and repo[alias]["text"]
+                for alias, _path in README_CANDIDATES
+            )
+        ):
+            # Direct enrichment consumes these inline aliases. An unresolved
+            # README cannot become an empty canonical value even when metadata
+            # succeeded; another usable alias is required to continue safely.
+            raise GitHubClientError("README candidates failed; retry acquisition")
         return repo
 
     def get_readme(self, owner: str, name: str) -> FetchedReadme:

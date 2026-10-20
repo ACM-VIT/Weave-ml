@@ -253,6 +253,43 @@ def test_single_repository_retries_failed_description_instead_of_replacing_text(
         client.get_repository('owner', 'repo')
 
 
+@pytest.mark.parametrize('alias', ['readmeGithub1', 'readme1', 'readmeDocs1'])
+def test_single_repository_keeps_metadata_when_only_a_readme_alias_failed(alias):
+    client = GitHubGraphQLClient(token='test-token')
+    alternate = next(name for name, _ in README_CANDIDATES if name != alias)
+    repo = {'nameWithOwner': 'owner/repo', 'description': 'Resolved project description.',
+            alias: None, alternate: {'text': 'Usable canonical README.'}}
+    client.execute = MagicMock(return_value={
+        'data': {'repository': repo},
+        'errors': [{'message': 'README timeout', 'path': ['repository', alias, 'text']}],
+    })
+    assert client.get_repository('owner', 'repo') == repo
+
+
+def test_single_repository_retries_unresolved_readme_without_erasing_canonical_text():
+    client = GitHubGraphQLClient(token='test-token')
+    client.execute = MagicMock(return_value={
+        'data': {'repository': {'nameWithOwner': 'owner/repo', 'description': 'Usable metadata.',
+                                **{alias: None for alias, _ in README_CANDIDATES}}},
+        'errors': [{'message': 'README timeout', 'path': ['repository', 'readme1', 'text']}],
+    })
+    with pytest.raises(GitHubGraphQLClientError, match='README'):
+        client.get_repository('owner', 'repo')
+
+
+def test_readme_error_does_not_hide_a_simultaneous_metadata_error():
+    client = GitHubGraphQLClient(token='test-token')
+    client.execute = MagicMock(return_value={
+        'data': {'repository': {'nameWithOwner': 'owner/repo', 'description': None}},
+        'errors': [
+            {'message': 'README timeout', 'path': ['repository', 'readme1']},
+            {'message': 'description timeout', 'path': ['repository', 'description']},
+        ],
+    })
+    with pytest.raises(GitHubGraphQLClientError):
+        client.get_repository('owner', 'repo')
+
+
 @pytest.mark.parametrize('errors', [
     [{'message': 'unlocated timeout'}],
     [{'message': 'unrecognized field', 'path': ['unknown']}],

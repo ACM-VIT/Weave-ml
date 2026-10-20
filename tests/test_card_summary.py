@@ -61,6 +61,7 @@ def test_untrusted_preprocessing_is_bounded_without_mutating_markdown(malformed)
     "newlines", "crlf", "spaces", "tabs", "mixed-whitespace", "interior-newlines",
     "blank-lines-before-pipe", "whitespace-line", "heading-whitespace",
     "unclosed-fence", "unclosed-link", "unclosed-html", "deep-link-target", "repeated-link-openers",
+    "formatting-delimiter-runs", "many-dunder-identifiers", "unclosed-html-tags",
 ])
 def test_whitespace_and_delimiter_cleanup_finishes_in_a_killable_process(case) -> None:
     import subprocess
@@ -89,6 +90,9 @@ cases = {
     "unclosed-html": "<" + " \n" * 31_999,
     "deep-link-target": "[review tools](" + "(" * 30_000 + "x" + ")" * 30_001,
     "repeated-link-openers": "[review](" * 7_000,
+    "formatting-delimiter-runs": "**a __b " * 8_000,
+    "many-dunder-identifiers": "__getitem__ " * 5_000,
+    "unclosed-html-tags": "<b" * 32_000,
 }
 raw = cases[sys.argv[1]]
 started = time.monotonic()
@@ -167,6 +171,65 @@ def test_balanced_parenthesis_links_are_cleaned_and_repaired(target) -> None:
     assert result.summary == repaired
     assert len(provider.calls) == 2
     assert "Markdown" in provider.calls[1][1]
+
+
+@pytest.mark.parametrize("formatted", [
+    "**review workspace**", "*review workspace*", "__review workspace__",
+    "_review workspace_", "~~review workspace~~", "<b>review workspace</b>",
+    '<span class="feature">review workspace</span>',
+])
+def test_inline_formatting_in_generated_prose_triggers_repair(formatted) -> None:
+    summary = (
+        f"A focused {formatted} helps engineering teams coordinate proposed software changes. "
+        "It brings ownership decisions and durable project history together so maintainers can keep shared development work organized."
+    )
+    repaired = summary.replace(formatted, "review workspace")
+    with pytest.raises(SummaryValidationError, match="Markdown"):
+        validate_generated_summary(parse_summary_response(json.dumps({"summary": summary})), comparison_texts=[])
+    provider = SequenceProvider([json.dumps({"summary": summary}), json.dumps({"summary": repaired})])
+    repo = {"full_name": "weave/review", "description": "A shared workspace for engineering teams."}
+    artifact = CardSummaryPipeline(provider=provider).summarize(repo, repo)
+    assert artifact.source == "generated"
+    assert artifact.summary == repaired
+    assert len(provider.calls) == 2
+    assert "Markdown" in provider.calls[1][1]
+
+
+@pytest.mark.parametrize("highlight", ["**Team reviews**", "<b>Team reviews</b>"])
+def test_inline_formatting_in_generated_highlights_is_rejected(highlight) -> None:
+    content = parse_summary_response(json.dumps({
+        "summary": _fixtures()["repositories"][0]["new_summary"], "highlights": [highlight],
+    }))
+    with pytest.raises(SummaryValidationError, match="Markdown"):
+        validate_generated_summary(content, comparison_texts=[])
+
+
+@pytest.mark.parametrize("location", ["summary", "highlights"])
+def test_repeated_inline_formatting_failure_falls_back_to_plain_metadata(location) -> None:
+    case = _fixtures()["repositories"][0]
+    body = {"summary": case["new_summary"], "highlights": []}
+    if location == "summary":
+        first, separator, rest = body["summary"].partition(" ")
+        body["summary"] = f"<b>{first}</b>{separator}{rest}"
+    else:
+        body["highlights"] = ["**Team reviews**"]
+    provider = SequenceProvider([json.dumps(body), json.dumps(body)])
+    artifact = CardSummaryPipeline(provider=provider).summarize(_repo(case), _repo(case))
+    assert artifact.source == "description_fallback"
+    assert artifact.highlights == []
+    assert "<b>" not in artifact.summary
+    assert "**" not in artifact.summary
+    assert len(provider.calls) == 2
+    assert "Markdown" in provider.calls[1][1]
+
+
+def test_plain_python_identifiers_and_literal_operators_are_not_emphasis() -> None:
+    summary = (
+        "A Python adapter supports __getitem__ and __custom_hook__ while keeping deep_learning workflows organized. "
+        "It gives engineering teams a predictable interface for reviewing shared data operations and preserving their project history."
+    )
+    content = parse_summary_response(json.dumps({"summary": summary, "highlights": ["Computes 2 * 3", "Uses A < B comparisons"]}))
+    assert validate_generated_summary(content, comparison_texts=[]) == content
 
 
 @pytest.fixture
