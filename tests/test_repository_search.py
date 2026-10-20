@@ -161,7 +161,8 @@ def test_query_embedding_does_not_construct_or_call_a_summary_provider():
         search.assert_called_once()
 
 
-def test_search_and_event_loop_remain_responsive_during_malformed_readme_ingestion():
+@pytest.mark.parametrize('adversary', ['unmatched_brackets', 'blank_lines', 'whitespace_lines'])
+def test_search_and_event_loop_remain_responsive_during_malformed_readme_ingestion(adversary):
     import subprocess
     import sys
 
@@ -171,13 +172,13 @@ def test_search_and_event_loop_remain_responsive_during_malformed_readme_ingesti
         [sys.executable, '-c',
          'import asyncio; from tests.test_repository_search import '
          '_malformed_ingestion_search_scenario; '
-         'asyncio.run(_malformed_ingestion_search_scenario())'],
+         f'asyncio.run(_malformed_ingestion_search_scenario({adversary!r}))'],
         capture_output=True, text=True, timeout=10,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-async def _malformed_ingestion_search_scenario():
+async def _malformed_ingestion_search_scenario(adversary):
     import asyncio
     import os
     import threading
@@ -213,15 +214,23 @@ async def _malformed_ingestion_search_scenario():
         payload=_repository_payload(repo_id),
     )])
     retriever = QdrantV2Retriever(client=client, repository_collection=collection, heavy_ranker_enabled=False)
+    readme = {
+        'unmatched_brackets': '[' * 1_000_000,
+        # Keep whitespace inside non-whitespace sentinels so request-level
+        # trimming cannot remove the adversary before ingestion processes it.
+        'blank_lines': 'x' + '\n' * 999_998 + 'x',
+        'whitespace_lines': 'x' + ' \t\n' * 333_332 + 'x',
+    }[adversary]
     job = RepositoryJob.model_validate({
         'schema_version': 2, 'job_id': str(uuid.uuid4()), 'repo_id': repo_id,
         'content_version': 1,
         'repository': {
             'repo_id': repo_id, 'full_name': 'weave/malformed-readme',
             'description': 'A collaborative review workspace for developer teams.',
-            'readme': '[' * 1_000_000, 'content_hash': 'isolated-malformed-fixture',
+            'readme': readme, 'content_hash': 'isolated-malformed-fixture',
         },
     })
+    assert job.repository.readme == readme
     started = threading.Event()
     stop_heartbeat = asyncio.Event()
     ticks = []
