@@ -40,6 +40,9 @@ class _Spec:
 
 
 _SPECS = {
+    # Short query jobs must not queue behind repository summary-provider waits.
+    # The model itself remains shared and concurrency-bounded.
+    "search": _Spec("V2_SEARCH", 1, 4, 4.0, 4, 16, 10.0),
     "feedback": _Spec("V2_FEEDBACK", 2, 8, 8.0, 8, 64, 30.0),
     "refresh": _Spec("V2_REFRESH", 2, 4, 45.0, 8, 32, 120.0),
     "health": _Spec("V2_HEALTH", 2, 4, 5.0, 4, 16, 30.0),
@@ -160,7 +163,7 @@ class _BoundedExecutor:
         self.executor.shutdown(wait=False, cancel_futures=True)
 
 
-@lru_cache(maxsize=3)
+@lru_cache(maxsize=4)
 def _runtime(operation: str) -> _BoundedExecutor:
     return _BoundedExecutor(operation)
 

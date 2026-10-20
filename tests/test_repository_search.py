@@ -1,4 +1,3 @@
-import asyncio
 import uuid
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,6 +10,7 @@ from qdrant_client import QdrantClient, models
 
 from api.contracts import RepositorySearchRequest
 from api.search import search_repositories
+from api.runtime import ServiceDeadlineExceeded
 from api.v2 import router
 from config import REPOSITORY_EMBEDDING_DIM, QDRANT_VECTOR_NAME
 from retrieval.v2_retriever import QdrantV2Retriever
@@ -57,8 +57,8 @@ def test_search_deadline_returns_retryable_unavailable(monkeypatch):
     monkeypatch.setenv('INTERNAL_API_SECRET', 'search-local-secret')
     app = FastAPI(); app.include_router(router)
     async def expired(*args, **kwargs):
-        raise asyncio.TimeoutError()
-    with patch('api.v2.run_embedding_job', expired), TestClient(app) as client:
+        raise ServiceDeadlineExceeded("search")
+    with patch('api.v2.run_service_job', expired), TestClient(app) as client:
         assert client.post('/api/v2/search/repositories', json=request().model_dump(mode='json'), headers={'X-Internal-Secret': 'search-local-secret'}).status_code == 503
 
 

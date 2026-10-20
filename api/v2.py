@@ -1085,14 +1085,24 @@ async def metrics() -> PlainTextResponse:
 
 def _search_repository_job(request: RepositorySearchRequest):
     from api.search import search_repositories
-    return search_repositories(request, retriever(), SentenceTransformerEmbedder(model=shared_embedding_model()))
+    return search_repositories(
+        request, retriever(), SentenceTransformerEmbedder(model=shared_embedding_model())
+    )
 
 
-@router.post("/search/repositories", response_model=RepositorySearchResponse, dependencies=[Depends(require_internal_secret)])
+@router.post(
+    "/search/repositories",
+    response_model=RepositorySearchResponse,
+    dependencies=[Depends(require_internal_secret)],
+)
 async def repository_search(request: RepositorySearchRequest):
     try:
-        return await asyncio.wait_for(run_embedding_job(_search_repository_job, request), timeout=4.0)
-    except (asyncio.TimeoutError, EmbeddingCapacityError) as exc:
-        raise HTTPException(status_code=503, detail="Semantic search is temporarily unavailable.") from exc
+        return await run_service_job("search", _search_repository_job, request)
+    except (ServiceCapacityError, ServiceDeadlineExceeded) as exc:
+        raise HTTPException(
+            status_code=503, detail="Semantic search is temporarily unavailable."
+        ) from exc
     except Exception as exc:
-        raise _operation_error("repository_search", exc, request_id=str(request.search_id)) from exc
+        raise _operation_error(
+            "repository_search", exc, request_id=str(request.search_id)
+        ) from exc
