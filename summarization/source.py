@@ -10,12 +10,12 @@ from typing import Any
 from utils.readme_processor import MAX_PREPROCESS_CHARS, clean_inline_markdown
 
 
-_FENCE = re.compile(r"^\s*(```|~~~)")
-_HEADING = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*$")
-_SETEXT = re.compile(r"^\s*(?:=+|-+)\s*$")
+_FENCE = re.compile(r"^[ \t]*(```|~~~)")
+_HEADING = re.compile(r"^[ \t]{0,3}(#{1,6})[ \t]+(.+)$")
+_SETEXT = re.compile(r"^[ \t]*(?:=+|-+)[ \t]*$")
 _URL = re.compile(r"https?://\S+")
-_LIST_MARKER = re.compile(r"^\s*(?:[-*+] |\d+[.)]\s+)")
-_TABLE_RULE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*$")
+_LIST_MARKER = re.compile(r"^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)")
+_TABLE_CELL = re.compile(r":?-{3,}:?")
 _COMMAND = re.compile(
     r"(?:\b(?:npm|pnpm|yarn|pipx?|uv|cargo|go)\s+(?:install|add|run|get)\b"
     r"|\b(?:brew|apt(?:-get)?|dnf|yum|pacman|choco|winget)\s+install\b"
@@ -118,7 +118,7 @@ def _readme_sections(markdown: str) -> tuple[list[str], list[str]]:
         if heading_match or setext:
             if heading_match:
                 depth = len(heading_match.group(1))
-                heading = heading_match.group(2)
+                heading = heading_match.group(2).rstrip()
             else:
                 depth = 1 if lines[index + 1].lstrip().startswith("=") else 2
                 heading = raw_line.strip()
@@ -136,7 +136,9 @@ def _readme_sections(markdown: str) -> tuple[list[str], list[str]]:
             previous_was_heading = False
             continue
         previous_was_heading = False
-        if blocked_depth is not None or _TABLE_RULE.match(raw_line) or raw_line.count("|") >= 3:
+        cells = raw_line.strip().strip("|").split("|")
+        table_rule = "|" in raw_line and all(_TABLE_CELL.fullmatch(cell.strip()) for cell in cells)
+        if blocked_depth is not None or table_rule or raw_line.count("|") >= 3:
             continue
         cleaned = _clean_line(raw_line)
         if (

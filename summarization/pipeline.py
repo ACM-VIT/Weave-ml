@@ -38,7 +38,7 @@ _UNSAFE_SENTENCE = re.compile(
 )
 _SENTENCE = re.compile(r".+?[.!?](?=\s|$)|.+$", re.DOTALL)
 _MARKDOWN_STRUCTURE = re.compile(
-    r"(?m)^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)|```|~~~|`"
+    r"(?m)^[ \t]*(?:#{1,6}[ \t]+|[-*+][ \t]+|\d+[.)][ \t]+)|```|~~~|`"
 )
 _DUNDER_IDENTIFIER = re.compile(r"__([A-Za-z_][A-Za-z0-9_]*)__")
 _INLINE_MARKDOWN_PUNCTUATION = re.compile(r"[*_~]+")

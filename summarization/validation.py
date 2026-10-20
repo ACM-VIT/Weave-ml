@@ -18,9 +18,8 @@ from .contracts import (
 )
 
 
-_FENCED_JSON = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.IGNORECASE)
 _MARKDOWN = re.compile(
-    r"(?:^|\n)\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s)|```|~~~|`|!?\[[^\[\]]*\]\([^()]+\)",
+    r"^[ \t]*(?:#{1,6}[ \t]|[-*+][ \t]|\d+[.)][ \t])|```|~~~|`|!?\[[^\[\]]*\]\([^()]+\)",
     re.MULTILINE,
 )
 _COMMAND = re.compile(
@@ -56,8 +55,12 @@ def parse_summary_response(raw: str) -> CardSummaryContent:
         raise SummaryValidationError(("model response is empty",))
     if len(raw) > 8_192:
         raise SummaryValidationError(("model response exceeds the transport bound",))
-    fence = _FENCED_JSON.fullmatch(raw)
-    candidate = fence.group(1) if fence else raw.strip()
+    candidate = raw.strip()
+    if candidate.startswith("```") and candidate.endswith("```") and len(candidate) >= 6:
+        candidate = candidate[3:-3]
+        if candidate[:4].casefold() == "json":
+            candidate = candidate[4:]
+        candidate = candidate.strip()
     try:
         decoded = json.loads(candidate)
     except (json.JSONDecodeError, TypeError) as exc:

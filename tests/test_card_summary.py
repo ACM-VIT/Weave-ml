@@ -36,7 +36,8 @@ from summarization.validation import (
 FIXTURE_PATH = Path("tests/fixtures/repository_summary_golden.json")
 
 
-@pytest.mark.parametrize("malformed", ["[" * 1_000_000, "<" * 1_000_000, "*a " * 333_333])
+@pytest.mark.parametrize("malformed", ["[" * 1_000_000, "<" * 1_000_000, "*a " * 333_333],
+                         ids=["unclosed-brackets", "unclosed-html", "unbalanced-emphasis"])
 def test_untrusted_preprocessing_is_bounded_without_mutating_markdown(malformed) -> None:
     import time
     from utils.readme_processor import MAX_PREPROCESS_CHARS, process_markdown
@@ -54,6 +55,62 @@ def test_untrusted_preprocessing_is_bounded_without_mutating_markdown(malformed)
     assert len(material.prompt_input) <= 12_000
     assert all(len(text) <= MAX_PREPROCESS_CHARS for text in material.comparison_texts)
     assert len(fallback.summary) <= 360
+
+
+@pytest.mark.parametrize("case", [
+    "newlines", "crlf", "spaces", "tabs", "mixed-whitespace", "interior-newlines",
+    "blank-lines-before-pipe", "whitespace-line", "heading-whitespace",
+    "unclosed-fence", "unclosed-link", "unclosed-html",
+])
+def test_whitespace_and_delimiter_cleanup_finishes_in_a_killable_process(case) -> None:
+    import subprocess
+    import sys
+
+    # A timeout around a Python thread cannot stop a regex holding the GIL.
+    # Keep the hostile input in a killable child and exercise every cleanup path.
+    script = r'''
+import sys, time
+from utils.readme_processor import MAX_PREPROCESS_CHARS, process_markdown
+from summarization.pipeline import description_fallback_artifact
+from summarization.source import build_summary_source
+from summarization.validation import _unsafe_text, parse_summary_response, SummaryValidationError
+cases = {
+    "newlines": "\n" * 1_000_000,
+    "crlf": "\r\n" * 500_000,
+    "spaces": " " * 1_000_000,
+    "tabs": "\t" * 1_000_000,
+    "mixed-whitespace": " \t\n" * 333_333,
+    "interior-newlines": "x" + "\n" * 999_998 + "x",
+    "blank-lines-before-pipe": "\n" * 31_999 + "|" + " " * 31_999 + "x",
+    "whitespace-line": "x\n" + " " * 63_995 + "\nx",
+    "heading-whitespace": "## Overview" + " " * 63_980 + "x",
+    "unclosed-fence": "```" + " " * 63_990 + "x",
+    "unclosed-link": "[label](" + " " * 63_990,
+    "unclosed-html": "<" + " \n" * 31_999,
+}
+raw = cases[sys.argv[1]]
+started = time.monotonic()
+document = process_markdown(raw)
+repo = {"full_name": "weave/adversarial", "readme": raw, "description": raw}
+material = build_summary_source(repo, repo, max_chars=12_000)
+artifact = description_fallback_artifact(repo)
+_unsafe_text(raw[:MAX_PREPROCESS_CHARS])
+try:
+    parse_summary_response("```json" + " " * 8_000 + "x```")
+except SummaryValidationError:
+    pass
+else:
+    raise AssertionError("malformed fenced JSON must be rejected")
+assert time.monotonic() - started < 1.5
+assert document.raw_markdown == raw
+assert document.readme_length == len(raw)
+assert len(document.clean_text) <= MAX_PREPROCESS_CHARS
+assert len(material.prompt_input) <= 12_000
+assert all(len(value) <= MAX_PREPROCESS_CHARS for value in material.comparison_texts)
+assert len(artifact.summary) <= 360
+'''
+    subprocess.run([sys.executable, "-c", script, case], check=True, timeout=5,
+                   capture_output=True, text=True)
 
 
 def test_list_before_thematic_break_is_not_a_setext_heading() -> None:

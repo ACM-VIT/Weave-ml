@@ -18,7 +18,9 @@ _LINK_RE = re.compile(r"(!?)\[([^\[\]]*)\]\(([^()]*?)\)")
 _HTML_TAG_RE = re.compile(r"<[^<>]+>")
 _FENCE_RE = re.compile(r"```.*?```", re.S)
 _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
-_MARKDOWN_TABLE_RE = re.compile(r"^\s*\|.*\|\s*$", re.M)
+_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]*")
+_BULLET_RE = re.compile(r"^[ \t]*[-*+][ \t]+")
+_ORDERED_RE = re.compile(r"^[ \t]*\d+[.)][ \t]+")
 _BOILERPLATE_PATTERNS = [
     re.compile(r"^\s*(table of contents|toc)\s*$", re.I),
     re.compile(r"^\s*(license|copyright)\s*$", re.I),
@@ -71,8 +73,7 @@ def process_markdown(
     text = clean_markdown_copy(raw)
 
     paragraphs: list[str] = []
-    for block in re.split(r"\n\s*\n+", text):
-        block = re.sub(r"\s+", " ", block).strip(" -*_\t\n")
+    for block in text.split("\n\n"):
         if not _is_meaningful_paragraph(block):
             continue
         paragraphs.append(block)
@@ -95,21 +96,29 @@ def clean_markdown_copy(markdown: str) -> str:
 
     text = html.unescape((markdown or "")[:MAX_PREPROCESS_CHARS])
     text = _FENCE_RE.sub(" ", text)
-    text = _MARKDOWN_TABLE_RE.sub(" ", text)
     text = clean_inline_markdown(text)
     text = _INLINE_CODE_RE.sub(r"\1", text)
-    text = _HTML_TAG_RE.sub(" ", text)
-    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.M)
-    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.M)
-    text = re.sub(r"^\s*\d+[.)]\s+", "", text, flags=re.M)
-    text = re.sub(r"\r\n?", "\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
 
     paragraphs: list[str] = []
-    for block in re.split(r"\n\s*\n+", text):
-        block = re.sub(r"\s+", " ", block).strip(" -*_\t\n")
+    lines: list[str] = []
+    # Process each line once. Multiline ^\s* patterns retry the complete
+    # remaining blank-line suffix at every newline, even on bounded input.
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|"):
+            line = ""
+        line = _ORDERED_RE.sub("", _BULLET_RE.sub("", _HEADING_RE.sub("", line)))
+        normalized = " ".join(line.split())
+        if normalized:
+            lines.append(normalized)
+            continue
+        block = " ".join(lines).strip(" -*_\t\n")
         if block:
             paragraphs.append(block)
+        lines.clear()
+    block = " ".join(lines).strip(" -*_\t\n")
+    if block:
+        paragraphs.append(block)
     return "\n\n".join(paragraphs)
 
 
