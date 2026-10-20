@@ -139,7 +139,12 @@ def test_same_content_missing_summary_is_backfilled_without_replacing_content() 
     )
 
 
-def test_same_content_fallback_is_upgraded_after_provider_recovery() -> None:
+def test_same_content_fallback_is_upgraded_after_provider_recovery(monkeypatch) -> None:
+    from embedding.runtime import embedding_timeout_seconds
+    from summarization.provider import OpenRouterSummaryProvider
+    from summarization.settings import SummarySettings
+
+    monkeypatch.setenv("EMBEDDING_TIMEOUT_SECONDS", "30")
     request = _job()
     fallback = CardSummaryPipeline().summarize(
         request.repository.model_dump(mode="json"),
@@ -153,9 +158,12 @@ def test_same_content_fallback_is_upgraded_after_provider_recovery() -> None:
         "catch risky updates before they disrupt downstream users or integrations."
     )
 
-    class RecoveredProvider:
-        def generate(self, source, *, repair_feedback=None, deadline=None):
-            return json.dumps({"summary": generated_summary})
+    settings = SummarySettings(api_key="isolated-summary-test-key", request_timeout_seconds=30)
+    session = MagicMock()
+    session.post.return_value.status_code = 200
+    session.post.return_value.json.return_value = {
+        "choices": [{"message": {"content": json.dumps({"summary": generated_summary})}}]
+    }
 
     class Store:
         def compare_and_set_card_summary(self, *, expected_point, artifact):
@@ -165,16 +173,22 @@ def test_same_content_fallback_is_upgraded_after_provider_recovery() -> None:
 
     pipeline = RepositoryEmbeddingPipeline(
         embedder=FakeEmbedder(),
-        card_summarizer=CardSummaryPipeline(provider=RecoveredProvider()),
+        card_summarizer=CardSummaryPipeline(
+            settings=settings,
+            provider=OpenRouterSummaryProvider(settings, session=session),
+        ),
     )
     assert pipeline.card_summarizer.is_current(fallback) is True
 
     with patch("api.v2._repository_points", return_value=[point]), patch(
         "api.v2.repository_embedding_pipeline", return_value=pipeline
     ), patch("api.v2.repository_store", return_value=Store()):
-        response = _embed_repository_job_locked(request, OwnedLock())
+        response = _embed_repository_job_locked(
+            request, OwnedLock(), deadline=time.monotonic() + embedding_timeout_seconds()
+        )
 
     assert response["status"] == "current"
+    assert 0.1 < session.post.call_args.kwargs["timeout"] <= 20
     assert response["card_summary"]["source"] == "generated"
     assert response["card_summary"]["summary"] == generated_summary
     assert (

@@ -30,6 +30,23 @@ class GitHubGraphQLClientError(RuntimeError):
 GitHubClientError = GitHubGraphQLClientError
 
 
+def _failed_repository_aliases(errors: Any, aliases: set[str]) -> set[str]:
+    """Keep unaffected rows only when GraphQL identifies the failed field."""
+    failed: set[str] = set()
+    if not isinstance(errors, list):
+        raise GitHubClientError("GraphQL errors have no usable field paths")
+    for error in errors:
+        path = error.get("path") if isinstance(error, dict) else None
+        if not isinstance(path, list) or not path or not isinstance(path[0], str):
+            raise GitHubClientError("GraphQL errors have no usable field paths")
+        if path[0] == "rateLimit":
+            continue
+        if path[0] not in aliases:
+            raise GitHubClientError("GraphQL error identifies an unknown repository field")
+        failed.add(path[0])
+    return failed
+
+
 class FetchedReadme(str):
     """Canonical README Markdown with the metadata needed to resolve media.
 
@@ -123,8 +140,15 @@ class GitHubGraphQLClient:
         response = self.execute(GET_REPOSITORY_QUERY, variables)
         if not response:
             return None
+        if _failed_repository_aliases(response.get("errors") or [], {"repository"}):
+            raise GitHubClientError("repository metadata fields failed; retry acquisition")
         data = response.get("data", {})
-        return data.get("repository")
+        repo = data.get("repository") if isinstance(data, dict) else None
+        if repo is not None and (
+            not isinstance(repo, dict) or "description" not in repo
+        ):
+            raise GitHubClientError("repository description was not resolved")
+        return repo
 
     def get_readme(self, owner: str, name: str) -> FetchedReadme:
         """Fetch canonical README Markdown and its source metadata.
@@ -138,10 +162,9 @@ class GitHubGraphQLClient:
             gql_errors = response.get("errors")
             data = response.get("data")
             # GitHub can return a partial response: usable repository data (and
-            # valid README aliases) alongside a field-level error for a *different*
-            # alias.  Only treat errors as fatal when there is no accompanying
-            # data envelope — otherwise log them as warnings and continue so the
-            # pipeline can still use whichever README aliases resolved correctly.
+            # valid README aliases) alongside a field-level error for a different
+            # alias. Keep usable text, but never confirm absence from failed or
+            # incomplete aliases: that would erase previously saved content.
             if gql_errors:
                 if not isinstance(data, dict) or "repository" not in data:
                     raise GitHubClientError(
@@ -167,14 +190,19 @@ class GitHubGraphQLClient:
             default_branch = (
                 branch_ref.get("name") if isinstance(branch_ref, dict) else None
             )
+            complete = not gql_errors
             for key, source_path in README_CANDIDATES:
+                if key not in repo:
+                    complete = False
                 blob = repo.get(key)
                 if blob is None:
                     continue
                 if not isinstance(blob, dict) or "text" not in blob:
+                    complete = False
                     continue
                 text = blob["text"]
                 if not isinstance(text, str):
+                    complete = False
                     continue
                 if text:
                     return FetchedReadme(
@@ -185,6 +213,8 @@ class GitHubGraphQLClient:
                             owner, name, default_branch, source_path
                         ),
                     )
+            if not complete:
+                raise GitHubClientError("README candidates were not fully resolved; retry acquisition")
             logger.info(
                 "README not found for %s/%s: every candidate resolved empty or null.",
                 owner,
@@ -216,11 +246,22 @@ class GitHubGraphQLClient:
         data = response.get("data", {})
         if not isinstance(data, dict):
             raise GitHubClientError("batch metadata query returned invalid data")
+        failed = _failed_repository_aliases(
+            response.get("errors") or [],
+            {f"repo_{i}" for i in range(len(repos))},
+        )
         results = {}
         for i, (owner, name) in enumerate(repos):
             alias = f"repo_{i}"
-            if alias in data and data[alias]:
-                results[f"{owner}/{name}"] = data[alias]
+            repo = data.get(alias)
+            if alias in failed or (isinstance(repo, dict) and "description" not in repo):
+                # Omitted rows become structured acquisition failures upstream;
+                # healthy rows can still be published without replacing text
+                # from an unresolved field with an accidental empty value.
+                logger.warning("Metadata fields unresolved for %s/%s; retry acquisition", owner, name)
+                continue
+            if isinstance(repo, dict) and repo:
+                results[f"{owner}/{name}"] = repo
         return results
 
     def execute(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any] | None:

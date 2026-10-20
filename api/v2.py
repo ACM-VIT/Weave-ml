@@ -496,7 +496,7 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
         if artifact is None or not pipeline.card_summarizer.is_current(artifact) or (
             job_status != "duplicate"
             and pipeline.card_summarizer.should_upgrade(artifact)
-            and _summary_upgrade_has_time(pipeline, deadline)
+            and _summary_upgrade_has_time(deadline)
         ):
             payload = _repository_embedding_payload(request)
             artifact = pipeline.summarize_repository(payload, deadline=deadline)
@@ -589,7 +589,6 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
 
 
 def _summary_upgrade_has_time(
-    pipeline: Any,
     deadline: float | None,
 ) -> bool:
     """Avoid delaying replay of a durable fallback through another timeout."""
@@ -598,8 +597,10 @@ def _summary_upgrade_has_time(
         return True
     return (
         deadline - time.monotonic()
-        >= pipeline.card_summarizer.settings.request_timeout_seconds
-        + SUMMARY_COMPLETION_RESERVE_SECONDS
+        # The provider caps its request timeout to the remaining usable budget.
+        # Requiring the full configured timeout would disable upgrades under
+        # the production 30-second job / 30-second provider configuration.
+        >= SUMMARY_COMPLETION_RESERVE_SECONDS + 0.1
     )
 
 

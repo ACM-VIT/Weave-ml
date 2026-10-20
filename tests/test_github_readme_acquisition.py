@@ -212,6 +212,82 @@ def test_get_readme_returns_empty_only_after_every_alias_resolves_null():
     assert readme.source_path is None
 
 
+@pytest.mark.parametrize('incomplete', ['failed_alias', 'missing_alias', 'missing_text'])
+def test_get_readme_retries_unknown_text_instead_of_confirming_empty(incomplete):
+    response = _complete_readme_response()
+    if incomplete == 'failed_alias':
+        response['errors'] = [{'message': 'timeout', 'path': ['repository', 'readme1', 'text']}]
+    elif incomplete == 'missing_alias':
+        del response['data']['repository']['readme1']
+    else:
+        response['data']['repository']['readme1'] = {}
+    client = GitHubGraphQLClient(token='test-token')
+    client.execute = MagicMock(return_value=response)
+
+    with pytest.raises(GitHubGraphQLClientError):
+        client.get_readme('owner', 'repo')
+
+
+@pytest.mark.parametrize('description', [None, 'still usable text'])
+def test_failed_metadata_fields_retry_only_the_affected_repository(description):
+    client = GitHubGraphQLClient(token='test-token')
+    healthy = {'nameWithOwner': 'owner/healthy', 'description': 'A healthy repository.'}
+    client.execute = MagicMock(return_value={
+        'data': {'repo_0': {'nameWithOwner': 'owner/failed', 'description': description}, 'repo_1': healthy},
+        'errors': [{'message': 'timeout', 'path': ['repo_0', 'description']}],
+    })
+
+    assert client.get_repositories_batch([('owner', 'failed'), ('owner', 'healthy')]) == {
+        'owner/healthy': healthy,
+    }
+
+
+def test_single_repository_retries_failed_description_instead_of_replacing_text():
+    client = GitHubGraphQLClient(token='test-token')
+    client.execute = MagicMock(return_value={
+        'data': {'repository': {'nameWithOwner': 'owner/repo', 'description': None}},
+        'errors': [{'message': 'timeout', 'path': ['repository', 'description']}],
+    })
+
+    with pytest.raises(GitHubGraphQLClientError):
+        client.get_repository('owner', 'repo')
+
+
+@pytest.mark.parametrize('errors', [
+    [{'message': 'unlocated timeout'}],
+    [{'message': 'unrecognized field', 'path': ['unknown']}],
+])
+def test_unlocated_metadata_errors_retry_instead_of_publishing_partial_rows(errors):
+    client = GitHubGraphQLClient(token='test-token')
+    client.execute = MagicMock(return_value={
+        'data': {'repo_0': {'nameWithOwner': 'owner/repo', 'description': None}},
+        'errors': errors,
+    })
+    with pytest.raises(GitHubGraphQLClientError):
+        client.get_repositories_batch([('owner', 'repo')])
+
+
+def test_partial_metadata_failure_reaches_acquisition_retry_without_losing_healthy_rows(monkeypatch):
+    from acquisition.pipeline import enrich_repositories
+
+    client = GitHubGraphQLClient(token='test-token')
+    client.execute = MagicMock(side_effect=lambda query, *args: (
+        _complete_readme_response() if query == GET_README_QUERY else {
+            'data': {
+                'repo_0': {'nameWithOwner': 'owner/failed', 'description': None},
+                'repo_1': {'nameWithOwner': 'owner/healthy', 'description': 'Healthy project.'},
+            },
+            'errors': [{'message': 'timeout', 'path': ['repo_0', 'description']}],
+        }
+    ))
+    monkeypatch.setattr('acquisition.github_graphql_client.GitHubGraphQLClient', lambda **kwargs: client)
+
+    result = enrich_repositories('test-token', ['owner/failed', 'owner/healthy'], workers=1)
+
+    assert [repo.repo_id for repo in result.repositories] == ['owner/healthy']
+    assert [failure.repository for failure in result.failures] == ['owner/failed']
+
+
 @pytest.mark.unit
 def test_batch_metadata_preserves_usable_partial_response_envelopes(caplog):
     import logging
@@ -219,15 +295,15 @@ def test_batch_metadata_preserves_usable_partial_response_envelopes(caplog):
     client = GitHubGraphQLClient(token="test-token")
     client.execute = MagicMock(
         return_value={
-            "data": {"repo_0": {"nameWithOwner": "owner/repo"}},
-            "errors": [{"message": "languages field timed out"}],
+            "data": {"repo_0": {"nameWithOwner": "owner/repo", "description": None}},
+            "errors": [{"message": "rate limit metadata timed out", "path": ["rateLimit"]}],
         }
     )
 
     with caplog.at_level(logging.WARNING, logger="acquisition.github_graphql_client"):
         results = client.get_repositories_batch([("owner", "repo")])
 
-    assert results.get("owner/repo") == {"nameWithOwner": "owner/repo"}
+    assert results.get("owner/repo") == {"nameWithOwner": "owner/repo", "description": None}
 
 
 @pytest.mark.unit
