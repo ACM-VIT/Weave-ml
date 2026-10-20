@@ -131,6 +131,29 @@ def test_search_discards_malformed_points_bad_scores_and_duplicate_ids():
     assert result['items'] == [{'repo_id':id,'score':.9}]
 
 
+def test_search_clamps_cosine_roundoff_and_rejects_invalid_scores():
+    scores = [
+        1.0000001192092896, -1.0000001192092896,
+        1.00001, -1.00001, float('nan'), float('inf'), float('-inf'),
+        True, '0.9', None,
+    ]
+    ids = [str(uuid.uuid4()) for _ in scores]
+    points = [
+        SimpleNamespace(id=id, payload=_repository_payload(id), score=score)
+        for id, score in zip(ids, scores)
+    ]
+    client = SimpleNamespace(query_points=lambda **kwargs: SimpleNamespace(points=points))
+    retriever = QdrantV2Retriever(client=client, heavy_ranker_enabled=False)
+    embedder = SimpleNamespace(embed_text=lambda text: [1.] + [0.] * (REPOSITORY_EMBEDDING_DIM - 1))
+
+    result = search_repositories(request(), retriever, embedder)
+
+    assert result['items'] == [
+        {'repo_id': ids[0], 'score': 1.0},
+        {'repo_id': ids[1], 'score': -1.0},
+    ]
+
+
 def test_query_embedding_does_not_construct_or_call_a_summary_provider():
     from api.v2 import _search_repository_job
     with patch('api.v2.repository_embedding_pipeline', side_effect=AssertionError('summary runtime must not be constructed')), patch('api.v2.shared_embedding_model', return_value=object()), patch('api.v2.retriever', return_value=object()), patch('api.search.search_repositories', return_value={'items':[]}) as search:
