@@ -672,6 +672,7 @@ def _validate_ranker_and_retrieval(v: _Validator) -> None:
         )
 
     for prefix, maximum_workers, maximum_capacity, maximum_timeout in (
+        ("V2_SEARCH", 4, 16, 10),
         ("V2_FEEDBACK", 8, 64, 30),
         ("V2_REFRESH", 8, 32, 120),
         ("V2_HEALTH", 4, 16, 30),

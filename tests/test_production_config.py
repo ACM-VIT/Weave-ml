@@ -119,6 +119,9 @@ def valid_production_env() -> dict[str, str]:
         "V2_REFRESH_EXECUTOR_WORKERS": "2",
         "V2_REFRESH_MAX_OUTSTANDING": "4",
         "V2_REFRESH_TIMEOUT_SECONDS": "45",
+        "V2_SEARCH_EXECUTOR_WORKERS": "1",
+        "V2_SEARCH_MAX_OUTSTANDING": "4",
+        "V2_SEARCH_TIMEOUT_SECONDS": "4",
         "V2_HEALTH_EXECUTOR_WORKERS": "2",
         "V2_HEALTH_MAX_OUTSTANDING": "4",
         "REPOSITORY_JOB_LOCK_TTL_MS": "600000",
@@ -229,6 +232,8 @@ def test_service_executor_capacity_is_bounded() -> None:
         V2_FEEDBACK_MAX_OUTSTANDING="2",
         V2_REFRESH_TIMEOUT_SECONDS="121",
         V2_HEALTH_EXECUTOR_WORKERS="5",
+        V2_SEARCH_EXECUTOR_WORKERS="2",
+        V2_SEARCH_MAX_OUTSTANDING="1",
     )
 
     names = issue_names(environment)
@@ -236,7 +241,51 @@ def test_service_executor_capacity_is_bounded() -> None:
         "V2_FEEDBACK_MAX_OUTSTANDING",
         "V2_REFRESH_TIMEOUT_SECONDS",
         "V2_HEALTH_EXECUTOR_WORKERS",
+        "V2_SEARCH_MAX_OUTSTANDING",
     } <= names
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("V2_SEARCH_EXECUTOR_WORKERS", "0"),
+    ("V2_SEARCH_EXECUTOR_WORKERS", "5"),
+    ("V2_SEARCH_MAX_OUTSTANDING", "0"),
+    ("V2_SEARCH_MAX_OUTSTANDING", "17"),
+    ("V2_SEARCH_TIMEOUT_SECONDS", "0.09"),
+    ("V2_SEARCH_TIMEOUT_SECONDS", "10.1"),
+    ("V2_SEARCH_TIMEOUT_SECONDS", "nan"),
+])
+def test_search_preflight_rejects_settings_that_fail_runtime_startup(field, value, monkeypatch):
+    from api.runtime import _settings
+
+    environment = valid_production_env()
+    environment[field] = value
+    for name in ("V2_SEARCH_EXECUTOR_WORKERS", "V2_SEARCH_MAX_OUTSTANDING", "V2_SEARCH_TIMEOUT_SECONDS"):
+        monkeypatch.setenv(name, environment[name])
+
+    with pytest.raises(ValueError):
+        _settings("search")
+    assert field in issue_names(environment)
+
+
+@pytest.mark.parametrize(("workers", "capacity", "timeout"), [
+    ("1", "4", "4"),
+    ("1", "1", "0.1"),
+    ("4", "16", "10"),
+], ids=["defaults", "minimum", "maximum"])
+def test_search_preflight_and_runtime_accept_defaults_and_bounds(workers, capacity, timeout, monkeypatch):
+    from api.runtime import _settings
+
+    environment = valid_production_env()
+    environment.update(
+        V2_SEARCH_EXECUTOR_WORKERS=workers,
+        V2_SEARCH_MAX_OUTSTANDING=capacity,
+        V2_SEARCH_TIMEOUT_SECONDS=timeout,
+    )
+    for name in ("V2_SEARCH_EXECUTOR_WORKERS", "V2_SEARCH_MAX_OUTSTANDING", "V2_SEARCH_TIMEOUT_SECONDS"):
+        monkeypatch.setenv(name, environment[name])
+
+    assert _settings("search") == (int(workers), int(capacity), float(timeout))
+    assert validate_production_config(environment) == []
 
 
 def test_online_env_rejects_database_and_acquisition_credentials() -> None:
