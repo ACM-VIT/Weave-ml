@@ -125,7 +125,7 @@ async def test_search_runs_while_single_embedding_worker_waits_on_summary_provid
     allow_finish = threading.Event()
 
     class SlowProvider:
-        def generate(self, source, *, repair_feedback=None):
+        def generate(self, source, *, repair_feedback=None, deadline=None):
             started.set()
             assert allow_finish.wait(timeout=5)
             raise SummaryProviderError("unavailable")
