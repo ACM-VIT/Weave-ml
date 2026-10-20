@@ -22,7 +22,8 @@ from api.metrics import record_api_request
 load_dotenv()
 
 logger = logging.getLogger("pipeline.api")
-MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
+MAX_REQUEST_BODY_BYTES = 256 * 1024
+REPOSITORY_EMBED_MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
 MAX_VALIDATION_ERROR_DETAILS = 50
 
 def _request_id(request: Request) -> str:
@@ -219,7 +220,12 @@ async def authenticate_non_health_routes(request: Request, call_next):
                 message="Content-Length is invalid.",
                 retryable=False,
             )
-        if content_length > MAX_REQUEST_BODY_BYTES:
+        request_limit = (
+            REPOSITORY_EMBED_MAX_REQUEST_BODY_BYTES
+            if request.url.path == "/api/v2/repositories/embed"
+            else MAX_REQUEST_BODY_BYTES
+        )
+        if content_length > request_limit:
             return _error_response(
                 request,
                 status_code=status.HTTP_413_CONTENT_TOO_LARGE,

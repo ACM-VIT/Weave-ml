@@ -1,0 +1,75 @@
+{
+  "repositories": [
+    {
+      "id": "short-readme",
+      "description": "A small workflow engine for Python teams building reliable data jobs.",
+      "readme": "# Fluxlet\n\nFluxlet is a small workflow engine for Python teams. It coordinates reliable data jobs with typed steps, local retries, and an inspectable execution graph.",
+      "historical_output": "# Fluxlet\n\nFluxlet is a small workflow engine for Python teams.\n\n## Installation\n\n```bash\npip install fluxlet\n```",
+      "current_broken_output": "Fluxlet is a small workflow engine for Python teams. It coordinates reliable data jobs with typed steps, local retries, and an inspectable execution graph.",
+      "new_summary": "Fluxlet helps Python teams coordinate dependable data workflows through typed steps and local retry handling. Its inspectable execution graph makes job behavior easier to understand while developing or troubleshooting pipelines."
+    },
+    {
+      "id": "very-long-readme",
+      "description": "An observability toolkit for teams operating distributed event systems.",
+      "readme": "# Signal Harbor\n\nSignal Harbor connects traces, lag metrics, and event schemas so platform teams can diagnose distributed streams from one workspace.\n\n## Features\n\nIt correlates consumer lag with deployments and schema changes.\n\n## Installation\n\nRun npm install signal-harbor.\n\n## License\n\nLicensed under the Example License.",
+      "repeat_readme_paragraph": "Architecture notes explain brokers, partitions, retention policies, consumers, dashboards, alerts, deployments, and incident review procedures in extensive detail.",
+      "repeat": 180,
+      "historical_output": "# Signal Harbor\n\nA complete structured rewrite with architecture, installation commands, configuration references, changelog entries, and license details.",
+      "current_broken_output": "Signal Harbor connects traces, lag metrics, and event schemas so platform teams can diagnose distributed streams from one workspace. Architecture notes explain brokers, partitions, retention policies, consumers, dashboards, alerts, deployments, and incident review procedures in extensive detail.",
+      "new_summary": "Signal Harbor gives platform teams one place to investigate distributed event systems by connecting traces, consumer lag, and schema changes. It stands out by correlating operational symptoms with deployments, helping teams narrow down stream incidents faster."
+    },
+    {
+      "id": "image-heavy-readme",
+      "description": "A visual regression workspace for design-system maintainers.",
+      "readme": "# Prism Deck\n\n![dashboard](docs/images/dashboard.png)\n![diff](https://example.invalid/diff.webp)\n\nPrism Deck lets design-system maintainers review component snapshots and discuss visual regressions together.\n\n## Highlights\n\nIt groups diffs by component and release.",
+      "historical_output": "# Prism Deck\n\n![dashboard](docs/images/dashboard.png)\n\nA rewritten full document containing every image and section.",
+      "current_broken_output": "Prism Deck lets design-system maintainers review component snapshots and discuss visual regressions together. It groups diffs by component and release.",
+      "new_summary": "Prism Deck gives design-system maintainers a shared workspace for reviewing component snapshots and visual regressions. Grouping diffs by component and release helps reviewers focus on the changes most relevant to an upcoming ship."
+    },
+    {
+      "id": "code-installation-heavy-readme",
+      "description": "A policy simulator for infrastructure teams evaluating access changes.",
+      "readme": "# Gatehouse\n\nGatehouse simulates infrastructure access policies before teams deploy them.\n\n## Installation\n\n```bash\ncargo install gatehouse\ngatehouse apply policy.yaml\n```\n\n## API Reference\n\nCall evaluate(policy, request).",
+      "historical_output": "# Gatehouse\n\n## Installation\n\n```bash\ncargo install gatehouse\n```\n\n## API Reference\n\nCall evaluate(policy, request).",
+      "current_broken_output": "Gatehouse simulates infrastructure access policies before teams deploy them. Installation cargo install gatehouse gatehouse apply policy.yaml API Reference Call evaluate(policy, request).",
+      "new_summary": "Gatehouse helps infrastructure teams evaluate access-policy changes before those changes reach live environments. Its simulation-first workflow makes policy review safer by showing likely authorization outcomes ahead of deployment."
+    },
+    {
+      "id": "badge-heavy-readme",
+      "description": "A dependency-health dashboard for maintainers of large JavaScript workspaces.",
+      "readme": "[![build](https://img.shields.io/badge/build-passing-green)](https://ci.invalid) [![coverage](https://img.shields.io/badge/coverage-99-green)](https://coverage.invalid)\n\n# Orchard\n\nOrchard helps maintainers find stale and risky dependencies across large JavaScript workspaces. It prioritizes upgrade work using release cadence and workspace impact.",
+      "historical_output": "[![build](https://img.shields.io/badge/build-passing-green)](https://ci.invalid)\n\n# Orchard\n\nA complete rewritten README.",
+      "current_broken_output": "Orchard helps maintainers find stale and risky dependencies across large JavaScript workspaces. It prioritizes upgrade work using release cadence and workspace impact.",
+      "new_summary": "Orchard helps maintainers identify stale or risky dependencies across large JavaScript workspaces. It differentiates upgrade priorities using both release cadence and workspace impact, directing attention toward changes with the broadest effect."
+    },
+    {
+      "id": "empty-readme-description",
+      "description": "A collaborative query notebook for analysts exploring warehouse data with reviewable SQL history.",
+      "readme": "",
+      "historical_output": "",
+      "current_broken_output": "No summary available.",
+      "new_summary": "This collaborative query notebook helps analysts explore warehouse data while keeping SQL changes easy to review. Its shared, traceable query history supports teams that need context around how an analysis evolved."
+    }
+  ],
+  "generation_failures": [
+    {
+      "id": "copied-source-output",
+      "model_output": "{\"summary\":\"Signal Harbor connects traces, lag metrics, and event schemas so platform teams can diagnose distributed streams from one workspace. Architecture notes explain brokers, partitions, retention policies, consumers, dashboards, alerts, deployments, and incident review procedures in extensive detail.\"}",
+      "expected_result": "repair_then_fallback"
+    },
+    {
+      "id": "malformed-output",
+      "model_output": "summary: this is not a JSON object",
+      "expected_result": "repair_then_fallback"
+    },
+    {
+      "id": "rate-limited-provider",
+      "http_statuses": [429, 429, 429],
+      "expected_result": "description_fallback"
+    },
+    {
+      "id": "crash-after-ml-response",
+      "expected_result": "duplicate_replays_qdrant_artifact"
+    }
+  ]
+}

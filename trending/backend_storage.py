@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from typing import Any
 import uuid
 
-from acquisition.backend_client import BackendIngestionClient, repository_upsert_record
+from acquisition.backend_client import (
+    MAX_BODY_BYTES,
+    BackendIngestionClient,
+    repository_upsert_record,
+)
 from acquisition.github_graphql_client import GitHubGraphQLClient
 from acquisition.repository_enricher import RepositoryEnricher
 
@@ -44,6 +49,16 @@ class BackendTrendingStorage:
                 f"refusing incomplete trending snapshot: enriched {len(enriched)}/"
                 f"{len(repositories)} repositories"
             )
+        incomplete = [
+            source.repo_id
+            for source in enriched
+            if list(getattr(source, "warnings", []) or [])
+        ]
+        if incomplete:
+            raise RuntimeError(
+                "refusing incomplete trending snapshot: README acquisition failed for "
+                + ", ".join(incomplete)
+            )
         trending_by_name = {
             str(repository.get("full_name")): repository
             for repository in repositories
@@ -51,22 +66,27 @@ class BackendTrendingStorage:
         records: list[dict[str, Any]] = []
         for rank, source in enumerate(enriched, start=1):
             record = repository_upsert_record(source)
-            # A trending snapshot is one atomic request under the backend's
-            # 256 KB limit; repository embedding jobs retain the full content.
-            record["readme"] = record["readme"][:4000]
             trend = trending_by_name.get(record["full_name"], {})
             record["rank"] = rank
             if trend.get("daily_stars") is not None:
                 record["score"] = float(trend.get("daily_stars") or 0)
             records.append(record)
-        self.backend.publish_trending_snapshot(
-            {
-                "snapshot_id": str(uuid.uuid4()),
-                "period": "daily",
-                "computed_at": computed_at.astimezone(timezone.utc).isoformat(),
-                "source": "github-trending",
-                "repositories": records,
-            }
+        snapshot = {
+            "snapshot_id": str(uuid.uuid4()),
+            "period": "daily",
+            "computed_at": computed_at.astimezone(timezone.utc).isoformat(),
+            "source": "github-trending",
+            "repositories": records,
+        }
+        encoded_size = len(
+            json.dumps(snapshot, separators=(",", ":"), ensure_ascii=False).encode(
+                "utf-8"
+            )
         )
+        if encoded_size > MAX_BODY_BYTES:
+            raise ValueError(
+                "refusing trending snapshot larger than the 8 MiB transport limit"
+            )
+        self.backend.publish_trending_snapshot(snapshot)
         self._last_refresh = computed_at
         return len(records)

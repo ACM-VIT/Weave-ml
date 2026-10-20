@@ -115,7 +115,7 @@ rollout gates are in the [V2 production operations runbook](docs/PRODUCTION_RUNB
 
 ## Schema Cutover Contract
 
-The V2 boundary keeps backend-owned product state in `app` and immutable delivery telemetry in `telemetry`. Online ML uses only Redis and Qdrant and accepts versioned backend-owned jobs.
+The V2 boundary keeps backend-owned product state in `app` and immutable delivery telemetry in `telemetry`. Online ML accepts versioned backend-owned jobs, uses Redis and Qdrant for derived state, and sends only bounded derived repository material to the scoped card-summary provider.
 
 New work must follow these boundaries:
 
@@ -152,8 +152,10 @@ and atomically upserts the repository vector and payload.
 
 Production starts from [`deploy/production.env.example`](deploy/production.env.example)
 and keeps the completed file root-owned at `/etc/gh-social/ml.env` with mode
-`600`. It must contain no database, GitHub, or LLM-provider credentials. Run the
-network-free preflight before a manual restart:
+`600`. It must contain no database, GitHub, or legacy README-rewrite provider
+credentials. The only online LLM credential is the scoped `SUMMARY_API_KEY`
+required by the bounded card-summary path. Run the network-free preflight
+before a manual restart:
 
 Production Redis configuration is transport-aware: use an ACL-authenticated
 `redis://` URL for a private, network-isolated endpoint, or the equivalent

@@ -9,6 +9,7 @@ from typing import Mapping
 
 
 _ROUTES = {
+    "/api/v2/search/repositories",
     "/api/v2/recommendations/generate",
     "/api/v2/feedback/batch",
     "/api/v2/repositories/embed",

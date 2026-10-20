@@ -17,6 +17,7 @@ from api import main as api_main
 from api.contracts import OnboardingJob, RepositoryRefreshJob
 from api.v2 import _onboard_user_job, _repository_job_lock_settings
 from embedding import runtime as embedding_runtime
+from embedding.runtime import EmbeddingDeadlineExceeded
 from feedback.v2 import FeedbackEventIdConflictError
 from retrieval.v2_retriever import RecommendationBatch, RankedRepository
 
@@ -110,6 +111,24 @@ def test_stale_onboarding_skips_embedding_inference() -> None:
 
     assert exc_info.value.status_code == 409
     pipeline_factory.assert_not_called()
+
+
+def test_onboarding_timeout_is_reported_as_retryable(monkeypatch) -> None:
+    monkeypatch.setenv("INTERNAL_API_SECRET", "test-internal-secret")
+
+    async def exhausted_deadline(*_args, **_kwargs):
+        raise EmbeddingDeadlineExceeded("queued too long")
+
+    with patch("api.v2.run_embedding_job", side_effect=exhausted_deadline):
+        response = TestClient(api_main.app).post(
+            "/api/v2/users/onboard",
+            headers={"x-internal-secret": "test-internal-secret"},
+            json=_onboarding_job().model_dump(mode="json"),
+        )
+
+    assert response.status_code == 504
+    assert response.json()["retryable"] is True
+    assert response.headers["retry-after"] == "2"
 
 
 def test_recommendation_context_reaches_retrieval_and_reports_serving_metadata(
@@ -288,6 +307,35 @@ def test_declared_oversized_request_is_rejected_before_parsing(monkeypatch) -> N
     )
     assert response.status_code == 413
     assert response.json()["code"] == "REQUEST_TOO_LARGE"
+
+
+def test_larger_body_allowance_is_scoped_to_repository_embed(monkeypatch) -> None:
+    monkeypatch.setenv("INTERNAL_API_SECRET", "test-internal-secret")
+    client = TestClient(api_main.app)
+    allowed_for_repository = client.post(
+        "/api/v2/repositories/embed",
+        headers={
+            "x-internal-secret": "test-internal-secret",
+            "content-length": str(api_main.MAX_REQUEST_BODY_BYTES + 1),
+            "content-type": "application/json",
+        },
+        content=b"{}",
+    )
+    too_large_for_repository = client.post(
+        "/api/v2/repositories/embed",
+        headers={
+            "x-internal-secret": "test-internal-secret",
+            "content-length": str(
+                api_main.REPOSITORY_EMBED_MAX_REQUEST_BODY_BYTES + 1
+            ),
+            "content-type": "application/json",
+        },
+        content=b"{}",
+    )
+
+    assert allowed_for_repository.status_code == 422
+    assert too_large_for_repository.status_code == 413
+    assert too_large_for_repository.json()["code"] == "REQUEST_TOO_LARGE"
 
 
 def test_feedback_conflict_reports_safe_partial_batch_progress(monkeypatch) -> None:

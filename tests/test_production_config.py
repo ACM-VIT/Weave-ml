@@ -6,6 +6,8 @@ import json
 from secrets import token_hex
 import socket
 
+import pytest
+
 from scripts.validate_production_config import (
     load_env_file,
     main,
@@ -78,7 +80,21 @@ def valid_production_env() -> dict[str, str]:
         "MIN_ELIGIBLE_REPOSITORIES": "1000",
         "README_CHUNK_CHARS": "2500",
         "README_CHUNK_OVERLAP_CHARS": "250",
+        "SUMMARY_PROVIDER": "openrouter",
+        "SUMMARY_API_URL": "https://openrouter.ai/api/v1/chat/completions",
+        "SUMMARY_API_KEY": "summary-test-key-strong",
+        "SUMMARY_MODEL_ID": "meta-llama/llama-3.3-70b-instruct",
+        "SUMMARY_PROMPT_VERSION": "repo-card-summary-v1",
+        "SUMMARY_FORMAT_VERSION": "repo-card-summary-json-v1",
+        "SUMMARY_INPUT_MAX_CHARS": "12000",
+        "SUMMARY_TEMPERATURE": "0.1",
+        "SUMMARY_MAX_OUTPUT_TOKENS": "240",
+        "SUMMARY_REQUEST_TIMEOUT_SECONDS": "30",
+        "SUMMARY_RPM_LIMIT": "60",
+        "SUMMARY_MAX_RETRIES": "2",
+        "SUMMARY_RETRY_BASE_SECONDS": "1",
         "EMBEDDING_WARMUP_ON_STARTUP": "true",
+        "EMBEDDING_TIMEOUT_SECONDS": "30",
         "EMBEDDING_MAX_CONCURRENCY": "1",
         "EMBEDDING_EXECUTOR_WORKERS": "1",
         "EMBEDDING_MAX_OUTSTANDING_JOBS": "4",
@@ -103,6 +119,9 @@ def valid_production_env() -> dict[str, str]:
         "V2_REFRESH_EXECUTOR_WORKERS": "2",
         "V2_REFRESH_MAX_OUTSTANDING": "4",
         "V2_REFRESH_TIMEOUT_SECONDS": "45",
+        "V2_SEARCH_EXECUTOR_WORKERS": "1",
+        "V2_SEARCH_MAX_OUTSTANDING": "4",
+        "V2_SEARCH_TIMEOUT_SECONDS": "4",
         "V2_HEALTH_EXECUTOR_WORKERS": "2",
         "V2_HEALTH_MAX_OUTSTANDING": "4",
         "REPOSITORY_JOB_LOCK_TTL_MS": "600000",
@@ -122,6 +141,30 @@ def issue_names(environment: dict[str, str]) -> set[str]:
 
 def test_valid_production_environment_passes() -> None:
     assert validate_production_config(valid_production_env()) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("SUMMARY_REQUEST_TIMEOUT_SECONDS", "30.1"),
+        ("SUMMARY_MAX_RETRIES", "3"),
+        ("SUMMARY_RETRY_BASE_SECONDS", "1.1"),
+    ],
+)
+def test_production_rejects_summary_settings_that_can_overrun_the_lease(
+    field: str, value: str
+) -> None:
+    environment = valid_production_env()
+    environment[field] = value
+
+    assert field in issue_names(environment)
+
+
+def test_production_requires_a_bounded_embedding_timeout() -> None:
+    environment = valid_production_env()
+    environment["EMBEDDING_TIMEOUT_SECONDS"] = "301"
+
+    assert "EMBEDDING_TIMEOUT_SECONDS" in issue_names(environment)
 
 
 def test_valid_tls_redis_production_environment_passes() -> None:
@@ -189,6 +232,8 @@ def test_service_executor_capacity_is_bounded() -> None:
         V2_FEEDBACK_MAX_OUTSTANDING="2",
         V2_REFRESH_TIMEOUT_SECONDS="121",
         V2_HEALTH_EXECUTOR_WORKERS="5",
+        V2_SEARCH_EXECUTOR_WORKERS="2",
+        V2_SEARCH_MAX_OUTSTANDING="1",
     )
 
     names = issue_names(environment)
@@ -196,7 +241,51 @@ def test_service_executor_capacity_is_bounded() -> None:
         "V2_FEEDBACK_MAX_OUTSTANDING",
         "V2_REFRESH_TIMEOUT_SECONDS",
         "V2_HEALTH_EXECUTOR_WORKERS",
+        "V2_SEARCH_MAX_OUTSTANDING",
     } <= names
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("V2_SEARCH_EXECUTOR_WORKERS", "0"),
+    ("V2_SEARCH_EXECUTOR_WORKERS", "5"),
+    ("V2_SEARCH_MAX_OUTSTANDING", "0"),
+    ("V2_SEARCH_MAX_OUTSTANDING", "17"),
+    ("V2_SEARCH_TIMEOUT_SECONDS", "0.09"),
+    ("V2_SEARCH_TIMEOUT_SECONDS", "10.1"),
+    ("V2_SEARCH_TIMEOUT_SECONDS", "nan"),
+])
+def test_search_preflight_rejects_settings_that_fail_runtime_startup(field, value, monkeypatch):
+    from api.runtime import _settings
+
+    environment = valid_production_env()
+    environment[field] = value
+    for name in ("V2_SEARCH_EXECUTOR_WORKERS", "V2_SEARCH_MAX_OUTSTANDING", "V2_SEARCH_TIMEOUT_SECONDS"):
+        monkeypatch.setenv(name, environment[name])
+
+    with pytest.raises(ValueError):
+        _settings("search")
+    assert field in issue_names(environment)
+
+
+@pytest.mark.parametrize(("workers", "capacity", "timeout"), [
+    ("1", "4", "4"),
+    ("1", "1", "0.1"),
+    ("4", "16", "10"),
+], ids=["defaults", "minimum", "maximum"])
+def test_search_preflight_and_runtime_accept_defaults_and_bounds(workers, capacity, timeout, monkeypatch):
+    from api.runtime import _settings
+
+    environment = valid_production_env()
+    environment.update(
+        V2_SEARCH_EXECUTOR_WORKERS=workers,
+        V2_SEARCH_MAX_OUTSTANDING=capacity,
+        V2_SEARCH_TIMEOUT_SECONDS=timeout,
+    )
+    for name in ("V2_SEARCH_EXECUTOR_WORKERS", "V2_SEARCH_MAX_OUTSTANDING", "V2_SEARCH_TIMEOUT_SECONDS"):
+        monkeypatch.setenv(name, environment[name])
+
+    assert _settings("search") == (int(workers), int(capacity), float(timeout))
+    assert validate_production_config(environment) == []
 
 
 def test_online_env_rejects_database_and_acquisition_credentials() -> None:
@@ -207,6 +296,25 @@ def test_online_env_rejects_database_and_acquisition_credentials() -> None:
     names = issue_names(environment)
 
     assert {"DATABASE_URL", "GITHUB_TOKEN"} <= names
+
+
+def test_summary_provider_configuration_is_scoped_and_bounded() -> None:
+    environment = valid_production_env()
+    environment.update(
+        SUMMARY_API_URL="http://provider.internal/v1/chat/completions",
+        SUMMARY_API_KEY="replace-me",
+        SUMMARY_PROMPT_VERSION="unversioned",
+        SUMMARY_TEMPERATURE="0.9",
+    )
+
+    names = issue_names(environment)
+
+    assert {
+        "SUMMARY_API_URL",
+        "SUMMARY_API_KEY",
+        "SUMMARY_PROMPT_VERSION",
+        "SUMMARY_TEMPERATURE",
+    } <= names
 
 
 def test_url_validation_rejects_wrong_schemes_and_placeholders() -> None:

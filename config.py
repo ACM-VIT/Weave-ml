@@ -150,6 +150,7 @@ QDRANT_PAYLOAD_INDEX_SCHEMA = {
     "feature_spec_version": "keyword",
     "model_version": "keyword",
     "primary_language": "keyword",
+    "topics": "keyword",
     "category": "keyword",
     "discovery_category": "keyword",
     "discovery_band": "keyword",

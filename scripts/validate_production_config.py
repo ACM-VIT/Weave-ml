@@ -533,6 +533,7 @@ def _validate_vector_and_model(v: _Validator) -> None:
             "must be true so deployment health validates the baked model",
         )
     v.integer("EMBEDDING_MAX_CONCURRENCY", minimum=1, maximum=8)
+    v.number("EMBEDDING_TIMEOUT_SECONDS", minimum=0.1, maximum=300)
     embedding_workers = v.integer(
         "EMBEDDING_EXECUTOR_WORKERS", minimum=1, maximum=8
     )
@@ -566,6 +567,45 @@ def _validate_vector_and_model(v: _Validator) -> None:
             "TRANSFORMERS_OFFLINE",
             "must be true to prevent runtime downloads",
         )
+
+
+def _validate_card_summary(v: _Validator) -> None:
+    provider = v.raw("SUMMARY_PROVIDER", required=True)
+    if provider is not None and provider != "openrouter":
+        v.issue("SUMMARY_PROVIDER", "must be exactly 'openrouter'")
+
+    api_url = v.url("SUMMARY_API_URL", schemes={"https"})
+    if api_url is not None:
+        parsed = urlsplit(api_url)
+        if parsed.username is not None or parsed.password is not None:
+            v.issue("SUMMARY_API_URL", "must not contain credentials")
+        if parsed.query:
+            v.issue("SUMMARY_API_URL", "must not contain query options")
+
+    api_key = v.raw("SUMMARY_API_KEY", required=True)
+    if api_key is not None and (
+        len(api_key.encode("utf-8")) < 16 or _looks_like_placeholder(api_key)
+    ):
+        v.issue(
+            "SUMMARY_API_KEY",
+            "must be a non-placeholder provider key of at least 16 bytes",
+        )
+    model = v.raw("SUMMARY_MODEL_ID", required=True)
+    if model is not None and (
+        len(model) > 256
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}", model)
+        or _looks_like_placeholder(model)
+    ):
+        v.issue("SUMMARY_MODEL_ID", "must be a safe, non-placeholder model ID")
+    v.exact("SUMMARY_PROMPT_VERSION", "repo-card-summary-v1")
+    v.exact("SUMMARY_FORMAT_VERSION", "repo-card-summary-json-v1")
+    v.integer("SUMMARY_INPUT_MAX_CHARS", minimum=1_000, maximum=30_000)
+    v.number("SUMMARY_TEMPERATURE", minimum=0, maximum=0.2)
+    v.integer("SUMMARY_MAX_OUTPUT_TOKENS", minimum=64, maximum=512)
+    v.number("SUMMARY_REQUEST_TIMEOUT_SECONDS", minimum=0.1, maximum=30)
+    v.number("SUMMARY_RPM_LIMIT", minimum=0.01, maximum=600)
+    v.integer("SUMMARY_MAX_RETRIES", minimum=0, maximum=2)
+    v.number("SUMMARY_RETRY_BASE_SECONDS", minimum=0.1, maximum=1)
 
 
 def _validate_ranker_and_retrieval(v: _Validator) -> None:
@@ -632,6 +672,7 @@ def _validate_ranker_and_retrieval(v: _Validator) -> None:
         )
 
     for prefix, maximum_workers, maximum_capacity, maximum_timeout in (
+        ("V2_SEARCH", 4, 16, 10),
         ("V2_FEEDBACK", 8, 64, 30),
         ("V2_REFRESH", 8, 32, 120),
         ("V2_HEALTH", 4, 16, 30),
@@ -757,6 +798,7 @@ def validate_production_config(
 
     _validate_feedback(validator)
     _validate_vector_and_model(validator)
+    _validate_card_summary(validator)
     _validate_ranker_and_retrieval(validator)
     _validate_locks_and_smoke(validator)
     return validator.issues

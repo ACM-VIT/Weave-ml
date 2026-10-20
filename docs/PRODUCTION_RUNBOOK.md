@@ -5,11 +5,14 @@ This runbook is the operating contract for the Redis + Qdrant online ML path:
 ```text
 backend outbox/API -> ML API -> Redis stream -> ordered feedback worker -> Qdrant
                     ML API -> Qdrant retrieval/ranking -> backend feed serve
+                    ML API -> scoped summary provider (bounded derived text only)
 ```
 
-PostgreSQL, GitHub, OpenRouter, acquisition, training, and trending credentials
-do not belong in either online container. The backend owns product state and
-canonical UUIDs; ML owns derived vectors and recommendation computation.
+PostgreSQL, GitHub, legacy OpenRouter, acquisition, training, and trending
+credentials do not belong in either online container. A dedicated scoped
+`SUMMARY_API_KEY` is the sole online LLM credential. The backend owns product
+state and canonical UUIDs; ML owns derived vectors and recommendation
+computation.
 
 ## Release gates
 
@@ -79,15 +82,16 @@ purpose and production rule.
 | Feedback health | `FEEDBACK_HEALTH_WARN_*`, `FEEDBACK_HEALTH_MAX_*` | Warnings do not exceed hard failures; hard values fail readiness. |
 | Qdrant | `QDRANT_URL`, `QDRANT_AUTH_MODE=api_key`, required `QDRANT_API_KEY`, `QDRANT_TIMEOUT_SECONDS`, `QDRANT_DISTANCE`, `QDRANT_COLLECTION_NAME`, `QDRANT_VECTOR_NAME`, `USER_PROFILES_COLLECTION`, optional `USER_PROFILE_VECTOR_NAME`, `VECTOR_DIMENSION`, `V2_USER_COLLECTION_REQUIRED` | Qdrant 1.18.0+ and authenticated, restricted writes are required for fencing and serving-marker integrity. Repository and user contracts must be compatible. The current user collection uses its unnamed vector. |
 | Embedding | `EMBEDDING_MODEL`, `EMBEDDING_MODEL_REVISION`, `REPOSITORY_EMBEDDING_VERSION`, `V2_COMPATIBLE_EMBEDDING_VERSIONS`, `REPOSITORY_FEATURE_SPEC_VERSION`, `V2_REQUIRED_FEATURE_SPEC_VERSION`, `V2_REQUIRED_CONTENT_VERSION`, `V2_ALLOW_MISSING_EMBEDDING_REVISION`, `README_CHUNK_CHARS`, `README_CHUNK_OVERLAP_CHARS` | Exact baked model/revision; explicit compatible versions; missing revision is forbidden in production; chunking is bounded. |
+| Card summary | `SUMMARY_PROVIDER`, `SUMMARY_API_URL`, `SUMMARY_API_KEY`, `SUMMARY_MODEL_ID`, `SUMMARY_PROMPT_VERSION`, `SUMMARY_FORMAT_VERSION`, `SUMMARY_INPUT_MAX_CHARS`, `SUMMARY_TEMPERATURE`, `SUMMARY_MAX_OUTPUT_TOKENS`, `SUMMARY_REQUEST_TIMEOUT_SECONDS`, `SUMMARY_RPM_LIMIT`, `SUMMARY_MAX_RETRIES`, `SUMMARY_RETRY_BASE_SECONDS` | Dedicated least-privilege provider key; HTTPS transport; frozen prompt/schema identity; low temperature; bounded input, output, timeout, retries, and request rate. |
 | Readiness | `MIN_ELIGIBLE_REPOSITORIES` | Must be a positive capacity chosen for the launch market, not merely `1` for convenience. |
 | Model runtime | `EMBEDDING_WARMUP_ON_STARTUP`, `EMBEDDING_MAX_CONCURRENCY`, `EMBEDDING_EXECUTOR_WORKERS`, `EMBEDDING_CPU_THREADS`, `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE` | Warmup and offline flags are true; concurrency is bounded. |
 | Ranking | `ML_MODEL_VERSION`, `V2_HEAVY_RANKER_ENABLED`, `V2_HEAVY_RANKER_REQUIRED`, `V2_HEAVY_RANKER_TRAFFIC_PERCENT`, `V2_HEAVY_RANKER_CANARY_SALT`, `V2_ALLOW_UNQUALIFIED_HEAVY_RANKER`, `V2_EXPLORATION_FRACTION`, `V2_MAX_SAME_LANGUAGE` | Unqualified artifacts are forbidden. Required-heavy mode mandates 100% traffic and fails closed rather than serving the hybrid ranker. |
-| Service isolation | `V2_RECOMMENDATION_TIMEOUT_SECONDS`, `V2_RECOMMENDATION_EXECUTOR_WORKERS`, `V2_RECOMMENDATION_MAX_OUTSTANDING`; the `V2_FEEDBACK_*`, `V2_REFRESH_*`, and `V2_HEALTH_*` executor-worker, max-outstanding, and timeout variables | Recommendations, feedback mutation, repository refresh, and health work use separate bounded executors with fail-fast admission. Capacity includes running and queued work. Timed-out work retains capacity until it really exits; do not raise limits without host-specific load and dependency-failure tests. |
+| Service isolation | `V2_RECOMMENDATION_TIMEOUT_SECONDS`, `V2_RECOMMENDATION_EXECUTOR_WORKERS`, `V2_RECOMMENDATION_MAX_OUTSTANDING`; the `V2_FEEDBACK_*`, `V2_REFRESH_*`, `V2_SEARCH_*`, and `V2_HEALTH_*` executor-worker, max-outstanding, and timeout variables | Recommendations, feedback mutation, repository refresh, semantic search, and health work use separate bounded executors with fail-fast admission. Search shares the frozen encoder with indexing but does not queue behind summary-provider waits. Capacity includes running and queued work. Timed-out work retains capacity until it really exits; do not raise limits without host-specific load and dependency-failure tests. |
 | Repository jobs | `REPOSITORY_JOB_LOCK_TTL_MS`, `REPOSITORY_JOB_LOCK_WAIT_SECONDS` | Renewable lock TTL exceeds wait time. |
 | Deployment smoke | `ML_SMOKE_USER_ID`, `ML_SMOKE_RECOMMENDATION_LIMIT`, `ML_SMOKE_EXPECT_MIN_ITEMS`, `ML_SMOKE_TIMEOUT_SECONDS` | Dedicated, onboarded, non-human user; bounded read-only recommendation smoke. |
 
 `DATABASE_URL`, `TEST_DATABASE_URL`, `LOCAL_DATABASE_URL`,
-`SUPABASE_DATABASE_URL`, `GITHUB_TOKEN`, `OPENROUTER_API_KEY`, and
+`SUPABASE_DATABASE_URL`, `GITHUB_TOKEN`, legacy `OPENROUTER_API_KEY`, and
 `GROQ_API_KEY` are rejected in the online env file.
 
 ## Model cache and collection migration

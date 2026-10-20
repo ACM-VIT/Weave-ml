@@ -16,6 +16,11 @@ from numbers import Real
 from types import MappingProxyType
 from typing import Any
 
+from summarization.contracts import (
+    CARD_SUMMARY_MAX_CHARS,
+    card_summary_from_payload,
+)
+
 from config import (
     EMBEDDING_MODEL_REVISION,
     QDRANT_COLLECTION_NAME,
@@ -203,6 +208,13 @@ REPOSITORY_PAYLOAD_FIELD_TYPES: Mapping[str, type | tuple[type, ...]] = MappingP
         "model_version": str,
         "indexed_at": str,
         "source_hash": str,
+        "card_summary": (str, type(None)),
+        "card_summary_highlights": list,
+        "card_summary_prompt_version": (str, type(None)),
+        "card_summary_model_version": (str, type(None)),
+        "card_summary_format_version": (str, type(None)),
+        "card_summary_source": (str, type(None)),
+        "card_summary_artifact_hash": (str, type(None)),
         "serving_eligibility_version": str,
     }
 )
@@ -231,7 +243,7 @@ _FINITE_NUMBER_FIELDS = {
     "trend_velocity",
 }
 _TIMESTAMP_FIELDS = {"created_at", "updated_at", "pushed_at", "indexed_at"}
-_STRING_LIST_FIELDS = {"languages", "topics", "tags"}
+_STRING_LIST_FIELDS = {"languages", "topics", "tags", "card_summary_highlights"}
 
 
 def validate_repository_payload(
@@ -313,6 +325,30 @@ def validate_repository_payload(
         if any(not isinstance(item, str) for item in payload[field_name]):
             raise TypeError(f"repository payload field {field_name!r} must contain strings")
 
+    summary_identity_fields = (
+        "card_summary",
+        "card_summary_highlights",
+        "card_summary_prompt_version",
+        "card_summary_model_version",
+        "card_summary_format_version",
+        "card_summary_source",
+        "card_summary_artifact_hash",
+    )
+    has_summary_material = any(
+        bool(payload[field])
+        if field == "card_summary_highlights"
+        else payload[field] is not None
+        for field in summary_identity_fields
+    )
+    summary_artifact = card_summary_from_payload(payload)
+    if has_summary_material and summary_artifact is None:
+        raise ValueError("repository payload contains a partial or invalid card summary artifact")
+    if summary_artifact is not None:
+        if len(summary_artifact.summary) > CARD_SUMMARY_MAX_CHARS:
+            raise ValueError("repository card summary exceeds the hard character limit")
+        if summary_artifact.source not in {"generated", "description_fallback"}:
+            raise ValueError("repository card summary source is invalid")
+
     if payload["embedding_dim"] != REPOSITORY_COLLECTION_CONTRACT.vector_size:
         raise ValueError(
             "repository payload embedding_dim does not match the collection contract"
@@ -382,6 +418,13 @@ def repository_payload_defaults() -> dict[str, object]:
         "feature_spec_version": REPOSITORY_FEATURE_SPEC_VERSION,
         "content_version": 0,
         "model_version": REPOSITORY_EMBEDDING_MODEL,
+        "card_summary": None,
+        "card_summary_highlights": [],
+        "card_summary_prompt_version": None,
+        "card_summary_model_version": None,
+        "card_summary_format_version": None,
+        "card_summary_source": None,
+        "card_summary_artifact_hash": None,
         REPOSITORY_SERVING_ELIGIBILITY_FIELD: (
             REPOSITORY_SERVING_ELIGIBILITY_VERSION
         ),

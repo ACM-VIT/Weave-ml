@@ -11,6 +11,10 @@ from datetime import datetime, timedelta, timezone
 from numbers import Integral, Real
 from typing import Any
 
+from summarization.contracts import CardSummaryArtifact, card_summary_payload
+from summarization.pipeline import description_fallback_artifact
+from utils.readme_processor import clean_markdown_copy
+
 def _parse_list_field(val: Any) -> list[str]:
     if not val:
         return []
@@ -137,6 +141,7 @@ class RepositoryEmbeddingResult:
     source_hash: str
     embedding_model: str
     embedding_version: str
+    card_summary: CardSummaryArtifact | None = None
 
 
 def build_readme_text(source: Any) -> str:
@@ -149,6 +154,9 @@ def build_readme_text(source: Any) -> str:
         return str(clean_text)
 
     payload = coerce_payload(source)
+    raw_markdown = payload.get("readme")
+    if isinstance(raw_markdown, str) and raw_markdown.strip():
+        return clean_markdown_copy(raw_markdown)
     paragraphs = payload.get("extracted_paragraphs") or []
     if isinstance(paragraphs, list):
         return "\n\n".join(str(item) for item in paragraphs if item)
@@ -221,6 +229,7 @@ def build_vector_payload(
     readme_chunks: int,
     source_hash: str,
     config: RepositoryEmbeddingConfig,
+    card_summary: CardSummaryArtifact | None = None,
 ) -> dict[str, Any]:
     """Build the Qdrant payload schema for one repository vector."""
     normalized_repo = dict(repo)
@@ -343,6 +352,10 @@ def build_vector_payload(
         "indexed_at": datetime.now(timezone.utc).isoformat(),
         "source_hash": _string_field(source_hash, "source_hash"),
     }
+    artifact = card_summary or description_fallback_artifact(
+        normalized_repo,
+    )
+    payload.update(card_summary_payload(artifact))
     validate_repository_payload(payload, require_serving_eligibility=False)
     return payload
 

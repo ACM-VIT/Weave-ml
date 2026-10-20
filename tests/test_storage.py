@@ -171,6 +171,29 @@ class TestUpsertRepositories:
         assert mock_cursor.execute.called
         assert mock_conn.commit.called
 
+    def test_upsert_preserves_full_readme_without_legacy_length_cap(
+        self, mock_database_connector, sample_normalized_repo
+    ):
+        storage = TrendingStorage()
+        storage.connector = mock_database_connector
+        storage.enabled = True
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_database_connector.connect.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cursor
+        mock_cursor.fetchone.return_value = None
+        canonical_readme = "# README\n\n" + "x" * 20_000
+        repository = {**sample_normalized_repo, "readme": canonical_readme}
+
+        assert storage.upsert_repositories([repository]) == 1
+
+        insert_call = next(
+            call
+            for call in mock_cursor.execute.call_args_list
+            if "INSERT INTO" in str(call.args[0])
+        )
+        assert insert_call.args[1][13] == canonical_readme
+
     def test_upsert_updates_existing_repository(self, mock_database_connector, sample_normalized_repo):
         """Test upsert updates existing repository."""
         storage = TrendingStorage()

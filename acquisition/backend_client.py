@@ -12,7 +12,10 @@ import requests
 
 
 MAX_RECORDS = 100
-MAX_BODY_BYTES = 256 * 1024
+# The ingestion contract permits a canonical README of up to one million
+# characters. Keep transport bounded while allowing UTF-8 and JSON escaping
+# overhead for a single maximum-size repository record.
+MAX_BODY_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -123,9 +126,11 @@ class BackendIngestionClient:
         )
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        encoded = json.dumps(
+            payload, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
         if len(encoded) > MAX_BODY_BYTES:
-            raise ValueError("backend request exceeds the 256 KB body limit")
+            raise ValueError("backend request exceeds the 8 MiB body limit")
         headers = {
             "content-type": "application/json",
             "x-internal-secret": self.internal_secret,
@@ -161,6 +166,20 @@ class BackendIngestionClient:
 
 
 def repository_upsert_record(source: Any) -> dict[str, Any]:
+    raw_warnings = (
+        source.get("warnings", [])
+        if isinstance(source, dict)
+        else getattr(source, "warnings", [])
+    )
+    warnings = (
+        [raw_warnings]
+        if isinstance(raw_warnings, str)
+        else list(raw_warnings or [])
+    )
+    if warnings:
+        raise ValueError(
+            "repository enrichment is incomplete: " + "; ".join(map(str, warnings))[:500]
+        )
     payload = source if isinstance(source, dict) else getattr(source, "payload", {})
     raw = source if isinstance(source, dict) else getattr(source, "raw_repository", {})
     full_name = str(payload.get("full_name") or payload.get("id") or raw.get("full_name") or "").strip()
@@ -181,7 +200,28 @@ def repository_upsert_record(source: Any) -> dict[str, Any]:
     ).strip()
     if not owner_github_id.isdecimal() or int(owner_github_id) <= 0:
         raise ValueError("owner_github_id must be a positive decimal string")
-    readme = getattr(getattr(source, "readme", None), "clean_text", None)
+    readme_document = getattr(source, "readme", None)
+    canonical_readme = getattr(readme_document, "raw_markdown", None)
+    if canonical_readme is None:
+        canonical_readme = payload.get("readme")
+    readme_source_path = (
+        getattr(readme_document, "source_path", None)
+        or payload.get("readme_source_path")
+    )
+    readme_default_branch = (
+        getattr(readme_document, "default_branch", None)
+        or payload.get("readme_default_branch")
+        or raw.get("default_branch")
+    )
+    readme_base_url = (
+        getattr(readme_document, "base_url", None)
+        or payload.get("readme_base_url")
+    )
+    canonical_readme_text = (
+        None
+        if canonical_readme is None or canonical_readme == ""
+        else str(canonical_readme)
+    )
     return {
         "github_id": github_id,
         "github_node_id": github_node_id,
@@ -191,7 +231,11 @@ def repository_upsert_record(source: Any) -> dict[str, Any]:
         "name": name,
         "url": payload.get("html_url") or raw.get("html_url") or raw.get("url"),
         "description": str(payload.get("description") or ""),
-        "readme": str(readme or payload.get("readme") or ""),
+        "readme": canonical_readme_text,
+        "readme_length": len(canonical_readme_text or ""),
+        "readme_source_path": readme_source_path,
+        "readme_default_branch": readme_default_branch,
+        "readme_base_url": readme_base_url,
         "primary_language": str(payload.get("primary_language") or "Unknown"),
         "languages": list(payload.get("languages") or []),
         "topics": list(payload.get("topics") or []),
@@ -214,11 +258,12 @@ def _bounded_batches(
             json.dumps(
                 {"repositories": [record for _, record in candidate]},
                 separators=(",", ":"),
+                ensure_ascii=False,
             ).encode("utf-8")
         )
         if size > MAX_BODY_BYTES:
             if not current:
-                raise ValueError(f"repository payload for {item[0]} exceeds 256 KB")
+                raise ValueError(f"repository payload for {item[0]} exceeds 8 MiB")
             batches.append(current)
             current = [item]
         else:

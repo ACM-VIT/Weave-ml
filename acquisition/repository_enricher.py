@@ -9,9 +9,13 @@ import re
 from typing import Any
 import logging
 
-from .github_graphql_client import GitHubGraphQLClient
-from utils.readme_processor import ReadmeDocument, process_readme_payload, process_markdown
-from utils.openrouter_client import generate_readme_md
+from .github_graphql_client import (
+    FetchedReadme,
+    GitHubGraphQLClient,
+    build_readme_base_url,
+)
+from .graphql_queries import README_CANDIDATES
+from utils.readme_processor import ReadmeDocument, process_markdown
 from .identity import normalize_repository_name, repository_identity_key
 
 logger = logging.getLogger(__name__)
@@ -119,7 +123,7 @@ class RepositoryEnricher:
         for result in results:
             repo_id = result.repo_id
             owner, name = owner_name_map.get(repo_id, (None, None))
-            readme_text = ""
+            readme_text: str | FetchedReadme = ""
             if owner and name:
                 try:
                     readme_text = self.graphql_client.get_readme(owner, name)
@@ -129,13 +133,29 @@ class RepositoryEnricher:
                     logger.warning("README fetch failed for %s: %s", repo_id, exc)
 
             if readme_text:
-                readme = process_markdown(readme_text)
-                if readme.clean_text:
-                    readme.readme_md = generate_readme_md(readme.clean_text)
+                source_path = getattr(readme_text, "source_path", None)
+                default_branch = (
+                    getattr(readme_text, "default_branch", None)
+                    or result.raw_repository.get("default_branch")
+                )
+                base_url = getattr(readme_text, "base_url", None)
+                if not base_url and source_path:
+                    base_url = build_readme_base_url(
+                        owner, name, default_branch, source_path
+                    )
+                readme = process_markdown(
+                    str(readme_text),
+                    source_path=source_path,
+                    default_branch=default_branch,
+                    base_url=base_url,
+                )
                 # Patch the result with the real README data
                 result.readme = readme
                 result.payload["readme_length"] = readme.readme_length
                 result.payload["readme_md"] = readme.readme_md
+                result.payload["readme_source_path"] = readme.source_path
+                result.payload["readme_default_branch"] = readme.default_branch
+                result.payload["readme_base_url"] = readme.base_url
                 result.payload["extracted_paragraphs"] = readme.extracted_paragraphs
                 result.payload["readme_to_codebase_ratio"] = self._readme_to_codebase_ratio(
                     readme.readme_length, int(result.raw_repository.get("size") or 0)
@@ -182,23 +202,34 @@ class RepositoryEnricher:
         if languages:
             primary_language = max(languages.items(), key=lambda item: item[1])[0]
 
-        # README — use provided text, or check inline fields, or fall back to empty
+        default_branch = (data.get("defaultBranchRef") or {}).get("name")
+
+        # README — use provided text, or check inline fields, or fall back to empty.
+        # Cleaning is derived from a copy; canonical Markdown remains untouched.
+        source_path = getattr(readme_text, "source_path", None)
+        readme_default_branch = (
+            getattr(readme_text, "default_branch", None) or default_branch
+        )
+        readme_base_url = getattr(readme_text, "base_url", None)
         if readme_text is None:
             readme_text = ""
-            for key in ["readme1", "readme2", "readme3", "readme4", "readme5"]:
+            for key, candidate_path in README_CANDIDATES:
                 blob = data.get(key)
                 if blob and blob.get("text"):
                     readme_text = blob["text"]
+                    source_path = candidate_path
                     break
-
-        import base64
-        readme_payload = {
-            "content": base64.b64encode(readme_text.encode("utf-8")).decode("ascii"),
-            "encoding": "base64"
-        } if readme_text else None
-        readme = process_readme_payload(readme_payload)
-        if readme.clean_text:
-            readme.readme_md = generate_readme_md(readme.clean_text)
+        owner, _, name = full_name.partition("/")
+        if not readme_base_url and source_path:
+            readme_base_url = build_readme_base_url(
+                owner, name, readme_default_branch, source_path
+            )
+        readme = process_markdown(
+            str(readme_text or ""),
+            source_path=source_path,
+            default_branch=readme_default_branch,
+            base_url=readme_base_url,
+        )
 
         # Star history and events approximation
         stargazers = [{"starred_at": edge.get("starredAt")} for edge in data.get("stargazers", {}).get("edges", [])]
@@ -227,6 +258,7 @@ class RepositoryEnricher:
             "created_at": data.get("createdAt"),
             "updated_at": data.get("updatedAt"),
             "pushed_at": data.get("pushedAt"),
+            "default_branch": default_branch,
             "size": 0, # Cannot get size from GraphQL repo directly easily without languages sum
             "stargazers_count": data.get("stargazerCount", 0),
             "watchers_count": data.get("watchers", {}).get("totalCount", 0),
@@ -304,6 +336,9 @@ class RepositoryEnricher:
             "special_label": special_label,
             "readme_length": readme.readme_length,
             "readme_md": readme.readme_md,
+            "readme_source_path": readme.source_path,
+            "readme_default_branch": readme.default_branch,
+            "readme_base_url": readme.base_url,
             "readme_to_codebase_ratio": self._readme_to_codebase_ratio(readme.readme_length, size_kb),
             "mentionable_users_count": self._mentionable_users_count(contributors, repository),
             "delta_3d": deltas[3],

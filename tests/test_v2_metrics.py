@@ -67,3 +67,16 @@ def test_metrics_endpoint_is_authenticated_and_exposes_executor_saturation(
     assert 'ml_service_executor_capacity{operation="feedback"} 8' in response.text
     assert 'ml_service_executor_capacity{operation="recommendation"} 8' in response.text
     assert 'le="+Inf"' in response.text
+
+
+def test_search_success_and_failure_have_their_own_fixed_metric_route() -> None:
+    for status in [200, 503]:
+        metrics.record_api_request(
+            path="/api/v2/search/repositories", method="POST",
+            status_code=status, duration_seconds=0.2,
+        )
+    rendered = metrics.render_prometheus({})
+    assert 'route="/api/v2/search/repositories",status_class="2xx"' in rendered
+    assert 'route="/api/v2/search/repositories",status_class="5xx"' in rendered
+    assert 'route="/api/v2/search/repositories",le="+Inf"} 2' in rendered
+    assert '/api/v2/other' not in rendered

@@ -8,6 +8,8 @@ from collections.abc import Iterable, Mapping
 from numbers import Integral, Real
 from typing import Any
 
+from summarization.contracts import CardSummaryArtifact, card_summary_payload
+
 from config import (
     QDRANT_API_KEY,
     QDRANT_COLLECTION_NAME,
@@ -223,6 +225,36 @@ class QdrantRepositoryStore:
         self.client.set_payload(
             collection_name=self.collection_name,
             payload=dict(feature_payload),
+            points=selector,
+            wait=True,
+            ordering=self.models.WriteOrdering.STRONG,
+        )
+        return self._retrieve_point(str(expected_point.id))
+
+    def compare_and_set_card_summary(
+        self,
+        *,
+        expected_point: Any,
+        artifact: CardSummaryArtifact,
+    ) -> Any | None:
+        """Attach/replace only the summary artifact for an unchanged content snapshot."""
+
+        if expected_point is None:
+            raise ValueError("expected_point is required for a card-summary backfill")
+        expected_payload = dict(expected_point.payload or {})
+        selector = payload_snapshot_filter(
+            self.models,
+            point_id=expected_point.id,
+            payload=expected_payload,
+            fields=(
+                "content_version",
+                "content_job_id",
+                "card_summary_artifact_hash",
+            ),
+        )
+        self.client.set_payload(
+            collection_name=self.collection_name,
+            payload=card_summary_payload(artifact),
             points=selector,
             wait=True,
             ordering=self.models.WriteOrdering.STRONG,

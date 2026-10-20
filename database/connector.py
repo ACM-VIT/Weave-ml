@@ -440,6 +440,12 @@ class PostgreSQLConnector:
     @staticmethod
     def _build_upsert_params(cursor: Any, result: Any) -> tuple[str, tuple[Any, ...]]:
         """Validate and map one enrichment result inside its row savepoint."""
+        warnings = list(getattr(result, "warnings", []) or [])
+        if warnings:
+            raise ValueError(
+                "repository enrichment is incomplete: "
+                + "; ".join(map(str, warnings))[:500]
+            )
         payload = result.payload
         raw = result.raw_repository
         full_name = normalize_repository_name(result.repo_id)
@@ -455,8 +461,7 @@ class PostgreSQLConnector:
         )
         languages_json = json.dumps(result.languages or {})
         topics_json = json.dumps(result.topics or [])
-        readme_text = getattr(result.readme, "clean_text", "") or ""
-        readme_md = getattr(result.readme, "readme_md", "") or ""
+        canonical_readme = getattr(result.readme, "raw_markdown", "") or ""
 
         repo_uuid = str(
             uuid.uuid5(uuid.NAMESPACE_URL, f"github:{full_name.casefold()}")
@@ -482,8 +487,8 @@ class PostgreSQLConnector:
             payload.get("special_label"),
             languages_json,
             topics_json,
-            readme_text[:5000],
-            readme_md,
+            None,
+            canonical_readme,
             int(payload.get("star_count") or 0),
             int(payload.get("fork_count") or 0),
             int(raw.get("pull_requests_count") or 0),
@@ -549,7 +554,7 @@ class PostgreSQLConnector:
                     primary_language,
                     language_used,
                     topics,
-                    readme_summary,
+                    _legacy_readme_summary,
                     readme_md,
                     star_count,
                     forks_count,
@@ -558,7 +563,7 @@ class PostgreSQLConnector:
                 ) = row
                 languages = json.loads(language_used) if isinstance(language_used, str) else (language_used or {})
                 parsed_topics = json.loads(topics) if isinstance(topics, str) else (topics or [])
-                readme_text = readme_summary or readme_md or ""
+                canonical_readme = readme_md or None
                 payloads.append(
                     {
                         "id": full_name,
@@ -568,8 +573,8 @@ class PostgreSQLConnector:
                         "primary_language": primary_language or "Unknown",
                         "languages": list(languages) if isinstance(languages, dict) else list(languages),
                         "topics": list(parsed_topics),
-                        "extracted_paragraphs": [readme_text] if readme_text else [],
-                        "readme_length": len(readme_text),
+                        "readme": canonical_readme,
+                        "readme_length": len(canonical_readme or ""),
                         "star_count": int(star_count or 0),
                         "fork_count": int(forks_count or 0),
                         "pr_count": int(pr_count or 0),

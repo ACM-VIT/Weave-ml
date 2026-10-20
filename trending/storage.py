@@ -223,7 +223,7 @@ class TrendingStorage:
                         pushed_at,
                         repo["primary_language"],
                         json.dumps(repo.get("topics", [])),
-                        repo.get("readme", "")[:config.README_MAX_LENGTH],  # Cap README length
+                        repo.get("readme", ""),
                         repo.get("default_branch", "main"),
                         first_seen_at,
                         refresh_ts,

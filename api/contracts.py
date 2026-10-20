@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 import os
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 from pydantic import (
     AliasChoices,
@@ -178,6 +179,9 @@ class RepositorySource(StrictModel):
     languages: list[ListText] = Field(default_factory=list, max_length=100)
     topics: list[ListText] = Field(default_factory=list, max_length=200)
     readme: ReadmeText | None = None
+    readme_source_path: str | None = Field(default=None, min_length=1, max_length=1_024)
+    readme_default_branch: str | None = Field(default=None, min_length=1, max_length=256)
+    readme_base_url: str | None = Field(default=None, min_length=1, max_length=2_048)
     extracted_paragraphs: list[ParagraphText] = Field(
         default_factory=list, max_length=512
     )
@@ -210,6 +214,46 @@ class RepositorySource(StrictModel):
     def utc_commits(cls, value: list[datetime]) -> list[datetime]:
         return [_utc(item, field_name="recent_commits") for item in value]
 
+    @field_validator("readme_source_path")
+    @classmethod
+    def safe_readme_source_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if value.startswith("/") or "\\" in value or ".." in value.split("/"):
+            raise ValueError("readme_source_path must be a repository-relative POSIX path")
+        return value
+
+    @field_validator("readme_default_branch")
+    @classmethod
+    def safe_readme_default_branch(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        segments = value.split("/")
+        if "\\" in value or any(segment in {"", ".", ".."} for segment in segments):
+            raise ValueError(
+                "readme_default_branch must be a safe slash-separated Git ref"
+            )
+        return value
+
+    @field_validator("readme_base_url")
+    @classmethod
+    def safe_readme_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "raw.githubusercontent.com"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "readme_base_url must be an HTTPS raw.githubusercontent.com directory URL"
+            )
+        return value if value.endswith("/") else f"{value}/"
+
     @model_validator(mode="after")
     def bounded_readme(self):
         paragraph_size = sum(len(item) for item in self.extracted_paragraphs)
@@ -232,6 +276,8 @@ class RepositoryJob(StrictModel):
         nested_repo_id = self.repository.repo_id
         if nested_repo_id is not None and nested_repo_id != self.repo_id:
             raise ValueError("repository.repo_id must match repo_id")
+        if not self.repository.content_hash:
+            raise ValueError("repository.content_hash is required for repository jobs")
         return self
 
 
@@ -305,3 +351,37 @@ class OnboardingJob(StrictModel):
     user_id: uuid.UUID
     profile_version: int = Field(ge=1)
     profile: OnboardingProfile
+
+
+class RepositorySearchFilters(StrictModel):
+    # Language is the indexed primary language; topics use canonical slugs.
+    languages: list[Annotated[str, StringConstraints(min_length=1, max_length=64)]] = Field(default_factory=list, max_length=10)
+    topics: list[Annotated[str, StringConstraints(min_length=1, max_length=100, pattern=r"^[a-z0-9][a-z0-9-]*$")]] = Field(default_factory=list, max_length=10)
+
+
+class RepositorySearchRequest(StrictModel):
+    schema_version: Literal[2]
+    search_id: uuid.UUID
+    query: Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=512)]
+    limit: int = Field(ge=1, le=100, strict=True)
+    exclude_repo_ids: list[uuid.UUID] = Field(default_factory=list, max_length=500)
+    filters: RepositorySearchFilters = Field(default_factory=RepositorySearchFilters)
+
+    @field_validator("exclude_repo_ids")
+    @classmethod
+    def unique_search_exclusions(cls, values: list[uuid.UUID]) -> list[uuid.UUID]:
+        if len(set(values)) != len(values):
+            raise ValueError("repository exclusions must be unique")
+        return values
+
+
+class RepositorySearchHit(StrictModel):
+    repo_id: uuid.UUID
+    score: float = Field(ge=-1.0, le=1.0, allow_inf_nan=False)
+
+
+class RepositorySearchResponse(StrictModel):
+    schema_version: Literal[2]
+    search_id: uuid.UUID
+    embedding_version: ShortText
+    items: list[RepositorySearchHit] = Field(max_length=100)

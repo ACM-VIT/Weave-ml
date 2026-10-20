@@ -1,5 +1,27 @@
 """GraphQL queries for repository acquisition."""
 
+
+# Keep the aliases and paths in one place so the client can retain the exact
+# source path selected by GitHub alongside the canonical Markdown.
+README_CANDIDATES = (
+    # Match GitHub's display precedence: .github/, repository root, then docs/.
+    ("readmeGithub1", ".github/README.md"),
+    ("readmeGithub2", ".github/readme.md"),
+    ("readmeGithub3", ".github/README.rst"),
+    ("readmeGithub4", ".github/README.txt"),
+    ("readmeGithub5", ".github/README"),
+    ("readme1", "README.md"),
+    ("readme2", "readme.md"),
+    ("readme3", "README.rst"),
+    ("readme4", "README.txt"),
+    ("readme5", "README"),
+    ("readmeDocs1", "docs/README.md"),
+    ("readmeDocs2", "docs/readme.md"),
+    ("readmeDocs3", "docs/README.rst"),
+    ("readmeDocs4", "docs/README.txt"),
+    ("readmeDocs5", "docs/README"),
+)
+
 # Discovers repositories via GraphQL search — no REST needed
 SEARCH_REPOSITORIES_QUERY = """
 query SearchRepositories($query: String!, $after: String) {
@@ -75,6 +97,7 @@ def build_batch_metadata_query(repos: list[tuple[str, str]]) -> str:
       edges {{ size node {{ name }} }}
     }}
     defaultBranchRef {{
+      name
       target {{
         ... on Commit {{
           history(first: 10) {{ nodes {{ committedDate }} }}
@@ -93,11 +116,22 @@ def build_batch_metadata_query(repos: list[tuple[str, str]]) -> str:
 GET_README_QUERY = """
 query GetReadme($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
+    defaultBranchRef { name }
+    readmeGithub1: object(expression: "HEAD:.github/README.md") { ... on Blob { text } }
+    readmeGithub2: object(expression: "HEAD:.github/readme.md") { ... on Blob { text } }
+    readmeGithub3: object(expression: "HEAD:.github/README.rst") { ... on Blob { text } }
+    readmeGithub4: object(expression: "HEAD:.github/README.txt") { ... on Blob { text } }
+    readmeGithub5: object(expression: "HEAD:.github/README") { ... on Blob { text } }
     readme1: object(expression: "HEAD:README.md") { ... on Blob { text } }
     readme2: object(expression: "HEAD:readme.md") { ... on Blob { text } }
     readme3: object(expression: "HEAD:README.rst") { ... on Blob { text } }
     readme4: object(expression: "HEAD:README.txt") { ... on Blob { text } }
     readme5: object(expression: "HEAD:README")     { ... on Blob { text } }
+    readmeDocs1: object(expression: "HEAD:docs/README.md") { ... on Blob { text } }
+    readmeDocs2: object(expression: "HEAD:docs/readme.md") { ... on Blob { text } }
+    readmeDocs3: object(expression: "HEAD:docs/README.rst") { ... on Blob { text } }
+    readmeDocs4: object(expression: "HEAD:docs/README.txt") { ... on Blob { text } }
+    readmeDocs5: object(expression: "HEAD:docs/README") { ... on Blob { text } }
   }
 }
 """
@@ -173,7 +207,33 @@ query GetRepository($owner: String!, $name: String!) {
         }
       }
     }
-    
+
+    readmeGithub1: object(expression: "HEAD:.github/README.md") {
+      ... on Blob {
+        text
+      }
+    }
+    readmeGithub2: object(expression: "HEAD:.github/readme.md") {
+      ... on Blob {
+        text
+      }
+    }
+    readmeGithub3: object(expression: "HEAD:.github/README.rst") {
+      ... on Blob {
+        text
+      }
+    }
+    readmeGithub4: object(expression: "HEAD:.github/README.txt") {
+      ... on Blob {
+        text
+      }
+    }
+    readmeGithub5: object(expression: "HEAD:.github/README") {
+      ... on Blob {
+        text
+      }
+    }
+
     readme1: object(expression: "HEAD:README.md") {
       ... on Blob {
         text
@@ -199,6 +259,31 @@ query GetRepository($owner: String!, $name: String!) {
         text
       }
     }
+    readmeDocs1: object(expression: "HEAD:docs/README.md") {
+      ... on Blob {
+        text
+      }
+    }
+    readmeDocs2: object(expression: "HEAD:docs/readme.md") {
+      ... on Blob {
+        text
+      }
+    }
+    readmeDocs3: object(expression: "HEAD:docs/README.rst") {
+      ... on Blob {
+        text
+      }
+    }
+    readmeDocs4: object(expression: "HEAD:docs/README.txt") {
+      ... on Blob {
+        text
+      }
+    }
+    readmeDocs5: object(expression: "HEAD:docs/README") {
+      ... on Blob {
+        text
+      }
+    }
 
     stargazers(last: 100) {
       edges {
@@ -214,4 +299,3 @@ query GetRepository($owner: String!, $name: String!) {
   }
 }
 """
-

@@ -5,6 +5,7 @@ import copy
 import logging
 import math
 import os
+import time
 from dataclasses import asdict
 from functools import lru_cache
 from typing import Any
@@ -18,6 +19,8 @@ from api.contracts import (
     RepositoryJob,
     RepositoryFeaturePatch,
     RepositoryRefreshJob,
+    RepositorySearchRequest,
+    RepositorySearchResponse,
 )
 from api.runtime import (
     ServiceCapacityError,
@@ -30,11 +33,15 @@ from api.runtime import (
 from api.metrics import record_recommendation, render_prometheus
 from config import constant_time_secret_matches, internal_api_header_name
 from embedding.qdrant_store import QdrantRepositoryStore
+from embedding.embeddings import SentenceTransformerEmbedder
 from embedding.runtime import (
     EmbeddingCapacityError,
+    EmbeddingDeadlineExceeded,
     embedding_runtime_status,
+    embedding_timeout_seconds,
     embedding_warmup_enabled,
     repository_embedding_pipeline,
+    shared_embedding_model,
     run_embedding_job,
     shutdown_embedding_runtime,
     user_onboarding_pipeline,
@@ -66,6 +73,14 @@ from inference.runtime import (
     validate_recommendation_runtime,
 )
 from retrieval.v2_retriever import QdrantV2Retriever, RetrievalDependencyError
+from summarization.contracts import (
+    CARD_SUMMARY_PAYLOAD_FIELDS,
+    CardSummaryArtifact,
+    card_summary_from_payload,
+)
+from summarization.provider import SUMMARY_COMPLETION_RESERVE_SECONDS
+from summarization.settings import SummarySettings
+from utils.readme_processor import clean_markdown_copy, process_markdown
 
 router = APIRouter(prefix="/api/v2", tags=["v2"])
 logger = logging.getLogger("pipeline.api.v2")
@@ -397,7 +412,11 @@ def validate_v2_runtime_configuration() -> V2FeedbackSettings:
     settings = feedback_settings()
     _repository_job_lock_settings()
     _health_timeout_seconds()
+    embedding_timeout_seconds()
     embedding_warmup_enabled()
+    # Constructing settings is network-free and catches malformed provider
+    # configuration before an ingest request can occupy an embedding worker.
+    SummarySettings.from_env()
     validate_recommendation_runtime()
     validate_service_runtime()
     # Client construction validates retrieval/ranker configuration and, when
@@ -425,13 +444,13 @@ def _repository_job_lock(repo_id: str):
         ) from exc
 
 
-def _embed_repository_job(request: RepositoryJob) -> dict[str, Any]:
+def _embed_repository_job(request: RepositoryJob, deadline: float | None = None) -> dict[str, Any]:
     repo_id = str(request.repo_id)
     job_id = str(request.job_id)
     try:
         lock_context = _repository_job_lock(repo_id)
         with lock_context as lock:
-            return _embed_repository_job_locked(request, lock)
+            return _embed_repository_job_locked(request, lock, deadline=deadline)
     except (LockAcquisitionError, LockLostError) as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -440,7 +459,7 @@ def _embed_repository_job(request: RepositoryJob) -> dict[str, Any]:
         ) from exc
 
 
-def _embed_repository_job_locked(request: RepositoryJob, lock: Any) -> dict[str, Any]:
+def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: float | None = None) -> dict[str, Any]:
     repo_id = str(request.repo_id)
     job_id = str(request.job_id)
     lock.assert_owned()
@@ -453,17 +472,79 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any) -> dict[str,
         requested_version=request.content_version,
         job_id=job_id,
     )
-    if job_status != "apply":
-        return {
-            "accepted": True,
-            "status": job_status,
-            "repo_id": repo_id,
-            "content_version": current,
-        }
-
-    payload = _repository_embedding_payload(request)
     pipeline = repository_embedding_pipeline()
-    result = pipeline.embed_repository(payload)
+    if job_status != "apply":
+        if expected_point is None:
+            raise V2ServiceHTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Repository summary state changed; retry the request.",
+                error_code="REPOSITORY_SUMMARY_RACE",
+                retryable=True,
+            )
+        stored_payload = dict(expected_point.payload or {})
+        requested_hash = request.repository.content_hash
+        stored_hash = stored_payload.get("content_hash")
+        if (
+            not requested_hash
+            or not isinstance(stored_hash, str)
+            or not stored_hash
+            or requested_hash != stored_hash
+        ):
+            raise V2ServiceHTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="content_version already identifies different repository content.",
+                error_code="REPOSITORY_CONTENT_HASH_CONFLICT",
+                retryable=False,
+            )
+        artifact = card_summary_from_payload(stored_payload)
+        if artifact is None or not pipeline.card_summarizer.is_current(artifact) or (
+            job_status != "duplicate"
+            and pipeline.card_summarizer.should_upgrade(artifact)
+            and _summary_upgrade_has_time(deadline)
+        ):
+            payload = _repository_embedding_payload(request)
+            artifact = pipeline.summarize_repository(payload, deadline=deadline)
+            lock.assert_owned()
+            stored = repository_store().compare_and_set_card_summary(
+                expected_point=expected_point,
+                artifact=artifact,
+            )
+            lock.assert_owned()
+            if stored is None:
+                raise V2ServiceHTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Repository summary state changed; retry the request.",
+                    error_code="REPOSITORY_SUMMARY_RACE",
+                    retryable=True,
+                )
+            final_status, current = _repository_job_status(
+                [stored],
+                version_field="content_version",
+                job_field="content_job_id",
+                requested_version=request.content_version,
+                job_id=job_id,
+            )
+            stored_payload = dict(stored.payload or {})
+            artifact = card_summary_from_payload(stored_payload)
+            job_status = final_status
+        if artifact is None or not pipeline.card_summarizer.is_current(artifact):
+            raise V2ServiceHTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Repository summary state changed; retry the request.",
+                error_code="REPOSITORY_SUMMARY_RACE",
+                retryable=True,
+            )
+        return _repository_embedding_response(
+            request=request,
+            status_name=job_status,
+            content_version=current,
+            embedding_version=str(
+                stored_payload.get("embedding_version") or pipeline.config.version
+            ),
+            artifact=artifact,
+        )
+    payload = _repository_embedding_payload(request)
+    result = pipeline.embed_repository(payload, deadline=deadline)
     result.payload["content_job_id"] = job_id
 
     # Content upsert replaces the complete point. Carry forward independently
@@ -491,12 +572,59 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any) -> dict[str,
         requested_version=request.content_version,
         job_id=job_id,
     )
+    stored_artifact = card_summary_from_payload(dict(stored.payload or {})) if stored else None
+    if stored_artifact is None:
+        raise V2ServiceHTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Repository summary was not durably stored; retry the request.",
+            error_code="REPOSITORY_SUMMARY_MISSING",
+            retryable=True,
+        )
+    return _repository_embedding_response(
+        request=request,
+        status_name=final_status,
+        content_version=final_version,
+        embedding_version=str(
+            dict(stored.payload or {}).get("embedding_version")
+            or result.embedding_version
+        ),
+        artifact=stored_artifact,
+    )
+
+
+def _summary_upgrade_has_time(
+    deadline: float | None,
+) -> bool:
+    """Avoid delaying replay of a durable fallback through another timeout."""
+
+    if deadline is None:
+        return True
+    return (
+        deadline - time.monotonic()
+        # The provider caps its request timeout to the remaining usable budget.
+        # Requiring the full configured timeout would disable upgrades under
+        # the production 30-second job / 30-second provider configuration.
+        >= SUMMARY_COMPLETION_RESERVE_SECONDS + 0.1
+    )
+
+
+def _repository_embedding_response(
+    *,
+    request: RepositoryJob,
+    status_name: str,
+    content_version: int,
+    embedding_version: str,
+    artifact: CardSummaryArtifact,
+) -> dict[str, Any]:
     return {
+        "schema_version": 2,
         "accepted": True,
-        "status": final_status,
-        "repo_id": repo_id,
-        "content_version": final_version,
-        "embedding_version": result.embedding_version,
+        "status": status_name,
+        "job_id": str(request.job_id),
+        "repo_id": str(request.repo_id),
+        "content_version": content_version,
+        "embedding_version": embedding_version,
+        "card_summary": artifact.model_dump(mode="json"),
     }
 
 
@@ -506,9 +634,15 @@ def _repository_embedding_payload(request: RepositoryJob) -> dict[str, Any]:
     # payload contract publishes deterministic, non-null serving values.
     payload["description"] = payload.get("description") or ""
     payload["primary_language"] = payload.get("primary_language") or "Unknown"
-    readme = payload.pop("readme", None)
+    readme = payload.get("readme")
     if readme is not None:
-        payload["extracted_paragraphs"] = [readme]
+        derived = process_markdown(readme)
+        payload["extracted_paragraphs"] = derived.extracted_paragraphs or [
+            clean_markdown_copy(readme)
+        ]
+        payload["extracted_paragraphs"] = [
+            paragraph for paragraph in payload["extracted_paragraphs"] if paragraph
+        ]
         payload["readme_length"] = len(readme)
     payload.update({
         "id": str(request.repo_id),
@@ -565,6 +699,10 @@ def _refresh_repository_job_locked(
         "feature_version": request.feature_version,
         "feature_job_id": job_id,
     }
+    # Normalize only missing summary fields on a read copy. Core contract fields
+    # remain mandatory and summary defaults must never enter the feature CAS.
+    for field in CARD_SUMMARY_PAYLOAD_FIELDS:
+        updated.setdefault(field, [] if field == "card_summary_highlights" else None)
     validate_repository_payload(updated)
 
     lock.assert_owned()
@@ -804,13 +942,20 @@ async def submit_feedback(request: FeedbackBatch, http_request: Request):
 @router.post("/repositories/embed", dependencies=[Depends(require_internal_secret)])
 async def embed_repository(request: RepositoryJob, http_request: Request):
     try:
-        return await run_embedding_job(_embed_repository_job, request)
+        deadline = time.monotonic() + embedding_timeout_seconds()
+        return await run_embedding_job(_embed_repository_job, request, deadline=deadline)
     except HTTPException:
         raise
     except EmbeddingCapacityError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Embedding capacity is temporarily exhausted; retry the request.",
+            headers={"Retry-After": "2"},
+        ) from exc
+    except EmbeddingDeadlineExceeded as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Embedding generation exceeded its bounded deadline.",
             headers={"Retry-After": "2"},
         ) from exc
     except Exception as exc:
@@ -853,6 +998,12 @@ async def onboard_user(request: OnboardingJob, http_request: Request):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Embedding capacity is temporarily exhausted; retry the request.",
+            headers={"Retry-After": "2"},
+        ) from exc
+    except EmbeddingDeadlineExceeded as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Onboarding generation exceeded its bounded deadline.",
             headers={"Retry-After": "2"},
         ) from exc
     except Exception as exc:
@@ -930,3 +1081,28 @@ async def metrics() -> PlainTextResponse:
         ),
         media_type="text/plain; version=0.0.4; charset=utf-8",
     )
+
+
+def _search_repository_job(request: RepositorySearchRequest):
+    from api.search import search_repositories
+    return search_repositories(
+        request, retriever(), SentenceTransformerEmbedder(model=shared_embedding_model())
+    )
+
+
+@router.post(
+    "/search/repositories",
+    response_model=RepositorySearchResponse,
+    dependencies=[Depends(require_internal_secret)],
+)
+async def repository_search(request: RepositorySearchRequest):
+    try:
+        return await run_service_job("search", _search_repository_job, request)
+    except (ServiceCapacityError, ServiceDeadlineExceeded) as exc:
+        raise HTTPException(
+            status_code=503, detail="Semantic search is temporarily unavailable."
+        ) from exc
+    except Exception as exc:
+        raise _operation_error(
+            "repository_search", exc, request_id=str(request.search_id)
+        ) from exc

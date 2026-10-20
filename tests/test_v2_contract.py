@@ -79,6 +79,9 @@ def test_repository_job_accepts_canonical_node_v2_outbox_payload():
                 "url": "https://github.com/datawhalechina/llm-universe",
                 "description": None,
                 "readme": "Repository documentation",
+                "readme_source_path": "docs/README.md",
+                "readme_default_branch": "main",
+                "readme_base_url": "https://raw.githubusercontent.com/datawhalechina/llm-universe/refs/heads/main/docs/",
                 "primary_language": None,
                 "languages": ["Jupyter Notebook", "Python"],
                 "topics": ["langchain", "rag"],
@@ -101,7 +104,74 @@ def test_repository_job_accepts_canonical_node_v2_outbox_payload():
     assert payload["description"] == ""
     assert payload["primary_language"] == "Unknown"
     assert payload["readme_length"] == len("Repository documentation")
+    assert payload["readme"] == "Repository documentation"
     assert payload["extracted_paragraphs"] == ["Repository documentation"]
+    assert payload["readme_source_path"] == "docs/README.md"
+    assert payload["readme_default_branch"] == "main"
+    assert payload["readme_base_url"].endswith("/docs/")
+
+
+def test_repository_job_accepts_readme_metadata_at_exact_backend_boundaries():
+    repo_id = uuid.uuid4()
+    source_path = "a" * (1_024 - len("/README.md")) + "/README.md"
+    branch = "b" * 256
+    raw_prefix = "https://raw.githubusercontent.com/"
+    base_url = raw_prefix + "c" * (2_048 - len(raw_prefix) - 1) + "/"
+
+    job = RepositoryJob.model_validate(
+        {
+            "schema_version": 2,
+            "job_id": str(uuid.uuid4()),
+            "repo_id": str(repo_id),
+            "content_version": 1,
+            "repository": {
+                "repo_id": str(repo_id),
+                "full_name": "owner/repository",
+                "content_hash": "boundary-test",
+                "readme_source_path": source_path,
+                "readme_default_branch": branch,
+                "readme_base_url": base_url,
+            },
+        }
+    )
+
+    assert len(job.repository.readme_source_path or "") == 1_024
+    assert len(job.repository.readme_default_branch or "") == 256
+    assert len(job.repository.readme_base_url or "") == 2_048
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("readme_source_path", "a" * (1_025 - len("/README.md")) + "/README.md"),
+        ("readme_default_branch", "b" * 257),
+        (
+            "readme_base_url",
+            "https://raw.githubusercontent.com/"
+            + "c" * (2_049 - len("https://raw.githubusercontent.com/") - 1)
+            + "/",
+        ),
+    ],
+)
+def test_repository_job_rejects_readme_metadata_over_backend_boundaries(
+    field: str, value: str
+):
+    repo_id = uuid.uuid4()
+    with pytest.raises(ValidationError):
+        RepositoryJob.model_validate(
+            {
+                "schema_version": 2,
+                "job_id": str(uuid.uuid4()),
+                "repo_id": str(repo_id),
+                "content_version": 1,
+                "repository": {
+                    "repo_id": str(repo_id),
+                    "full_name": "owner/repository",
+                    "content_hash": "boundary-test",
+                    field: value,
+                },
+            }
+        )
 
 
 def test_repository_job_rejects_mismatched_nested_repo_id():
@@ -114,6 +184,54 @@ def test_repository_job_rejects_mismatched_nested_repo_id():
                 "content_version": 1,
                 "repository": {
                     "repo_id": str(uuid.uuid4()),
+                    "full_name": "owner/repository",
+                    "content_hash": "mismatched-repo-test",
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"readme_source_path": "../README.md"},
+        {"readme_source_path": "/README.md"},
+        {"readme_base_url": "http://raw.githubusercontent.com/owner/repo/main/"},
+        {"readme_base_url": "https://evil.example/owner/repo/main/"},
+        {"readme_default_branch": "feature/../main"},
+        {"readme_default_branch": "feature\\main"},
+    ],
+)
+def test_repository_job_rejects_unsafe_readme_source_metadata(metadata):
+    repo_id = uuid.uuid4()
+    with pytest.raises(ValidationError):
+        RepositoryJob.model_validate(
+            {
+                "schema_version": 2,
+                "job_id": str(uuid.uuid4()),
+                "repo_id": str(repo_id),
+                "content_version": 1,
+                "repository": {
+                    "repo_id": str(repo_id),
+                    "full_name": "owner/repository",
+                    "content_hash": "unsafe-metadata-test",
+                    **metadata,
+                },
+            }
+        )
+
+
+def test_repository_job_requires_content_hash_for_retry_fencing():
+    repo_id = uuid.uuid4()
+    with pytest.raises(ValidationError, match="content_hash is required"):
+        RepositoryJob.model_validate(
+            {
+                "schema_version": 2,
+                "job_id": str(uuid.uuid4()),
+                "repo_id": str(repo_id),
+                "content_version": 1,
+                "repository": {
+                    "repo_id": str(repo_id),
                     "full_name": "owner/repository",
                 },
             }
@@ -241,3 +359,81 @@ def test_repository_job_lock_uses_token_checked_release():
     redis.set.assert_called_once()
     assert redis.set.call_args.kwargs == {"nx": True, "px": 600_000}
     redis.eval.assert_called_once()
+
+
+def test_refresh_repository_job_backfills_missing_summary_fields_for_older_schema_v2_records():
+    from api.v2 import _refresh_repository_job_locked
+    from api.contracts import RepositoryRefreshJob, RepositoryFeaturePatch
+
+    repo_id = str(uuid.uuid4())
+    job_id = str(uuid.uuid4())
+    lock = SimpleNamespace(assert_owned=lambda: None)
+
+    # Create an older schema-v2 payload mock missing card_summary fields
+    older_payload = {
+        "github_id": "123",
+        "html_url": "https://github.com/owner/repo",
+        "repo_id": repo_id,
+        "full_name": "owner/repo",
+        "description": "test repo",
+        "primary_language": "Python",
+        "languages": ["Python"],
+        "topics": [],
+        "star_count": 10,
+        "fork_count": 2,
+        "open_issues_count": 0,
+        "readme_length": 500,
+        "readme_chunks": 1,
+        "pushed_days_ago": 5,
+        "delta_3d": 0,
+        "delta_7d": 0,
+        "delta_30d": 0,
+        "mentionable_users_count": 1,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:00:00Z",
+        "pushed_at": "2026-01-03T00:00:00Z",
+        "discovery_category": None,
+        "discovery_band": None,
+        "category": "ML",
+        "tags": [],
+        "doc_quality": 0.5,
+        "code_health": 0.8,
+        "activity_score": 0.6,
+        "trend_velocity": 0.1,
+        "embedding_dim": 384,
+        "embedding_model": "all-MiniLM-L6-v2",
+        "embedding_model_revision": "main",
+        "embedding_version": "v2",
+        "feature_spec_version": "v2",
+        "content_version": 1,
+        "content_hash": "hash123",
+        "model_version": "all-MiniLM-L6-v2",
+        "indexed_at": "2026-01-04T00:00:00Z",
+        "source_hash": "src123",
+        "feature_version": 1,
+        "feature_job_id": str(uuid.uuid4()),
+        "serving_eligibility_version": "repository-vector-v2",
+        # Notice: NO card_summary or card_summary_* fields!
+    }
+
+    mock_point = SimpleNamespace(id=repo_id, payload=older_payload)
+    mock_store = MagicMock()
+    mock_store.compare_and_set_features.return_value = SimpleNamespace(
+        id=repo_id, payload={**older_payload, "feature_version": 2, "feature_job_id": job_id}
+    )
+
+    job = RepositoryRefreshJob(
+        schema_version=2,
+        repo_id=repo_id,
+        job_id=job_id,
+        feature_version=2,
+        features=RepositoryFeaturePatch(star_count=15),
+    )
+
+    with patch("api.v2._repository_points", return_value=[mock_point]), \
+         patch("api.v2.repository_store", return_value=mock_store):
+        res = _refresh_repository_job_locked(job, lock)
+
+    assert res["accepted"] is True
+    assert res["status"] == "applied"
+    assert res["feature_version"] == 2

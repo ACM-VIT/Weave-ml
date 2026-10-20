@@ -35,7 +35,8 @@ def run_acquisition(
       .repo_id          — "owner/repo"
       .payload          — Osiris-compatible dict (star_count, language, topics, …)
       .raw_repository   — raw GraphQL response fields
-      .readme           — ReadmeDocument (clean_text, extracted_paragraphs, …)
+      .readme           — ReadmeDocument (canonical raw Markdown, source
+                          metadata, and separately derived clean text)
       .topics           — list[str]
       .languages        — dict[str, int]  (language → bytes)
     """

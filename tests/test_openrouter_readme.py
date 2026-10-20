@@ -5,6 +5,7 @@ import requests
 
 from utils.readme_processor import ReadmeDocument, process_markdown
 from utils.openrouter_client import generate_readme_md
+from acquisition.github_graphql_client import FetchedReadme
 from acquisition.repository_enricher import EnrichmentResult, RepositoryEnricher
 from database.connector import PostgreSQLConnector
 
@@ -172,12 +173,9 @@ class TestReadmeDocumentExtension:
 
 @pytest.mark.unit
 class TestEnricherIntegration:
-    """Test that RepositoryEnricher populates the readme_md field."""
+    """Test that acquisition keeps canonical README separate from legacy rewrites."""
 
-    @patch("acquisition.repository_enricher.generate_readme_md")
-    def test_enricher_batch_populates_markdown(self, mock_generate):
-        mock_generate.return_value = "# Processed Markdown"
-
+    def test_enricher_batch_preserves_canonical_markdown(self):
         graphql_client = MagicMock()
         graphql_client.get_repositories_batch.return_value = {
             "test/repo": {
@@ -187,20 +185,33 @@ class TestEnricherIntegration:
                 "url": "https://github.com/test/repo",
                 "stargazerCount": 100,
                 "size": 1024,
+                "defaultBranchRef": {"name": "main"},
                 "languages": {"edges": [{"size": 100, "node": {"name": "Python"}}]}
             }
         }
-        # GraphQL readme mock
-        graphql_client.get_readme.return_value = "# Test Repository\n\nThis is a longer test paragraph that passes length checks."
+        raw_markdown = (
+            "# Test Repository\n\n"
+            "![Preview](docs/preview.png)\n\n"
+            "This is a longer test paragraph that passes length checks."
+        )
+        graphql_client.get_readme.return_value = FetchedReadme(
+            raw_markdown,
+            source_path="README.md",
+            default_branch="main",
+            base_url="https://raw.githubusercontent.com/test/repo/refs/heads/main/",
+        )
 
         enricher = RepositoryEnricher(graphql_client=graphql_client)
         results = enricher.get_repositories_batch([{"full_name": "test/repo"}])
 
         assert len(results) == 1
         res = results[0]
-        assert res.readme.readme_md == "# Processed Markdown"
-        assert res.payload["readme_md"] == "# Processed Markdown"
-        mock_generate.assert_called_once()
+        assert res.readme.raw_markdown == raw_markdown
+        assert res.readme.readme_md == ""
+        assert res.payload["readme_md"] == ""
+        assert res.payload["readme_source_path"] == "README.md"
+        assert res.payload["readme_default_branch"] == "main"
+        assert res.payload["readme_base_url"].endswith("/refs/heads/main/")
 
 
 @pytest.mark.unit
@@ -254,6 +265,68 @@ class TestDatabaseConnectorSchema:
         query_str = insert_calls[0][0][0]
         assert "readme_md" in query_str
         
-        # Verify that # Markdown Content is in the parameters passed
+        # The legacy summary column must never receive README-derived text;
+        # canonical Markdown belongs only in the full-content column.
         params = insert_calls[0][0][1]
-        assert "# Markdown Content" in params
+        assert params[10] is None
+        assert params[11] == "raw"
+        assert "clean" not in params
+        assert "# Markdown Content" not in params
+
+    @patch("database.connector.PostgreSQLConnector.connect")
+    def test_legacy_connector_maps_warning_result_to_retryable_failure(
+        self, mock_connect
+    ):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_connect.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cursor
+        result = MagicMock()
+        result.repo_id = "test/repo"
+        result.warnings = ["README fetch failed: TimeoutError"]
+        database = PostgreSQLConnector()
+        database.enabled = True
+
+        outcome = database.upsert_repositories_detailed([result])
+
+        assert outcome.succeeded == []
+        assert "test/repo" in outcome.failed
+        assert "incomplete" in outcome.failed["test/repo"]
+        assert not any(
+            "INSERT INTO Repo" in str(call.args[0])
+            for call in mock_cursor.execute.call_args_list
+        )
+
+    @patch("database.connector.PostgreSQLConnector.connect")
+    def test_retry_mapping_ignores_legacy_summary_and_uses_full_readme(
+        self, mock_connect
+    ):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_connect.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cursor
+        full_readme = "# Canonical README\n\nComplete project documentation."
+        mock_cursor.fetchall.return_value = [
+            (
+                "test/repo",
+                "https://github.com/test/repo",
+                "description",
+                "Python",
+                {"Python": 100},
+                ["testing"],
+                "legacy cleaned README masquerading as a summary",
+                full_readme,
+                10,
+                2,
+                1,
+                None,
+            )
+        ]
+        database = PostgreSQLConnector()
+        database.enabled = True
+
+        payload = database.get_repositories_by_full_names(["test/repo"])[0]
+
+        assert payload["readme"] == full_readme
+        assert payload["readme_length"] == len(full_readme)
+        assert "legacy cleaned README" not in str(payload)
