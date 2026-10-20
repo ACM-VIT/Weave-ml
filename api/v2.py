@@ -44,7 +44,6 @@ from embedding.runtime import (
 )
 from embedding.user_profile_store import QdrantUserProfileStore
 from embedding.vector_contract import (
-    repository_payload_defaults,
     repository_point_id,
     validate_repository_payload,
 )
@@ -70,7 +69,11 @@ from inference.runtime import (
     validate_recommendation_runtime,
 )
 from retrieval.v2_retriever import QdrantV2Retriever, RetrievalDependencyError
-from summarization.contracts import CardSummaryArtifact, card_summary_from_payload
+from summarization.contracts import (
+    CARD_SUMMARY_PAYLOAD_FIELDS,
+    CardSummaryArtifact,
+    card_summary_from_payload,
+)
 from summarization.provider import SUMMARY_COMPLETION_RESERVE_SECONDS
 from summarization.settings import SummarySettings
 from utils.readme_processor import clean_markdown_copy, process_markdown
@@ -490,8 +493,9 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
                 retryable=False,
             )
         artifact = card_summary_from_payload(stored_payload)
-        if artifact is None or (
-            not pipeline.card_summarizer.is_current(artifact)
+        if artifact is None or not pipeline.card_summarizer.is_current(artifact) or (
+            job_status != "duplicate"
+            and pipeline.card_summarizer.should_upgrade(artifact)
             and _summary_upgrade_has_time(pipeline, deadline)
         ):
             payload = _repository_embedding_payload(request)
@@ -519,7 +523,7 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
             stored_payload = dict(stored.payload or {})
             artifact = card_summary_from_payload(stored_payload)
             job_status = final_status
-        if artifact is None:
+        if artifact is None or not pipeline.card_summarizer.is_current(artifact):
             raise V2ServiceHTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Repository summary state changed; retry the request.",
@@ -684,16 +688,16 @@ def _refresh_repository_job_locked(
         }
 
     features = request.features.model_dump(mode="json", exclude_none=True)
-    # Merge vector payload contract defaults underneath the existing payload so
-    # older schema-v2 points (indexed before card_summary fields existed) pass
-    # validation seamlessly during feature-only refreshes.
     updated = {
-        **repository_payload_defaults(),
         **dict(expected_point.payload or {}),
         **features,
         "feature_version": request.feature_version,
         "feature_job_id": job_id,
     }
+    # Normalize only missing summary fields on a read copy. Core contract fields
+    # remain mandatory and summary defaults must never enter the feature CAS.
+    for field in CARD_SUMMARY_PAYLOAD_FIELDS:
+        updated.setdefault(field, [] if field == "card_summary_highlights" else None)
     validate_repository_payload(updated)
 
     lock.assert_owned()

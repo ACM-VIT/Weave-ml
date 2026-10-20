@@ -36,6 +36,48 @@ from summarization.validation import (
 FIXTURE_PATH = Path("tests/fixtures/repository_summary_golden.json")
 
 
+@pytest.mark.parametrize("malformed", ["[" * 1_000_000, "<" * 1_000_000, "*a " * 333_333])
+def test_untrusted_preprocessing_is_bounded_without_mutating_markdown(malformed) -> None:
+    import time
+    from utils.readme_processor import MAX_PREPROCESS_CHARS, process_markdown
+    from summarization.pipeline import description_fallback_artifact
+
+    started = time.monotonic()
+    document = process_markdown(malformed)
+    repo = {"full_name": "weave/adversarial", "description": malformed, "readme": malformed}
+    material = build_summary_source(repo, repo, max_chars=12_000)
+    fallback = description_fallback_artifact(repo)
+    assert time.monotonic() - started < 3, "malformed delimiters must not cause quadratic preprocessing"
+    assert document.raw_markdown == malformed
+    assert document.readme_length == len(malformed)
+    assert len(document.clean_text) <= MAX_PREPROCESS_CHARS
+    assert len(material.prompt_input) <= 12_000
+    assert all(len(text) <= MAX_PREPROCESS_CHARS for text in material.comparison_texts)
+    assert len(fallback.summary) <= 360
+
+
+def test_list_before_thematic_break_is_not_a_setext_heading() -> None:
+    repo = {"full_name": "weave/preview", "readme": (
+        "## Features\n- Fast local development with live previews\n---\n"
+        "Maintainers review the resulting changes together in a shared visual workspace."
+    )}
+    material = build_summary_source(repo, repo, max_chars=12_000)
+    assert "Maintainers review" in material.prompt_input
+
+
+@pytest.fixture
+def api_project() -> dict:
+    return {
+        "full_name": "weave/traffic-gateway",
+        "description": "An API gateway for routing service traffic.",
+        "primary_language": "Python",
+        "extracted_paragraphs": [
+            "This project routes requests between distributed services while keeping their traffic policies in one place.",
+            "Teams can observe request traffic and enforce shared access policies across their internal services.",
+        ],
+    }
+
+
 def _fixtures() -> dict:
     return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
@@ -453,10 +495,82 @@ def test_provider_enabled_pipeline_retries_a_fallback_and_upgrades_to_generated(
 
     upgraded = pipeline.summarize(_repo(case), _repo(case))
 
-    assert pipeline.is_current(fallback) is False
+    assert pipeline.is_current(fallback) is True
+    assert pipeline.should_upgrade(fallback) is True
     assert upgraded.source == "generated"
     assert upgraded.model_version == pipeline.settings.model_id
     assert pipeline.is_current(upgraded) is True
+
+
+def test_api_project_description_and_generated_summary_remain_useful(api_project) -> None:
+    summary = (
+        "A central API gateway gives platform teams a consistent way to control traffic "
+        "across a network of services. It brings routing rules and operational visibility "
+        "together so maintainers can coordinate how requests reach their applications."
+    )
+    provider = SequenceProvider([json.dumps({"summary": summary})])
+    generated = CardSummaryPipeline(provider=provider).summarize(api_project, api_project)
+    assert generated.source == "generated"
+    assert generated.summary == summary
+    assert "Description: An API gateway" in provider.calls[0][0]
+    fallback = CardSummaryPipeline().summarize(api_project, api_project)
+    assert fallback.summary.startswith(api_project["description"])
+    assert "API reference" not in fallback.summary
+
+
+def test_paragraph_only_input_reaches_provider_and_copy_checks(api_project) -> None:
+    paragraph = (
+        "A shared review workspace brings design proposals and ownership decisions together "
+        "for teams working across large software projects. Maintainers can record the reasons "
+        "behind every decision and coordinate future changes with their collaborators."
+    )
+    api_project["extracted_paragraphs"] = [paragraph]
+    provider = SequenceProvider([json.dumps({"summary": paragraph})] * 2)
+    result = CardSummaryPipeline(provider=provider).summarize(api_project, api_project)
+    assert paragraph in provider.calls[0][0]
+    assert len(provider.calls) == 2, "copied paragraph triggers repair, then fallback"
+    assert "source passage" in provider.calls[1][1]
+    assert result.source == "description_fallback"
+    assert paragraph not in result.summary
+
+
+@pytest.mark.parametrize("heading_style", ["atx", "setext"])
+def test_excluded_sections_keep_their_subheadings_blocked(heading_style) -> None:
+    overview = "A visual workspace helps teams review changes across shared software projects."
+    hidden = "Secret prerequisite prose should never consume the bounded provider context."
+    nested = "Nested feature prose inside installation must also remain excluded from summaries."
+    useful = "Review queues help maintainers coordinate changes with clear ownership and durable context."
+    title = "## Installation" if heading_style == "atx" else "Installation\n------------"
+    readme = f"# Overview\n{overview}\n\n{title}\n### Prerequisites\n{hidden}\n#### Features\n{nested}\n## Benefits\n{useful}"
+    repo = {"full_name": "weave/section-depth", "readme": readme}
+    source = build_summary_source(repo, repo, max_chars=12_000)
+    assert overview in source.prompt_input
+    assert useful in source.prompt_input
+    assert hidden not in source.prompt_input
+    assert nested not in source.prompt_input
+    assert repo["readme"] == readme, "canonical Markdown remains intact"
+
+
+def test_api_reference_section_is_still_excluded(api_project) -> None:
+    api_project["readme"] = "## API reference\nDetailed endpoint reference prose does not belong in a discovery card.\n## Overview\nA traffic management workspace helps maintainers coordinate service routing."
+    source = build_summary_source(api_project, api_project, max_chars=12_000)
+    assert "Detailed endpoint reference" not in source.prompt_input
+    assert "traffic management workspace" in source.prompt_input
+    raw = json.dumps({"summary": "The API reference lists service endpoints and every supported operation for application teams. It documents the request parameters and response objects needed by developers integrating a remote service."})
+    with pytest.raises(SummaryValidationError, match="excluded README section"):
+        validate_generated_summary(parse_summary_response(raw), comparison_texts=[])
+
+
+def test_enrichment_markdown_takes_precedence_over_flattened_paragraphs(api_project) -> None:
+    from types import SimpleNamespace
+    hidden = "Long prerequisite instructions must remain outside the discovery summary context."
+    markdown = f"# Overview\nA shared gateway helps platform teams manage requests across their services.\n## Installation\n### Prerequisites\n{hidden}"
+    api_project["extracted_paragraphs"] = [hidden]
+    source = SimpleNamespace(readme=SimpleNamespace(raw_markdown=markdown))
+    material = build_summary_source(source, api_project, max_chars=12_000)
+    assert hidden not in material.prompt_input
+    assert hidden in material.comparison_texts
+    assert "A shared gateway" in material.prompt_input
 
 
 def test_summary_model_version_matches_the_backend_256_character_boundary() -> None:

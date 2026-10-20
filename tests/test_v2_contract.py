@@ -371,6 +371,8 @@ def test_refresh_repository_job_backfills_missing_summary_fields_for_older_schem
 
     # Create an older schema-v2 payload mock missing card_summary fields
     older_payload = {
+        "github_id": "123",
+        "html_url": "https://github.com/owner/repo",
         "repo_id": repo_id,
         "full_name": "owner/repo",
         "description": "test repo",

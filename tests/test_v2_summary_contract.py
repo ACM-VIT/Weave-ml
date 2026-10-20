@@ -13,8 +13,8 @@ from fastapi import HTTPException
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
-from api.contracts import RepositoryJob
-from api.v2 import _embed_repository_job_locked
+from api.contracts import RepositoryJob, RepositoryRefreshJob
+from api.v2 import _embed_repository_job_locked, _refresh_repository_job_locked
 from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
 from embedding.qdrant_store import QdrantRepositoryStore
 from summarization.contracts import (
@@ -167,7 +167,7 @@ def test_same_content_fallback_is_upgraded_after_provider_recovery() -> None:
         embedder=FakeEmbedder(),
         card_summarizer=CardSummaryPipeline(provider=RecoveredProvider()),
     )
-    assert pipeline.card_summarizer.is_current(fallback) is False
+    assert pipeline.card_summarizer.is_current(fallback) is True
 
     with patch("api.v2._repository_points", return_value=[point]), patch(
         "api.v2.repository_embedding_pipeline", return_value=pipeline
@@ -384,3 +384,120 @@ def test_qdrant_summary_cas_fences_a_concurrent_highlight_update() -> None:
 
     assert card_summary_from_payload(winning.payload) == _artifact()
     assert card_summary_from_payload(losing.payload) == _artifact()
+
+
+def test_provider_outage_allows_first_duplicate_and_current_fallback_deliveries() -> None:
+    from summarization.provider import SummaryProviderError
+
+    class UnavailableProvider:
+        calls = 0
+
+        def generate(self, source, *, repair_feedback=None, deadline=None):
+            self.calls += 1
+            raise SummaryProviderError("provider unavailable")
+
+    provider = UnavailableProvider()
+    pipeline = RepositoryEmbeddingPipeline(
+        embedder=FakeEmbedder(),
+        card_summarizer=CardSummaryPipeline(provider=provider),
+    )
+    client, store = _qdrant_store()
+    request = _job()
+    try:
+        with patch("api.v2._repository_points", side_effect=lambda _id: client.retrieve(
+            store.collection_name, [REPO_ID], with_payload=True
+        )), patch("api.v2.repository_embedding_pipeline", return_value=pipeline), patch(
+            "api.v2.repository_store", return_value=store
+        ):
+            first = _embed_repository_job_locked(request, OwnedLock())
+            duplicate = _embed_repository_job_locked(request, OwnedLock())
+            assert provider.calls == 1, "duplicate delivery must replay its stored result"
+            current = _embed_repository_job_locked(_job(), OwnedLock())
+        assert [first["status"], duplicate["status"], current["status"]] == ["applied", "duplicate", "current"]
+        assert first["card_summary"]["source"] == "description_fallback"
+        assert first["card_summary"] == duplicate["card_summary"] == current["card_summary"]
+        assert provider.calls == 2, "a separate delivery may attempt to upgrade a valid fallback"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("concurrent_summary", [False, True])
+def test_pre_summary_point_refreshes_without_erasing_a_concurrent_summary(concurrent_summary) -> None:
+    client, store = _qdrant_store()
+    pipeline = RepositoryEmbeddingPipeline(embedder=FakeEmbedder())
+    result = pipeline.embed_repository(_job().repository.model_dump(mode="json"))
+    store.upsert([result])
+    client.delete_payload(store.collection_name, keys=list(CARD_SUMMARY_PAYLOAD_FIELDS), points=[REPO_ID], wait=True)
+    expected = client.retrieve(store.collection_name, [REPO_ID], with_payload=True)[0]
+    request = RepositoryRefreshJob(
+        schema_version=2, job_id=uuid.uuid4(), repo_id=REPO_ID,
+        feature_version=2, features={"star_count": 42, "activity_score": 0.75},
+    )
+    original_cas = store.compare_and_set_features
+
+    def refresh_cas(*, expected_point, feature_payload):
+        assert not set(CARD_SUMMARY_PAYLOAD_FIELDS).intersection(feature_payload)
+        if concurrent_summary:
+            store.compare_and_set_card_summary(expected_point=expected_point, artifact=_artifact())
+        return original_cas(expected_point=expected_point, feature_payload=feature_payload)
+
+    try:
+        with patch("api.v2._repository_points", return_value=[expected]), patch(
+            "api.v2.repository_store", return_value=store
+        ), patch.object(store, "compare_and_set_features", side_effect=refresh_cas):
+            response = _refresh_repository_job_locked(request, OwnedLock())
+        stored = client.retrieve(store.collection_name, [REPO_ID], with_payload=True)[0]
+        assert response["status"] == "applied"
+        assert stored.payload["star_count"] == 42
+        assert stored.payload["activity_score"] == 0.75
+        assert stored.payload["feature_version"] == 2
+        assert card_summary_from_payload(stored.payload) == (_artifact() if concurrent_summary else None)
+        assert not set(CARD_SUMMARY_PAYLOAD_FIELDS).intersection(expected.payload)
+    finally:
+        client.close()
+
+
+def test_feature_refresh_still_rejects_missing_core_payload_fields() -> None:
+    pipeline = RepositoryEmbeddingPipeline(embedder=FakeEmbedder())
+    result = pipeline.embed_repository(_job().repository.model_dump(mode="json"))
+    result.payload.pop("star_count")
+    from embedding.vector_contract import REPOSITORY_SERVING_ELIGIBILITY_FIELD, REPOSITORY_SERVING_ELIGIBILITY_VERSION
+    result.payload[REPOSITORY_SERVING_ELIGIBILITY_FIELD] = REPOSITORY_SERVING_ELIGIBILITY_VERSION
+    point = SimpleNamespace(id=REPO_ID, payload=result.payload)
+    request = RepositoryRefreshJob(
+        schema_version=2, job_id=uuid.uuid4(), repo_id=REPO_ID,
+        feature_version=2, features={"activity_score": 0.5},
+    )
+    with patch("api.v2._repository_points", return_value=[point]), pytest.raises(ValueError, match="star_count"):
+        _refresh_repository_job_locked(request, OwnedLock())
+
+
+def test_paragraph_only_repository_job_supplies_readme_context_to_summary_provider() -> None:
+    body = _job().model_dump(mode="json")
+    body["repository"].pop("readme")
+    paragraphs = ["A collaborative review workspace keeps design proposals and ownership decisions together for maintainers across many shared software projects."]
+    body["repository"]["extracted_paragraphs"] = paragraphs
+    request = RepositoryJob.model_validate(body)
+    captured = []
+
+    class Provider:
+        def generate(self, source, *, repair_feedback=None, deadline=None):
+            captured.append(source)
+            return json.dumps({"summary": (
+                "A focused repository workspace helps maintainers review shared developer-tool changes "
+                "with clear ownership and durable decision history. Its coordinated workflow helps "
+                "distributed teams catch risky updates before they disrupt downstream integrations."
+            )})
+
+    pipeline = RepositoryEmbeddingPipeline(embedder=FakeEmbedder(), card_summarizer=CardSummaryPipeline(provider=Provider()))
+    client, store = _qdrant_store()
+    try:
+        with patch("api.v2._repository_points", return_value=[]), patch(
+            "api.v2.repository_embedding_pipeline", return_value=pipeline
+        ), patch("api.v2.repository_store", return_value=store):
+            result = _embed_repository_job_locked(request, OwnedLock())
+        assert result["status"] == "applied"
+        assert result["card_summary"]["source"] == "generated"
+        assert paragraphs[0] in captured[0]
+    finally:
+        client.close()

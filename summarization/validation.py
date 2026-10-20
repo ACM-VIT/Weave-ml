@@ -9,6 +9,8 @@ from typing import Iterable
 
 from pydantic import ValidationError
 
+from utils.readme_processor import MAX_PREPROCESS_CHARS
+
 from .contracts import (
     CARD_SUMMARY_MAX_CHARS,
     CARD_SUMMARY_MIN_GENERATED_CHARS,
@@ -18,7 +20,7 @@ from .contracts import (
 
 _FENCED_JSON = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.IGNORECASE)
 _MARKDOWN = re.compile(
-    r"(?:^|\n)\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s)|```|~~~|`|!?\[[^\]]*\]\([^)]+\)",
+    r"(?:^|\n)\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s)|```|~~~|`|!?\[[^\[\]]*\]\([^()]+\)",
     re.MULTILINE,
 )
 _COMMAND = re.compile(
@@ -74,7 +76,7 @@ def _words(value: str) -> list[str]:
 
 def _near_copy(summary: str, source: str) -> bool:
     summary_words = _words(summary)
-    source_words = _words(source)
+    source_words = _words(source[:MAX_PREPROCESS_CHARS])
     joined_summary = " ".join(summary_words)
     joined_source = " ".join(source_words)
     if len(joined_summary) >= 80 and joined_summary in joined_source:

@@ -7,6 +7,8 @@ import re
 import time
 from typing import Any
 
+from utils.readme_processor import MAX_PREPROCESS_CHARS, clean_inline_markdown
+
 from .contracts import (
     CARD_SUMMARY_FALLBACK_MODEL_VERSION,
     CARD_SUMMARY_FORMAT_VERSION,
@@ -35,15 +37,8 @@ _UNSAFE_SENTENCE = re.compile(
     re.IGNORECASE,
 )
 _SENTENCE = re.compile(r".+?[.!?](?=\s|$)|.+$", re.DOTALL)
-_MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
-_MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
 _MARKDOWN_STRUCTURE = re.compile(
     r"(?m)^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)|```|~~~|`"
-)
-_MARKDOWN_EMPHASIS = re.compile(
-    r"(\*\*|__|~~)(\S.*?\S|\S)\1"  # double-marker: content must not start/end with space
-    r"|(?<![\w*_])([*_])([^\W_][\s\S]*?[^\W_]|[^\W_])\3(?![\w*_])",  # single-marker: content must start/end with letter/digit
-    re.DOTALL,
 )
 _DUNDER_IDENTIFIER = re.compile(r"__([A-Za-z_][A-Za-z0-9_]*)__")
 _INLINE_MARKDOWN_PUNCTUATION = re.compile(r"[*_~]+")
@@ -64,9 +59,7 @@ def _bounded(value: str, maximum: int) -> str:
 def _plain_description(value: Any) -> str:
     """Reduce a repository description to plain prose for the metadata fallback."""
 
-    text = str(value or "")
-    text = _MARKDOWN_IMAGE.sub("", text)
-    text = _MARKDOWN_LINK.sub(r"\1", text)
+    text = clean_inline_markdown(str(value or "")[:MAX_PREPROCESS_CHARS])
     text = _URL.sub("", text)
     text = _MARKDOWN_STRUCTURE.sub("", text)
     # Spell Python special-method identifiers as prose before stripping emphasis.
@@ -74,10 +67,6 @@ def _plain_description(value: Any) -> str:
     # double underscores that Markdown renderers interpret as emphasis markers.
     text = _DUNDER_IDENTIFIER.sub(
         lambda match: f"dunder {match.group(1).replace('_', ' ')}",
-        text,
-    )
-    text = _MARKDOWN_EMPHASIS.sub(
-        lambda match: match.group(2) or match.group(4) or "",
         text,
     )
     # Unbalanced emphasis markers, wildcards, and snake-case separators are not
@@ -174,10 +163,11 @@ class CardSummaryPipeline:
             return False
         if artifact.source == "generated":
             return artifact.model_version == self.settings.model_id
-        return (
-            self.provider is None
-            and artifact.model_version == CARD_SUMMARY_FALLBACK_MODEL_VERSION
-        )
+        return artifact.model_version == CARD_SUMMARY_FALLBACK_MODEL_VERSION
+
+    def should_upgrade(self, artifact: CardSummaryArtifact) -> bool:
+        """Keep durable fallback replay independent from provider availability."""
+        return artifact.source == "description_fallback" and self.provider is not None
 
     def summarize(self, source: Any, repo: Mapping[str, Any], *, deadline: float | None = None) -> CardSummaryArtifact:
         material = build_summary_source(

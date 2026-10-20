@@ -9,10 +9,13 @@ from dataclasses import dataclass
 from typing import Any
 
 
-_BADGE_RE = re.compile(r"!?\[[^\]]*\]\([^)]*(?:badge|shields\.io|badge\.svg)[^)]*\)", re.I)
-_IMAGE_RE = re.compile(r"!?\[[^\]]*\]\([^)]*\.(?:png|jpg|jpeg|gif|svg|webp)(?:\?[^)]*)?\)", re.I)
-_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
+# Derived views are bounded before any decoding/cleanup; canonical Markdown is
+# retained separately in ReadmeDocument and in backend ingestion payloads.
+MAX_PREPROCESS_CHARS = 64_000
+# Excluding opening delimiters prevents each malformed opener from rescanning
+# the complete suffix (e.g. '[' * 1_000_000 or '<' * 1_000_000).
+_LINK_RE = re.compile(r"(!?)\[([^\[\]]*)\]\(([^()]*?)\)")
+_HTML_TAG_RE = re.compile(r"<[^<>]+>")
 _FENCE_RE = re.compile(r"```.*?```", re.S)
 _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 _MARKDOWN_TABLE_RE = re.compile(r"^\s*\|.*\|\s*$", re.M)
@@ -90,12 +93,10 @@ def process_markdown(
 def clean_markdown_copy(markdown: str) -> str:
     """Return derived plain text while leaving canonical Markdown untouched."""
 
-    text = html.unescape(markdown or "")
-    text = _BADGE_RE.sub(" ", text)
-    text = _IMAGE_RE.sub(" ", text)
+    text = html.unescape((markdown or "")[:MAX_PREPROCESS_CHARS])
     text = _FENCE_RE.sub(" ", text)
     text = _MARKDOWN_TABLE_RE.sub(" ", text)
-    text = _LINK_RE.sub(r"\1", text)
+    text = clean_inline_markdown(text)
     text = _INLINE_CODE_RE.sub(r"\1", text)
     text = _HTML_TAG_RE.sub(" ", text)
     text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.M)
@@ -110,6 +111,18 @@ def clean_markdown_copy(markdown: str) -> str:
         if block:
             paragraphs.append(block)
     return "\n\n".join(paragraphs)
+
+
+def clean_inline_markdown(text: str) -> str:
+    """Remove images, badge links and HTML using delimiter-safe scans."""
+    def link_text(match: re.Match[str]) -> str:
+        image, label, target = match.groups()
+        lowered = target.casefold()
+        if image or any(token in lowered for token in ("badge", "shields.io")):
+            return " "
+        return label
+
+    return _HTML_TAG_RE.sub(" ", _LINK_RE.sub(link_text, text[:MAX_PREPROCESS_CHARS]))
 
 
 def _is_meaningful_paragraph(text: str) -> bool:
