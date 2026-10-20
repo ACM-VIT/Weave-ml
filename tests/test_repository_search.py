@@ -159,3 +159,115 @@ def test_query_embedding_does_not_construct_or_call_a_summary_provider():
     with patch('api.v2.repository_embedding_pipeline', side_effect=AssertionError('summary runtime must not be constructed')), patch('api.v2.shared_embedding_model', return_value=object()), patch('api.v2.retriever', return_value=object()), patch('api.search.search_repositories', return_value={'items':[]}) as search:
         _search_repository_job(request())
         search.assert_called_once()
+
+
+def test_search_and_event_loop_remain_responsive_during_malformed_readme_ingestion():
+    import subprocess
+    import sys
+
+    # A regressed regex may hold the interpreter GIL, defeating asyncio's own
+    # timeout. Run the complete concurrent scenario in a killable process.
+    result = subprocess.run(
+        [sys.executable, '-c',
+         'import asyncio; from tests.test_repository_search import '
+         '_malformed_ingestion_search_scenario; '
+         'asyncio.run(_malformed_ingestion_search_scenario())'],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+async def _malformed_ingestion_search_scenario():
+    import asyncio
+    import os
+    import threading
+    import time
+
+    import httpx
+
+    from api import runtime as service_runtime
+    from api.contracts import RepositoryJob
+    from api.v2 import _repository_embedding_payload
+    from embedding import runtime as embedding_runtime
+    from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
+    from embedding.embeddings import SentenceTransformerEmbedder
+    from summarization.pipeline import CardSummaryPipeline
+
+    class Encoder:
+        def encode(self, texts, **kwargs):
+            return [[1.0] + [0.0] * (REPOSITORY_EMBEDDING_DIM - 1) for _ in texts]
+
+    model = embedding_runtime.BoundedEmbeddingModel(Encoder(), max_concurrency=1)
+    pipeline = RepositoryEmbeddingPipeline(
+        embedder=SentenceTransformerEmbedder(model=model),
+        card_summarizer=CardSummaryPipeline(provider=None),
+    )
+    client = QdrantClient(':memory:')
+    collection = 'malformed_ingestion_search'
+    client.create_collection(collection, vectors_config={
+        QDRANT_VECTOR_NAME: models.VectorParams(size=REPOSITORY_EMBEDDING_DIM, distance=models.Distance.COSINE),
+    })
+    repo_id = str(uuid.uuid4())
+    client.upsert(collection, [models.PointStruct(
+        id=repo_id, vector={QDRANT_VECTOR_NAME: Encoder().encode(['query'])[0]},
+        payload=_repository_payload(repo_id),
+    )])
+    retriever = QdrantV2Retriever(client=client, repository_collection=collection, heavy_ranker_enabled=False)
+    job = RepositoryJob.model_validate({
+        'schema_version': 2, 'job_id': str(uuid.uuid4()), 'repo_id': repo_id,
+        'content_version': 1,
+        'repository': {
+            'repo_id': repo_id, 'full_name': 'weave/malformed-readme',
+            'description': 'A collaborative review workspace for developer teams.',
+            'readme': '[' * 1_000_000, 'content_hash': 'isolated-malformed-fixture',
+        },
+    })
+    started = threading.Event()
+    stop_heartbeat = asyncio.Event()
+    ticks = []
+
+    async def heartbeat():
+        while not stop_heartbeat.is_set():
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.01)
+
+    def ingest():
+        started.set()
+        payload = _repository_embedding_payload(job)
+        # Both canonical ingestion cleanup and summary source/fallback parsing
+        # execute for real, using the same bounded encoder as query embedding.
+        return pipeline.embed_repository(payload)
+
+    app = FastAPI()
+    app.include_router(router)
+    with patch.dict(os.environ, {
+        'INTERNAL_API_SECRET': 'isolated-malformed-search',
+        'EMBEDDING_EXECUTOR_WORKERS': '1', 'EMBEDDING_MAX_OUTSTANDING_JOBS': '1',
+        'V2_SEARCH_EXECUTOR_WORKERS': '1', 'V2_SEARCH_MAX_OUTSTANDING': '1',
+    }), patch('api.v2.shared_embedding_model', return_value=model), patch('api.v2.retriever', return_value=retriever):
+        began = time.monotonic()
+        ticker = asyncio.create_task(heartbeat())
+        ingestion = asyncio.create_task(embedding_runtime.run_embedding_job(ingest))
+        try:
+            assert await asyncio.to_thread(started.wait, 2)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://isolated.test') as http:
+                response = await http.post(
+                    '/api/v2/search/repositories',
+                    headers={'X-Internal-Secret': 'isolated-malformed-search'},
+                    json=request().model_dump(mode='json'),
+                )
+            elapsed = time.monotonic() - began
+            assert response.status_code == 200, response.text
+            assert response.json()['items'] == [{'repo_id': repo_id, 'score': 1.0}]
+            assert elapsed < 1.5, f'Search stalled during README ingestion for {elapsed:.3f}s'
+            result = await ingestion
+            assert result.card_summary is not None
+            ticks.append(time.monotonic())
+            assert max(b - a for a, b in zip(ticks, ticks[1:])) < 1.5
+        finally:
+            stop_heartbeat.set()
+            await ticker
+            await ingestion
+            embedding_runtime.reset_embedding_runtime_for_tests()
+            service_runtime.shutdown_service_runtime()
+            client.close()
