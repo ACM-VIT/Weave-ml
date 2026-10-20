@@ -12,7 +12,8 @@ from utils.readme_processor import MAX_PREPROCESS_CHARS, clean_inline_markdown
 
 _FENCE = re.compile(r"^[ \t]*(```|~~~)")
 _HEADING = re.compile(r"^[ \t]{0,3}(#{1,6})[ \t]+(.+)$")
-_SETEXT = re.compile(r"^[ \t]*(?:=+|-+)[ \t]*$")
+_SETEXT = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
+_SETEXT_TEXT = re.compile(r"^ {0,3}[^ \t>]")
 _URL = re.compile(r"https?://\S+")
 _LIST_MARKER = re.compile(r"^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)")
 _TABLE_CELL = re.compile(r":?-{3,}:?")
@@ -111,7 +112,7 @@ def _readme_sections(markdown: str) -> tuple[list[str], list[str]]:
         heading_match = _HEADING.match(raw_line)
         setext = (
             index + 1 < len(lines)
-            and bool(raw_line.strip())
+            and _SETEXT_TEXT.match(raw_line)
             and not _LIST_MARKER.match(raw_line)
             and _SETEXT.match(lines[index + 1])
         )

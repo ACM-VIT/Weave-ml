@@ -9,7 +9,7 @@ from typing import Iterable
 
 from pydantic import ValidationError
 
-from utils.readme_processor import MAX_PREPROCESS_CHARS
+from utils.readme_processor import MAX_PREPROCESS_CHARS, contains_inline_markdown_link
 
 from .contracts import (
     CARD_SUMMARY_MAX_CHARS,
@@ -19,7 +19,7 @@ from .contracts import (
 
 
 _MARKDOWN = re.compile(
-    r"^[ \t]*(?:#{1,6}[ \t]|[-*+][ \t]|\d+[.)][ \t])|```|~~~|`|!?\[[^\[\]]*\]\([^()]+\)",
+    r"^[ \t]*(?:#{1,6}[ \t]|[-*+][ \t]|\d+[.)][ \t])|```|~~~|`",
     re.MULTILINE,
 )
 _COMMAND = re.compile(
@@ -123,7 +123,7 @@ def _unsafe_text(value: str) -> list[str]:
     reasons: list[str] = []
     if "\n" in value or "\r" in value:
         reasons.append("summary must be one paragraph")
-    if _MARKDOWN.search(value):
+    if _MARKDOWN.search(value) or contains_inline_markdown_link(value):
         reasons.append("summary contains Markdown structure or code")
     if _COMMAND.search(value):
         reasons.append("summary contains a command or installation instruction")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import html
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,9 +13,9 @@ from typing import Any
 # Derived views are bounded before any decoding/cleanup; canonical Markdown is
 # retained separately in ReadmeDocument and in backend ingestion payloads.
 MAX_PREPROCESS_CHARS = 64_000
-# Excluding opening delimiters prevents each malformed opener from rescanning
-# the complete suffix (e.g. '[' * 1_000_000 or '<' * 1_000_000).
-_LINK_RE = re.compile(r"(!?)\[([^\[\]]*)\]\(([^()]*?)\)")
+# Match only the link prefix here. A single stack scan supplies balanced target
+# endings, so malformed or deeply nested targets cannot trigger suffix rescans.
+_LINK_START_RE = re.compile(r"(!?)\[([^\[\]]*)\]\(")
 _HTML_TAG_RE = re.compile(r"<[^<>]+>")
 _FENCE_RE = re.compile(r"```.*?```", re.S)
 _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
@@ -123,15 +124,48 @@ def clean_markdown_copy(markdown: str) -> str:
 
 
 def clean_inline_markdown(text: str) -> str:
-    """Remove images, badge links and HTML using delimiter-safe scans."""
-    def link_text(match: re.Match[str]) -> str:
-        image, label, target = match.groups()
-        lowered = target.casefold()
-        if image or any(token in lowered for token in ("badge", "shields.io")):
-            return " "
-        return label
+    """Remove images, badge links and HTML using bounded linear scans."""
+    text = text[:MAX_PREPROCESS_CHARS]
+    pieces: list[str] = []
+    previous = 0
+    for match, end in _inline_markdown_links(text):
+        image, label = match.groups()
+        target = text[match.end():end - 1].casefold()
+        replacement = " " if image or "badge" in target or "shields.io" in target else label
+        pieces.extend((text[previous:match.start()], replacement))
+        previous = end
+    pieces.append(text[previous:])
+    return _HTML_TAG_RE.sub(" ", "".join(pieces))
 
-    return _HTML_TAG_RE.sub(" ", _LINK_RE.sub(link_text, text[:MAX_PREPROCESS_CHARS]))
+
+def _inline_markdown_links(text: str) -> Iterator[tuple[re.Match[str], int]]:
+    """Yield complete flat-label links, including balanced/escaped target parentheses."""
+    endings: dict[int, int] = {}
+    stack: list[int] = []
+    escaped = False
+    for index, char in enumerate(text):
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "(":
+            stack.append(index)
+        elif char == ")" and stack:
+            endings[stack.pop()] = index + 1
+
+    consumed = 0
+    for match in _LINK_START_RE.finditer(text):
+        if match.start() < consumed:
+            continue
+        end = endings.get(match.end() - 1)
+        if end is not None:
+            yield match, end
+            consumed = end
+
+
+def contains_inline_markdown_link(text: str) -> bool:
+    """Use the same bounded link grammar for cleanup and plain-text validation."""
+    return next(_inline_markdown_links(text[:MAX_PREPROCESS_CHARS]), None) is not None
 
 
 def _is_meaningful_paragraph(text: str) -> bool:

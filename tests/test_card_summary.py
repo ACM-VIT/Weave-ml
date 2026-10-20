@@ -60,7 +60,7 @@ def test_untrusted_preprocessing_is_bounded_without_mutating_markdown(malformed)
 @pytest.mark.parametrize("case", [
     "newlines", "crlf", "spaces", "tabs", "mixed-whitespace", "interior-newlines",
     "blank-lines-before-pipe", "whitespace-line", "heading-whitespace",
-    "unclosed-fence", "unclosed-link", "unclosed-html",
+    "unclosed-fence", "unclosed-link", "unclosed-html", "deep-link-target", "repeated-link-openers",
 ])
 def test_whitespace_and_delimiter_cleanup_finishes_in_a_killable_process(case) -> None:
     import subprocess
@@ -70,7 +70,7 @@ def test_whitespace_and_delimiter_cleanup_finishes_in_a_killable_process(case) -
     # Keep the hostile input in a killable child and exercise every cleanup path.
     script = r'''
 import sys, time
-from utils.readme_processor import MAX_PREPROCESS_CHARS, process_markdown
+from utils.readme_processor import MAX_PREPROCESS_CHARS, process_markdown, clean_inline_markdown
 from summarization.pipeline import description_fallback_artifact
 from summarization.source import build_summary_source
 from summarization.validation import _unsafe_text, parse_summary_response, SummaryValidationError
@@ -87,6 +87,8 @@ cases = {
     "unclosed-fence": "```" + " " * 63_990 + "x",
     "unclosed-link": "[label](" + " " * 63_990,
     "unclosed-html": "<" + " \n" * 31_999,
+    "deep-link-target": "[review tools](" + "(" * 30_000 + "x" + ")" * 30_001,
+    "repeated-link-openers": "[review](" * 7_000,
 }
 raw = cases[sys.argv[1]]
 started = time.monotonic()
@@ -108,6 +110,8 @@ assert len(document.clean_text) <= MAX_PREPROCESS_CHARS
 assert len(material.prompt_input) <= 12_000
 assert all(len(value) <= MAX_PREPROCESS_CHARS for value in material.comparison_texts)
 assert len(artifact.summary) <= 360
+if sys.argv[1] == "deep-link-target":
+    assert clean_inline_markdown(raw) == "review tools"
 '''
     subprocess.run([sys.executable, "-c", script, case], check=True, timeout=5,
                    capture_output=True, text=True)
@@ -120,6 +124,49 @@ def test_list_before_thematic_break_is_not_a_setext_heading() -> None:
     )}
     material = build_summary_source(repo, repo, max_chars=12_000)
     assert "Maintainers review" in material.prompt_input
+
+
+@pytest.mark.parametrize("note,underline", [
+    ("> Installation", "---"), ("   > Installation", "---"),
+    ("    Installation", "---"), ("\tInstallation", "---"),
+    (" \tInstallation", "---"), ("Installation", "    ---"),
+], ids=["quote", "indented-quote", "space-code", "tab-code", "mixed-code", "indented-rule"])
+def test_quote_and_indented_code_before_thematic_break_do_not_hide_overview(note, underline) -> None:
+    overview = "A collaborative review workspace helps maintainers coordinate changes across shared software projects."
+    repo = {"full_name": "weave/review", "readme": f"{note}\n{underline}\n{overview}"}
+    material = build_summary_source(repo, repo, max_chars=12_000)
+    assert overview in material.prompt_input
+    provider = SequenceProvider([json.dumps({"summary": (
+        "A focused workspace gives engineering teams a clear view of proposed software changes. "
+        "It brings ownership decisions and review history together so maintainers can coordinate their work."
+    )})])
+    artifact = CardSummaryPipeline(provider=provider).summarize(repo, repo)
+    assert len(provider.calls) == 1
+    assert artifact.source == "generated"
+
+
+@pytest.mark.parametrize("target", ["docs/intro(v2).md", "docs/intro(v2(details)).md", r"docs/intro\(v2\).md"])
+def test_balanced_parenthesis_links_are_cleaned_and_repaired(target) -> None:
+    from utils.readme_processor import clean_inline_markdown, process_markdown
+
+    link = f"[review tools]({target})"
+    marked = (
+        f"A focused workspace provides {link} for coordinating software changes across a team. "
+        "It keeps ownership decisions and review history available to maintainers working on shared projects."
+    )
+    repaired = marked.replace(link, "review tools")
+    assert clean_inline_markdown(marked) == repaired
+    assert clean_inline_markdown(f"![preview]({target})") == " "
+    assert process_markdown(marked).raw_markdown == marked
+    assert process_markdown(marked).clean_text == repaired
+    with pytest.raises(SummaryValidationError, match="Markdown"):
+        validate_generated_summary(parse_summary_response(json.dumps({"summary": marked})), comparison_texts=[])
+    provider = SequenceProvider([json.dumps({"summary": marked}), json.dumps({"summary": repaired})])
+    repo = {"full_name": "weave/review", "description": "A shared review workspace for engineering teams."}
+    result = CardSummaryPipeline(provider=provider).summarize(repo, repo)
+    assert result.summary == repaired
+    assert len(provider.calls) == 2
+    assert "Markdown" in provider.calls[1][1]
 
 
 @pytest.fixture
@@ -591,13 +638,15 @@ def test_paragraph_only_input_reaches_provider_and_copy_checks(api_project) -> N
     assert paragraph not in result.summary
 
 
-@pytest.mark.parametrize("heading_style", ["atx", "setext"])
+@pytest.mark.parametrize("heading_style", ["atx", "setext", "setext-three-spaces"])
 def test_excluded_sections_keep_their_subheadings_blocked(heading_style) -> None:
     overview = "A visual workspace helps teams review changes across shared software projects."
     hidden = "Secret prerequisite prose should never consume the bounded provider context."
     nested = "Nested feature prose inside installation must also remain excluded from summaries."
     useful = "Review queues help maintainers coordinate changes with clear ownership and durable context."
     title = "## Installation" if heading_style == "atx" else "Installation\n------------"
+    if heading_style == "setext-three-spaces":
+        title = "   Installation\n   ------------"
     readme = f"# Overview\n{overview}\n\n{title}\n### Prerequisites\n{hidden}\n#### Features\n{nested}\n## Benefits\n{useful}"
     repo = {"full_name": "weave/section-depth", "readme": readme}
     source = build_summary_source(repo, repo, max_chars=12_000)
