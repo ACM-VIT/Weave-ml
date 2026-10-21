@@ -27,6 +27,7 @@ from api.runtime import (
     ServiceDeadlineExceeded,
     run_service_job,
     service_runtime_status,
+    service_timeout_seconds,
     shutdown_service_runtime,
     validate_service_runtime,
 )
@@ -1092,6 +1093,7 @@ def _search_repository_job(request: RepositorySearchRequest):
         model_revision=model.query_embedding_revision,
         embedding_version=search_retriever.embedding_version,
         expected_size=search_retriever.embedding_dim,
+        wait_seconds=service_timeout_seconds("search"),
     )
     try:
         return search_repositories(request, search_retriever, embedder)

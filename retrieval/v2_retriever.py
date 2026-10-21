@@ -425,7 +425,9 @@ class QdrantV2Retriever:
             return None
         return list(value)
 
-    def _eligible_filter(self) -> models.Filter:
+    def _eligible_filter(
+        self, *, exclude_repo_ids: set[str] | None = None
+    ) -> models.Filter:
         # Filtering in Qdrant happens before the retrieval limit is applied, so
         # stale pre-contract points cannot crowd valid backend repositories out.
         must: list[Any] = [
@@ -469,7 +471,17 @@ class QdrantV2Retriever:
                     match=models.MatchValue(value=self.embedding_model_revision),
                 )
             )
-        return models.Filter(must=must)
+        # The store uses canonical backend UUIDs as point IDs, and
+        # _canonical_id rejects points whose payload and point ID disagree.
+        # Exclude history before *every* channel's bounded selection so a
+        # viewed top pool cannot hide eligible unseen repositories behind it.
+        return models.Filter(
+            must=must,
+            must_not=(
+                [models.HasIdCondition(has_id=sorted(exclude_repo_ids))]
+                if exclude_repo_ids else None
+            ),
+        )
 
     def _eligible_repository_point(
         self,
@@ -617,12 +629,13 @@ class QdrantV2Retriever:
         cache: dict[tuple[str, bool], _EligibleRepositoryPoint | None] | None = None,
         *,
         include_vectors: bool = True,
+        exclude_repo_ids: set[str] | None = None,
     ) -> list[tuple[_EligibleRepositoryPoint, float]]:
         response = self.client.query_points(
             collection_name=self.repository_collection,
             query=vector,
             using=QDRANT_VECTOR_NAME,
-            query_filter=self._eligible_filter(),
+            query_filter=self._eligible_filter(exclude_repo_ids=exclude_repo_ids),
             limit=min(limit, self.max_candidates),
             with_payload=(
                 _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS
@@ -647,6 +660,7 @@ class QdrantV2Retriever:
         cache: dict[tuple[str, bool], _EligibleRepositoryPoint | None] | None = None,
         *,
         include_vectors: bool = True,
+        exclude_repo_ids: set[str] | None = None,
     ) -> list[tuple[_EligibleRepositoryPoint, str]]:
         target = min(limit, self.max_candidates)
         channels = list(_DISCOVERY_SOURCES)
@@ -660,7 +674,9 @@ class QdrantV2Retriever:
             try:
                 records, _ = self.client.scroll(
                     collection_name=self.repository_collection,
-                    scroll_filter=self._eligible_filter(),
+                    scroll_filter=self._eligible_filter(
+                        exclude_repo_ids=exclude_repo_ids
+                    ),
                     limit=per_channel,
                     order_by=models.OrderBy(
                         key=REPOSITORY_DISCOVERY_CHANNELS[channel],
@@ -976,6 +992,7 @@ class QdrantV2Retriever:
                     max(limit * 5, 100),
                     eligibility_cache,
                     include_vectors=include_candidate_vectors,
+                    exclude_repo_ids=excluded,
                 )
             except Exception as exc:
                 logger.error(
@@ -1001,6 +1018,7 @@ class QdrantV2Retriever:
                 max(limit * 8, 200),
                 eligibility_cache,
                 include_vectors=include_candidate_vectors,
+                exclude_repo_ids=excluded,
             )
         except RetrievalDependencyError:
             if not candidates:

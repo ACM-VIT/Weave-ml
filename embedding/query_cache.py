@@ -14,7 +14,7 @@ import threading
 import time
 from array import array
 from collections import OrderedDict
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import Callable
 
@@ -116,7 +116,12 @@ class QueryEmbeddingCache:
 
         if not owner:
             try:
-                value = future.result(timeout=wait_seconds)
+                try:
+                    value = future.result(timeout=wait_seconds)
+                except FutureTimeoutError as exc:
+                    # Before Python 3.11 this is not the built-in TimeoutError
+                    # caught by the search route. Keep one boundary contract.
+                    raise TimeoutError('query embedding wait deadline was exceeded') from exc
                 with self._lock:
                     self._saved_seconds += value.compute_seconds
                 return value.copy()

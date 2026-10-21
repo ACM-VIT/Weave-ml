@@ -176,6 +176,11 @@ async def run_service_job(
     return await _runtime(operation).run(function, *args)
 
 
+def service_timeout_seconds(operation: str) -> float:
+    """Return the immutable deadline configured for this admitted worker pool."""
+    return _runtime(operation).timeout
+
+
 def validate_service_runtime() -> None:
     for operation in _SPECS:
         _settings(operation)

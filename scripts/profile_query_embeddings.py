@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import struct
 import time
 import tracemalloc
 
@@ -46,12 +47,15 @@ def measure(queries: list[str], *, cached: bool) -> dict:
         embedding_version='synthetic-profile-v1', expected_size=REPOSITORY_EMBEDDING_DIM,
     ) if cached else SentenceTransformerEmbedder(model=model)
     began = time.perf_counter()
-    checksum = 0.
+    checksum = hashlib.sha256()
     for query in queries:
         vector = validate_embedding_vector(
             embedder.embed_text(query), expected_size=REPOSITORY_EMBEDDING_DIM,
         )
-        checksum += sum(vector)
+        # Frame and hash values in request/coordinate order; scalar sums
+        # cannot detect swapped requests or reordered coordinates.
+        checksum.update(struct.pack('!I', len(vector)))
+        checksum.update(struct.pack(f'!{len(vector)}d', *vector))
     seconds = time.perf_counter() - began
     snapshot = model.query_embedding_cache.snapshot()
     retained, peak = tracemalloc.get_traced_memory()
@@ -61,7 +65,7 @@ def measure(queries: list[str], *, cached: bool) -> dict:
         'cache_hit_rate': snapshot['hits'] / len(queries) if cached else 0.,
         'workload_seconds': seconds, 'encoder_seconds': encoder.seconds,
         'tracemalloc_retained_bytes': retained, 'tracemalloc_peak_bytes': peak,
-        'cache': snapshot, 'vector_checksum': checksum,
+        'cache': snapshot, 'vector_checksum': checksum.hexdigest(),
     }
 
 
@@ -72,14 +76,16 @@ def main() -> None:
     if not 10 <= args.requests <= 100_000:
         parser.error('--requests must be between 10 and 100000')
     output = {'scope': 'Local deterministic synthetic CPU encoder; no production inference or speedup claim.',
-              'dimension': REPOSITORY_EMBEDDING_DIM, 'workloads': {}}
+              'dimension': REPOSITORY_EMBEDDING_DIM,
+              'vector_checksum_algorithm': 'sha256-length-framed-big-endian-float64',
+              'workloads': {}}
     for name, queries in (
         ('repeat', [f'synthetic-query-{i % max(1, args.requests // 10)}' for i in range(args.requests)]),
         ('unique', [f'synthetic-query-{i}' for i in range(args.requests)]),
     ):
         baseline = measure(queries, cached=False)
         cached = measure(queries, cached=True)
-        if abs(baseline['vector_checksum'] - cached['vector_checksum']) > 1e-9:
+        if baseline['vector_checksum'] != cached['vector_checksum']:
             raise AssertionError('cached and baseline vectors differ')
         output['workloads'][name] = {
             'baseline': baseline, 'cached': cached,

@@ -139,7 +139,25 @@ def test_encoder_failure_wakes_waiters_and_next_call_retries(error):
     assert lookup(cache) == [1., 0.]
 
 
-def test_timed_out_waiter_does_not_cancel_or_retire_live_owner():
+@pytest.mark.parametrize('legacy_future_timeout', [False, True])
+def test_timed_out_waiter_does_not_cancel_or_retire_live_owner(monkeypatch, legacy_future_timeout):
+    if legacy_future_timeout:
+        import concurrent.futures
+        from embedding import query_cache
+
+        class LegacyFuturesTimeoutError(Exception):
+            pass
+
+        class LegacyFuture(concurrent.futures.Future):
+            def result(self, timeout=None):
+                try:
+                    return super().result(timeout=timeout)
+                except concurrent.futures.TimeoutError as exc:
+                    # Python 3.10's futures timeout is not a built-in timeout.
+                    raise LegacyFuturesTimeoutError() from exc
+
+        monkeypatch.setattr(query_cache, 'Future', LegacyFuture)
+        monkeypatch.setattr(query_cache, 'FutureTimeoutError', LegacyFuturesTimeoutError, raising=False)
     cache = QueryEmbeddingCache()
     started, release = threading.Event(), threading.Event()
 
@@ -283,3 +301,22 @@ def test_concurrent_cold_search_model_loads_share_one_query_cache(monkeypatch):
         assert len(loaded) == 2
     finally:
         runtime.reset_embedding_runtime_for_tests()
+
+
+@pytest.mark.parametrize('reorder', ['coordinates', 'requests'])
+def test_profile_fingerprint_detects_vector_and_request_reordering(monkeypatch, reorder):
+    from scripts.profile_query_embeddings import SyntheticEncoder, measure
+
+    queries = ['first synthetic query', 'second synthetic query']
+    baseline = measure(queries, cached=False)['vector_checksum']
+    if reorder == 'coordinates':
+        encode = SyntheticEncoder.encode
+
+        def reversed_coordinates(self, texts, **kwargs):
+            return [list(reversed(vector)) for vector in encode(self, texts, **kwargs)]
+
+        monkeypatch.setattr(SyntheticEncoder, 'encode', reversed_coordinates)
+    else:
+        queries.reverse()
+    reordered = measure(queries, cached=True)['vector_checksum']
+    assert baseline != reordered

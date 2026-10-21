@@ -212,7 +212,7 @@ async def test_search_deadline_retains_capacity_and_records_saturation(monkeypat
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize('interruption', ['cancel_owner', 'cancel_waiter', 'timeout'])
+@pytest.mark.parametrize('interruption', ['cancel_owner', 'cancel_waiter', 'timeout', 'configured_timeout'])
 async def test_shared_query_flight_preserves_search_admission_during_http_interruptions(monkeypatch, interruption):
     import uuid
     import httpx
@@ -225,7 +225,8 @@ async def test_shared_query_flight_preserves_search_admission_during_http_interr
     monkeypatch.setenv('INTERNAL_API_SECRET', 'isolated-query-cache-secret')
     monkeypatch.setenv('V2_SEARCH_EXECUTOR_WORKERS', '2')
     monkeypatch.setenv('V2_SEARCH_MAX_OUTSTANDING', '2')
-    monkeypatch.setenv('V2_SEARCH_TIMEOUT_SECONDS', '.1' if interruption == 'timeout' else '5')
+    timeout = '.1' if interruption == 'timeout' else ('6' if interruption == 'configured_timeout' else '5')
+    monkeypatch.setenv('V2_SEARCH_TIMEOUT_SECONDS', timeout)
     started, release = threading.Event(), threading.Event()
     calls = []
 
@@ -233,7 +234,7 @@ async def test_shared_query_flight_preserves_search_admission_during_http_interr
         def encode(self, texts, **kwargs):
             calls.extend(texts)
             started.set()
-            assert release.wait(3)
+            assert release.wait(8)
             return [[1.] + [0.] * (REPOSITORY_EMBEDDING_DIM - 1)]
 
     model = BoundedEmbeddingModel(Encoder(), max_concurrency=1)
@@ -263,8 +264,20 @@ async def test_shared_query_flight_preserves_search_admission_during_http_interr
         try:
             tasks.append(submit())
             assert await asyncio.to_thread(started.wait, 2)
+            if interruption == 'configured_timeout':
+                # The already-created pool keeps its six-second deadline even
+                # if the process environment changes before a matching job.
+                monkeypatch.setenv('V2_SEARCH_TIMEOUT_SECONDS', '.1')
             tasks.append(submit())
             await until(lambda: model.query_embedding_cache.snapshot()['waiters'] == 1)
+            if interruption == 'configured_timeout':
+                await asyncio.sleep(4.2)
+                release.set()
+                assert [response.status_code for response in await asyncio.gather(*tasks)] == [200, 200]
+                assert calls == ['private matching query']
+                assert model.query_embedding_cache.snapshot()['flights'] == 0
+                assert model.query_embedding_cache.snapshot()['waiters'] == 0
+                return
             if interruption == 'timeout':
                 assert [response.status_code for response in await asyncio.gather(*tasks)] == [503, 503]
             else:
