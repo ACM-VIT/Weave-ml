@@ -322,6 +322,15 @@ def test_history_exclusions_do_not_exhaust_a_bounded_candidate_pool(
     assert len(corpus.client.scroll.call_args_list) == 4
     assert corpus.client.query_points.call_args.kwargs["limit"] == 150
     assert all(call.kwargs["limit"] == 75 for call in corpus.client.scroll.call_args_list)
+    expected_exclusions = [models.HasIdCondition(has_id=sorted(excluded))]
+    assert (
+        corpus.client.query_points.call_args.kwargs["query_filter"].must_not
+        == expected_exclusions
+    )
+    assert all(
+        call.kwargs["scroll_filter"].must_not == expected_exclusions
+        for call in corpus.client.scroll.call_args_list
+    )
     if heavy:
         candidates = retriever.ranker.calls[0][2]
         assert 45 <= len(candidates) <= 150
