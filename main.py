@@ -145,6 +145,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _configuration_errors(args: argparse.Namespace) -> list[str]:
     """Return configuration errors without contacting external services."""
     errors: list[str] = []
+    from acquisition.config import metadata_batch_size
+
+    try:
+        metadata_batch_size()
+    except ValueError as exc:
+        errors.append(str(exc))
     token = os.getenv("GITHUB_TOKEN")
     if not token or token == "your_github_token_here":
         errors.append("GITHUB_TOKEN is missing or still uses the placeholder value")
@@ -192,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
     ).validated()
 
     def acquire(**kwargs: Any):
-        return run_acquisition_detailed(token, **kwargs)
+        return run_acquisition_detailed(token, metadata_projection="delivery", **kwargs)
 
     def retry(names: list[str]):
         return enrich_repository_ids(
@@ -200,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
             names,
             batch_size=args.batch_size,
             workers=args.workers,
+            metadata_projection="delivery",
         )
 
     backend = BackendIngestionClient(

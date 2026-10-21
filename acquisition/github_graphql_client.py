@@ -26,6 +26,15 @@ logger = logging.getLogger(__name__)
 class GitHubGraphQLClientError(RuntimeError):
     """Raised when the GitHub GraphQL API returns an unrecoverable error."""
 
+    def __init__(self, message: str, *, category: str = "response", status_code: int | None = None) -> None:
+        super().__init__(message)
+        # Log only controlled diagnostic fields, never the exception message:
+        # legacy messages may contain response bodies or transport URLs.
+        self.category = category if category in {
+            "response", "transport", "rate_limit", "server", "http", "invalid_json", "graphql",
+        } else "response"
+        self.status_code = status_code if type(status_code) is int and 100 <= status_code <= 599 else None
+
 # Backwards-compatible alias so existing callers don't break
 GitHubClientError = GitHubGraphQLClientError
 
@@ -261,12 +270,12 @@ class GitHubGraphQLClient:
             raise
         return FetchedReadme()
 
-    def get_repositories_batch(self, repos: list[tuple[str, str]]) -> dict[str, dict[str, Any]]:
+    def get_repositories_batch(self, repos: list[tuple[str, str]], *, projection: str = "legacy") -> dict[str, dict[str, Any]]:
         """Fetches multiple repositories using a lean metadata-only batch query."""
         if not repos:
             return {}
 
-        query = build_batch_metadata_query(repos)
+        query = build_batch_metadata_query(repos, projection=projection)
         response = self.execute(query)
         if not response:
             return {}
@@ -311,31 +320,47 @@ class GitHubGraphQLClient:
                 )
             except requests.RequestException as exc:
                 if attempt >= self.max_retries:
-                    raise GitHubClientError(f"GitHub GraphQL request failed: {exc}") from exc
+                    raise GitHubClientError(f"GitHub GraphQL request failed: {exc}", category="transport") from exc
                 self._sleep_backoff(attempt)
                 continue
 
             if response.status_code == 403 and self._is_rate_limited(response):
                 if attempt >= self.max_retries or not self.sleep_on_rate_limit:
-                    raise GitHubClientError("GitHub GraphQL rate limit exceeded")
+                    raise GitHubClientError("GitHub GraphQL rate limit exceeded", category="rate_limit", status_code=response.status_code)
                 self._sleep_until_reset(response)
                 continue
 
             if response.status_code in {500, 502, 503, 504}:
                 if attempt >= self.max_retries:
-                    raise GitHubClientError(f"GitHub GraphQL transient failure {response.status_code}: {response.text[:300]}")
+                    raise GitHubClientError(f"GitHub GraphQL transient failure {response.status_code}: {response.text[:300]}", category="server", status_code=response.status_code)
                 self._sleep_backoff(attempt)
                 continue
 
             if response.status_code >= 400:
-                raise GitHubClientError(f"GitHub GraphQL error {response.status_code}: {response.text[:300]}")
+                raise GitHubClientError(f"GitHub GraphQL error {response.status_code}: {response.text[:300]}", category="http", status_code=response.status_code)
 
-            result = response.json()
+            try:
+                result = response.json()
+            except ValueError as exc:
+                raise GitHubClientError(
+                    "GitHub GraphQL returned invalid JSON", category="invalid_json", status_code=response.status_code,
+                ) from exc
+            if not isinstance(result, dict):
+                raise GitHubClientError("GitHub GraphQL returned an invalid response envelope", status_code=response.status_code)
+            errors = result.get("errors")
+            if "errors" in result and (
+                not isinstance(errors, list) or any(not isinstance(error, dict) for error in errors)
+            ):
+                raise GitHubClientError("GitHub GraphQL returned invalid error details", status_code=response.status_code)
+            data_field = result.get("data")
+            if (data_field is not None and not isinstance(data_field, dict)) or (
+                not isinstance(data_field, dict) and not errors
+            ):
+                raise GitHubClientError("GitHub GraphQL returned an invalid data envelope", status_code=response.status_code)
             
             # Rate limit tracking from GraphQL payload
-            data_field = result.get("data")
-            if isinstance(data_field, dict) and "rateLimit" in data_field:
-                rl = data_field["rateLimit"]
+            rl = data_field.get("rateLimit") if isinstance(data_field, dict) else None
+            if isinstance(rl, dict):
                 logger.debug("GraphQL rate limit: %s remaining", rl.get("remaining"))
             
             if "errors" in result:
@@ -346,7 +371,8 @@ class GitHubGraphQLClient:
                     )
                     return result
                 if any(
-                    "Could not resolve to a Repository" in error.get("message", "")
+                    isinstance(error.get("message"), str)
+                    and "Could not resolve to a Repository" in error["message"]
                     for error in result["errors"]
                 ):
                     logger.warning(
@@ -355,7 +381,7 @@ class GitHubGraphQLClient:
                     )
                     return None
                 raise GitHubClientError(
-                    f"GitHub GraphQL returned errors: {result['errors']}"
+                    f"GitHub GraphQL returned errors: {result['errors']}", category="graphql", status_code=response.status_code,
                 )
 
             return result

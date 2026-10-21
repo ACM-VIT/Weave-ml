@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 import json
 import time
@@ -16,6 +17,9 @@ MAX_RECORDS = 100
 # characters. Keep transport bounded while allowing UTF-8 and JSON escaping
 # overhead for a single maximum-size repository record.
 MAX_BODY_BYTES = 8 * 1024 * 1024
+_REPOSITORIES_PREFIX = b'{"repositories":['
+_REPOSITORIES_SUFFIX = b"]}"
+_REPOSITORIES_ENVELOPE_BYTES = len(_REPOSITORIES_PREFIX) + len(_REPOSITORIES_SUFFIX)
 
 
 @dataclass(slots=True)
@@ -27,6 +31,12 @@ class RepositoryDeliveryResult:
     @property
     def count(self) -> int:
         return len(self.succeeded)
+
+
+@dataclass(slots=True)
+class _EncodedRepositoryBatch:
+    identities: list[tuple[str, str]]
+    body: bytes
 
 
 class BackendIngestionClient:
@@ -77,26 +87,34 @@ class BackendIngestionClient:
         self, sources: list[Any]
     ) -> RepositoryDeliveryResult:
         result = RepositoryDeliveryResult()
-        records: list[tuple[str, dict[str, Any]]] = []
-        for source in sources:
-            try:
-                record = repository_upsert_record(source)
-                records.append((record["full_name"], record))
-            except Exception as exc:
-                name = _source_name(source)
-                result.failed[name] = str(exc)[:500]
 
-        for batch in _bounded_batches(records):
-            names = [name for name, _ in batch]
+        def encoded_records() -> Iterator[tuple[str, str, bytes]]:
+            for source in sources:
+                try:
+                    record = repository_upsert_record(source)
+                    name, github_id = record["full_name"], record["github_id"]
+                    encoded = json.dumps(
+                        record, separators=(",", ":"), ensure_ascii=False
+                    ).encode("utf-8")
+                    # Do not retain the full normalized record during delivery.
+                    del record
+                    if len(encoded) + _REPOSITORIES_ENVELOPE_BYTES > MAX_BODY_BYTES:
+                        raise ValueError("backend request exceeds the 8 MiB body limit")
+                    yield name, github_id, encoded
+                except Exception as exc:
+                    result.failed[_source_name(source)] = str(exc)[:500]
+
+        for batch in _bounded_batches(encoded_records()):
+            names = [name for name, _ in batch.identities]
             try:
-                response = self._post(
+                response = self._post_encoded(
                     "/api/internal/v2/ingestion/repositories/upsert",
-                    {"repositories": [record for _, record in batch]},
+                    batch.body,
                 )
                 mappings = response.get("mappings")
                 if not isinstance(mappings, list):
                     raise ValueError("backend response is missing mappings")
-                by_github_id = {record["github_id"]: name for name, record in batch}
+                by_github_id = {github_id: name for name, github_id in batch.identities}
                 mapped_names: set[str] = set()
                 for mapping in mappings:
                     github_id = str(mapping.get("github_id") or "")
@@ -129,6 +147,9 @@ class BackendIngestionClient:
         encoded = json.dumps(
             payload, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
+        return self._post_encoded(path, encoded)
+
+    def _post_encoded(self, path: str, encoded: bytes) -> dict[str, Any]:
         if len(encoded) > MAX_BODY_BYTES:
             raise ValueError("backend request exceeds the 8 MiB body limit")
         headers = {
@@ -248,32 +269,27 @@ def repository_upsert_record(source: Any) -> dict[str, Any]:
 
 
 def _bounded_batches(
-    records: list[tuple[str, dict[str, Any]]]
-) -> list[list[tuple[str, dict[str, Any]]]]:
-    batches: list[list[tuple[str, dict[str, Any]]]] = []
-    current: list[tuple[str, dict[str, Any]]] = []
-    for item in records:
-        candidate = [*current, item]
-        size = len(
-            json.dumps(
-                {"repositories": [record for _, record in candidate]},
-                separators=(",", ":"),
-                ensure_ascii=False,
-            ).encode("utf-8")
-        )
-        if size > MAX_BODY_BYTES:
-            if not current:
-                raise ValueError(f"repository payload for {item[0]} exceeds 8 MiB")
-            batches.append(current)
-            current = [item]
-        else:
-            current = candidate
-        if len(current) == MAX_RECORDS:
-            batches.append(current)
-            current = []
-    if current:
-        batches.append(current)
-    return batches
+    records: Iterable[tuple[str, str, bytes]],
+) -> Iterator[_EncodedRepositoryBatch]:
+    identities: list[tuple[str, str]] = []
+    body = bytearray(_REPOSITORIES_PREFIX)
+    for name, github_id, encoded in records:
+        size = len(body) + bool(identities) + len(encoded) + len(_REPOSITORIES_SUFFIX)
+        if identities and (size > MAX_BODY_BYTES or len(identities) == MAX_RECORDS):
+            body.extend(_REPOSITORIES_SUFFIX)
+            batch = _EncodedRepositoryBatch(identities, bytes(body))
+            identities = []
+            body = bytearray(_REPOSITORIES_PREFIX)
+            yield batch
+        if identities:
+            body.extend(b",")
+        body.extend(encoded)
+        identities.append((name, github_id))
+    if identities:
+        body.extend(_REPOSITORIES_SUFFIX)
+        batch = _EncodedRepositoryBatch(identities, bytes(body))
+        body.clear()
+        yield batch
 
 
 def _source_name(source: Any) -> str:

@@ -13,6 +13,7 @@ from .identity import (
     repository_name_from_candidate,
 )
 from .models import AcquisitionFailure, AcquisitionRunResult
+from .config import metadata_batch_size as configured_metadata_batch_size
 
 logger = logging.getLogger("pipeline.acquisition")
 
@@ -27,6 +28,7 @@ def run_acquisition(
     batch_size: int = 15,
     workers: int = 4,
     existing_repos: set[str] | None = None,
+    metadata_projection: str = "legacy",
 ) -> list[Any]:
     """
     Discover and enrich GitHub repositories via GraphQL only.
@@ -46,6 +48,7 @@ def run_acquisition(
         batch_size=batch_size,
         workers=workers,
         existing_repos=existing_repos,
+        metadata_projection=metadata_projection,
     ).repositories
 
 
@@ -56,9 +59,11 @@ def run_acquisition_detailed(
     batch_size: int = 15,
     workers: int = 4,
     existing_repos: set[str] | None = None,
+    metadata_projection: str = "legacy",
 ) -> AcquisitionRunResult:
     """Discover and enrich repositories with structured audit information."""
     _validate_inputs(token=token, limit=limit, batch_size=batch_size, workers=workers)
+    _validate_metadata_settings(metadata_projection)
 
     from acquisition.github_graphql_client import GitHubGraphQLClient
     from acquisition.github_discovery import GitHubDiscoveryEngine, DiscoveryConfig
@@ -93,6 +98,7 @@ def run_acquisition_detailed(
         targets,
         batch_size=batch_size,
         workers=workers,
+        metadata_projection=metadata_projection,
     )
     enriched.discovered_count = len(discovered)
     enriched.skipped_existing_count = skipped_existing
@@ -107,10 +113,11 @@ def enrich_repository_ids(
     *,
     batch_size: int = 15,
     workers: int = 4,
+    metadata_projection: str = "legacy",
 ) -> AcquisitionRunResult:
     """Enrich explicit repository names, primarily for checkpoint retries."""
     _validate_inputs(token=token, limit=max(len(repositories), 1), batch_size=batch_size, workers=workers)
-    return enrich_repositories(token, repositories, batch_size=batch_size, workers=workers)
+    return enrich_repositories(token, repositories, batch_size=batch_size, workers=workers, metadata_projection=metadata_projection)
 
 
 def enrich_repositories(
@@ -119,15 +126,18 @@ def enrich_repositories(
     *,
     batch_size: int = 15,
     workers: int = 4,
+    metadata_projection: str = "legacy",
 ) -> AcquisitionRunResult:
     """Enrich an explicit candidate list concurrently and return stable ordering."""
     _validate_inputs(token=token, limit=max(len(repositories), 1), batch_size=batch_size, workers=workers)
+    metadata_size = _validate_metadata_settings(metadata_projection)
     targets, duplicates_removed = deduplicate_candidates(repositories)
     batches = [targets[i : i + batch_size] for i in range(0, len(targets), batch_size)]
     logger.info(
         "Enriching %d repos in %d batch(es) of up to %d with %d concurrent worker(s) …",
         len(targets), len(batches), batch_size, workers,
     )
+    logger.info("Metadata query settings: batch_size=%d projection=%s (scheduler chunk=%d)", metadata_size, metadata_projection, batch_size)
     failures: list[AcquisitionFailure] = []
     results_by_batch: dict[int, list[Any]] = {}
 
@@ -140,7 +150,9 @@ def enrich_repositories(
             from acquisition.github_graphql_client import GitHubGraphQLClient
             from acquisition.repository_enricher import RepositoryEnricher
             _thread_local.enricher = RepositoryEnricher(
-                graphql_client=GitHubGraphQLClient(token=token)
+                graphql_client=GitHubGraphQLClient(token=token),
+                metadata_batch_size=metadata_size,
+                metadata_projection=metadata_projection,
             )
         return _thread_local.enricher
 
@@ -152,8 +164,8 @@ def enrich_repositories(
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         # Each future processes one batch of batch_size repos. workers controls
-        # how many batches run concurrently; batch_size controls the GraphQL
-        # request payload size. Both levers are now effective.
+        # how many chunks run concurrently; metadata_size separately bounds
+        # each GraphQL payload inside a scheduler chunk.
         futures = {executor.submit(_enrich_batch, batch): (i, batch) for i, batch in enumerate(batches)}
         for future in as_completed(futures):
             batch_index, batch = futures[future]
@@ -206,6 +218,12 @@ def enrich_repositories(
         discovered_count=len(repositories),
         duplicates_removed=duplicates_removed,
     )
+
+
+def _validate_metadata_settings(projection: str) -> int:
+    if projection not in {"legacy", "delivery"}:
+        raise ValueError("Unknown metadata projection")
+    return configured_metadata_batch_size()
 
 
 def _validate_inputs(*, token: str, limit: int, batch_size: int, workers: int) -> None:

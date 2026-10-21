@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import itertools
 import logging
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .github_graphql_client import GitHubGraphQLClient
+from .github_graphql_client import GitHubGraphQLClient, GitHubGraphQLClientError
 from .graphql_queries import SEARCH_REPOSITORIES_QUERY
+from .identity import repository_identity_key
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,14 @@ class DiscoveryConfig:
     pages_per_query: int = 1
     random_seed: int | None = None
 
+    def __post_init__(self) -> None:
+        # GitHub connection first must be 1..100. Ten pages is our explicit
+        # bounded-work policy and cannot exceed search's 1,000-result window.
+        for name, maximum in (("per_query", 100), ("pages_per_query", 10)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+                raise ValueError(f"{name} must be an integer between 1 and {maximum}")
+
 
 class GitHubDiscoveryEngine:
     """Discovers repositories across categories and maturity bands using GraphQL only."""
@@ -59,44 +67,85 @@ class GitHubDiscoveryEngine:
         self.random = random.Random(self.config.random_seed)
 
     def _search_graphql(self, query_str: str, per_page: int) -> list[dict[str, Any]]:
-        """Run a GraphQL repository search and return a flat list of repo dicts."""
-        result = self.client.execute(
-            SEARCH_REPOSITORIES_QUERY,
-            {"query": query_str},
-        )
-        if not result:
-            return []
-        nodes = result.get("data", {}).get("search", {}).get("nodes", [])
+        """Fetch bounded pages; retain usable partial nodes without advancing."""
+        if isinstance(per_page, bool) or not isinstance(per_page, int) or not 1 <= per_page <= 100:
+            raise ValueError("per_page must be an integer between 1 and 100")
+        logger.info("Discovery request settings: first=%d pages=%d", per_page, self.config.pages_per_query)
         repos = []
-        for node in nodes[:per_page]:
-            full_name = node.get("nameWithOwner")
-            if not full_name:
-                continue
-            repos.append({
-                "full_name": full_name,
-                "name": node.get("name"),
-                "stargazers_count": node.get("stargazerCount", 0),
-                "description": node.get("description"),
-                "pushed_at": node.get("pushedAt"),
-                "owner": {"login": (node.get("owner") or {}).get("login")},
-            })
+        after = None
+        seen_cursors = set()
+        for _ in range(self.config.pages_per_query):
+            try:
+                result = self.client.execute(
+                    SEARCH_REPOSITORIES_QUERY,
+                    {"query": query_str, "first": per_page, "after": after},
+                )
+            except GitHubGraphQLClientError as exc:
+                if not repos:
+                    raise
+                logger.warning(
+                    "Discovery page failed (category=%s status=%s); retaining completed pages without advancing",
+                    exc.category, exc.status_code,
+                )
+                break
+            data = result.get("data") if isinstance(result, dict) else None
+            search = data.get("search") if isinstance(data, dict) else None
+            if not isinstance(search, dict):
+                break
+            nodes = search.get("nodes")
+            if not isinstance(nodes, list):
+                break
+            for node in nodes[:per_page]:
+                if not isinstance(node, dict) or not node.get("nameWithOwner"):
+                    continue
+                repos.append({
+                    "full_name": node["nameWithOwner"],
+                    "name": node.get("name"),
+                    "stargazers_count": node.get("stargazerCount", 0),
+                    "description": node.get("description"),
+                    "pushed_at": node.get("pushedAt"),
+                    "owner": {"login": (node.get("owner") or {}).get("login")},
+                })
+            page_info = search.get("pageInfo")
+            if result.get("errors"):
+                logger.warning("Discovery search returned partial data; not advancing its cursor")
+                break
+            if not isinstance(page_info, dict):
+                break
+            cursor = page_info.get("endCursor")
+            if not page_info.get("hasNextPage") or not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+                break
+            seen_cursors.add(cursor)
+            after = cursor
         return repos
 
     def discover(self, *, limit: int | None = None) -> list[dict[str, Any]]:
-        target = limit or self.config.total_limit
+        target = self.config.total_limit if limit is None else limit
+        if isinstance(target, bool) or not isinstance(target, int) or target < 0:
+            raise ValueError("Discovery target must be a non-negative integer")
         allocations = self._allocations(target)
         discovered: dict[str, dict[str, Any]] = {}
+        accepted_counts = dict.fromkeys(allocations, 0)
 
         category_cycle = list(DISCOVERY_CATEGORIES.items())
         self.random.shuffle(category_cycle)
+        category_cursor = 0
 
         for band, band_limit in allocations.items():
             if len(discovered) >= target:
                 break
+            if band_limit == 0:
+                continue
             per_category = max(1, band_limit // max(len(category_cycle), 1))
-            for category, terms in category_cycle:
-                if len(discovered) >= target:
+            # One finite pass: duplicate-heavy or exhausted categories may
+            # leave a shortfall, but never trigger unbounded refill searches.
+            for _ in range(len(category_cycle)):
+                if len(discovered) >= target or accepted_counts[band] >= band_limit:
                     break
+                # Continue across bands instead of repeatedly favoring the
+                # first category when small quotas fill on their first query.
+                category, terms = category_cycle[category_cursor % len(category_cycle)]
+                category_cursor += 1
                 query = self._query_for_band(category, terms, band)
                 per_page = min(self.config.per_query, max(per_category * 2, 10))
                 try:
@@ -105,16 +154,17 @@ class GitHubDiscoveryEngine:
                     logger.warning(f"Discovery query failed for {category}/{band}: {exc}")
                     continue
                 for repo in repos:
-                    full_name = repo.get("full_name")
-                    if not full_name or full_name in discovered:
+                    if len(discovered) >= target or accepted_counts[band] >= band_limit:
+                        break
+                    identity = repository_identity_key(repo.get("full_name"))
+                    if not identity or identity in discovered:
                         continue
                     repo["_discovery_category"] = category
                     repo["_discovery_band"] = band
-                    discovered[full_name] = repo
-                    if len([r for r in discovered.values() if r.get("_discovery_band") == band]) >= band_limit:
-                        break
+                    discovered[identity] = repo
+                    accepted_counts[band] += 1
 
-        return list(discovered.values())[:target]
+        return list(discovered.values())
 
     @staticmethod
     def _allocations(total: int) -> dict[str, int]:
