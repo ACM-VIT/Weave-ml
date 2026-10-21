@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -147,7 +148,7 @@ async def test_search_runs_while_single_embedding_worker_waits_on_summary_provid
         # short-job queue, using the exact model held by the blocked pipeline.
         monkeypatch.setenv("INTERNAL_API_SECRET", "isolated-search-secret")
         monkeypatch.setattr("api.v2.shared_embedding_model", lambda: model)
-        monkeypatch.setattr("api.v2.retriever", lambda: object())
+        monkeypatch.setattr("api.v2.retriever", lambda: SimpleNamespace(embedding_version="repo-embedding-v2", embedding_dim=384))
 
         def search(request, retriever, query_embedder):
             assert query_embedder.model is model
@@ -208,3 +209,103 @@ async def test_search_deadline_retains_capacity_and_records_saturation(monkeypat
             await runtime.run_service_job("search", lambda: None)
     finally:
         allow_finish.set()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('interruption', ['cancel_owner', 'cancel_waiter', 'timeout', 'configured_timeout'])
+async def test_shared_query_flight_preserves_search_admission_during_http_interruptions(monkeypatch, interruption):
+    import uuid
+    import httpx
+    from fastapi import FastAPI
+    from api.v2 import router
+    from embedding.runtime import BoundedEmbeddingModel
+    from config import REPOSITORY_EMBEDDING_DIM
+    from retrieval.v2_retriever import QdrantV2Retriever
+
+    monkeypatch.setenv('INTERNAL_API_SECRET', 'isolated-query-cache-secret')
+    monkeypatch.setenv('V2_SEARCH_EXECUTOR_WORKERS', '2')
+    monkeypatch.setenv('V2_SEARCH_MAX_OUTSTANDING', '2')
+    timeout = '.1' if interruption == 'timeout' else ('6' if interruption == 'configured_timeout' else '5')
+    monkeypatch.setenv('V2_SEARCH_TIMEOUT_SECONDS', timeout)
+    started, release = threading.Event(), threading.Event()
+    calls = []
+
+    class Encoder:
+        def encode(self, texts, **kwargs):
+            calls.extend(texts)
+            started.set()
+            assert release.wait(8)
+            return [[1.] + [0.] * (REPOSITORY_EMBEDDING_DIM - 1)]
+
+    model = BoundedEmbeddingModel(Encoder(), max_concurrency=1)
+    retriever = QdrantV2Retriever(
+        client=SimpleNamespace(query_points=lambda **kwargs: SimpleNamespace(points=[])),
+        heavy_ranker_enabled=False,
+    )
+    monkeypatch.setattr('api.v2.shared_embedding_model', lambda: model)
+    monkeypatch.setattr('api.v2.retriever', lambda: retriever)
+    app = FastAPI()
+    app.include_router(router)
+    tasks = []
+
+    async def until(predicate):
+        deadline = time.monotonic() + 2
+        while not predicate():
+            assert time.monotonic() < deadline
+            await asyncio.sleep(.001)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://isolated.test') as client:
+        def submit():
+            return asyncio.create_task(client.post(
+                '/api/v2/search/repositories', headers={'X-Internal-Secret': 'isolated-query-cache-secret'},
+                json={'schema_version': 2, 'search_id': str(uuid.uuid4()), 'query': 'private matching query', 'limit': 5},
+            ))
+
+        try:
+            tasks.append(submit())
+            assert await asyncio.to_thread(started.wait, 2)
+            if interruption == 'configured_timeout':
+                # The already-created pool keeps its six-second deadline even
+                # if the process environment changes before a matching job.
+                monkeypatch.setenv('V2_SEARCH_TIMEOUT_SECONDS', '.1')
+            tasks.append(submit())
+            await until(lambda: model.query_embedding_cache.snapshot()['waiters'] == 1)
+            if interruption == 'configured_timeout':
+                await asyncio.sleep(4.2)
+                release.set()
+                assert [response.status_code for response in await asyncio.gather(*tasks)] == [200, 200]
+                assert calls == ['private matching query']
+                assert model.query_embedding_cache.snapshot()['flights'] == 0
+                assert model.query_embedding_cache.snapshot()['waiters'] == 0
+                return
+            if interruption == 'timeout':
+                assert [response.status_code for response in await asyncio.gather(*tasks)] == [503, 503]
+                await until(lambda: model.query_embedding_cache.snapshot()['waiters'] == 0
+                            and runtime.service_runtime_status()['search']['outstanding'] == 1)
+            else:
+                tasks[0 if interruption == 'cancel_owner' else 1].cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await tasks[0 if interruption == 'cancel_owner' else 1]
+            # A completed cache waiter may release its own worker. Cancellation
+            # must retain every still-live worker; the owner always holds its
+            # slot/flight until the real encoder completes.
+            if interruption == 'timeout':
+                assert runtime.service_runtime_status()['search']['outstanding'] == 1
+                assert model.query_embedding_cache.snapshot()['waiters'] == 0
+            else:
+                assert runtime.service_runtime_status()['search']['outstanding'] == 2
+                assert model.query_embedding_cache.snapshot()['waiters'] == 1
+                assert (await submit()).status_code == 503
+            assert model.query_embedding_cache.snapshot()['flights'] == 1
+            release.set()
+            if interruption != 'timeout':
+                assert (await tasks[1 if interruption == 'cancel_owner' else 0]).status_code == 200
+            await until(lambda: runtime.service_runtime_status()['search']['outstanding'] == 0)
+            assert (await submit()).status_code == 200
+            assert calls == ['private matching query']
+            assert model.query_embedding_cache.snapshot()['waiters'] == 0
+            assert model.query_embedding_cache.snapshot()['flights'] == 0
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await until(lambda: runtime.service_runtime_status()['search']['outstanding'] == 0)
