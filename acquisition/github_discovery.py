@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import itertools
 import logging
 import random
 from dataclasses import dataclass
@@ -11,6 +10,7 @@ from typing import Any
 
 from .github_graphql_client import GitHubGraphQLClient
 from .graphql_queries import SEARCH_REPOSITORIES_QUERY
+from .identity import repository_identity_key
 
 logger = logging.getLogger(__name__)
 
@@ -83,20 +83,32 @@ class GitHubDiscoveryEngine:
         return repos
 
     def discover(self, *, limit: int | None = None) -> list[dict[str, Any]]:
-        target = limit or self.config.total_limit
+        target = self.config.total_limit if limit is None else limit
+        if isinstance(target, bool) or not isinstance(target, int) or target < 0:
+            raise ValueError("Discovery target must be a non-negative integer")
         allocations = self._allocations(target)
         discovered: dict[str, dict[str, Any]] = {}
+        accepted_counts = dict.fromkeys(allocations, 0)
 
         category_cycle = list(DISCOVERY_CATEGORIES.items())
         self.random.shuffle(category_cycle)
+        category_cursor = 0
 
         for band, band_limit in allocations.items():
             if len(discovered) >= target:
                 break
+            if band_limit == 0:
+                continue
             per_category = max(1, band_limit // max(len(category_cycle), 1))
-            for category, terms in category_cycle:
-                if len(discovered) >= target:
+            # One finite pass: duplicate-heavy or exhausted categories may
+            # leave a shortfall, but never trigger unbounded refill searches.
+            for _ in range(len(category_cycle)):
+                if len(discovered) >= target or accepted_counts[band] >= band_limit:
                     break
+                # Continue across bands instead of repeatedly favoring the
+                # first category when small quotas fill on their first query.
+                category, terms = category_cycle[category_cursor % len(category_cycle)]
+                category_cursor += 1
                 query = self._query_for_band(category, terms, band)
                 per_page = min(self.config.per_query, max(per_category * 2, 10))
                 try:
@@ -105,16 +117,17 @@ class GitHubDiscoveryEngine:
                     logger.warning(f"Discovery query failed for {category}/{band}: {exc}")
                     continue
                 for repo in repos:
-                    full_name = repo.get("full_name")
-                    if not full_name or full_name in discovered:
+                    if len(discovered) >= target or accepted_counts[band] >= band_limit:
+                        break
+                    identity = repository_identity_key(repo.get("full_name"))
+                    if not identity or identity in discovered:
                         continue
                     repo["_discovery_category"] = category
                     repo["_discovery_band"] = band
-                    discovered[full_name] = repo
-                    if len([r for r in discovered.values() if r.get("_discovery_band") == band]) >= band_limit:
-                        break
+                    discovered[identity] = repo
+                    accepted_counts[band] += 1
 
-        return list(discovered.values())[:target]
+        return list(discovered.values())
 
     @staticmethod
     def _allocations(total: int) -> dict[str, int]:
