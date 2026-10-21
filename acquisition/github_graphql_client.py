@@ -261,12 +261,12 @@ class GitHubGraphQLClient:
             raise
         return FetchedReadme()
 
-    def get_repositories_batch(self, repos: list[tuple[str, str]]) -> dict[str, dict[str, Any]]:
+    def get_repositories_batch(self, repos: list[tuple[str, str]], *, projection: str = "legacy") -> dict[str, dict[str, Any]]:
         """Fetches multiple repositories using a lean metadata-only batch query."""
         if not repos:
             return {}
 
-        query = build_batch_metadata_query(repos)
+        query = build_batch_metadata_query(repos, projection=projection)
         response = self.execute(query)
         if not response:
             return {}

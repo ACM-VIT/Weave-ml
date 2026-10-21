@@ -17,6 +17,7 @@ from .github_graphql_client import (
 from .graphql_queries import README_CANDIDATES
 from utils.readme_processor import ReadmeDocument, process_markdown
 from .identity import normalize_repository_name, repository_identity_key
+from .config import metadata_batch_size as validated_metadata_batch_size
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,17 @@ class EnrichmentResult:
 
 
 class RepositoryEnricher:
-    def __init__(self, graphql_client: GitHubGraphQLClient | None = None) -> None:
+    def __init__(
+        self,
+        graphql_client: GitHubGraphQLClient | None = None,
+        *,
+        metadata_batch_size: int | None = None,
+        metadata_projection: str = "legacy",
+    ) -> None:
+        self.metadata_batch_size = validated_metadata_batch_size(metadata_batch_size)
+        if metadata_projection not in {"legacy", "delivery"}:
+            raise ValueError("Unknown metadata projection")
+        self.metadata_projection = metadata_projection
         self.graphql_client = graphql_client or GitHubGraphQLClient()
 
     def enrich(self, repository: dict[str, Any] | str) -> EnrichmentResult | None:
@@ -61,7 +72,7 @@ class RepositoryEnricher:
         return None
 
     def get_repositories_batch(self, repositories: list[dict[str, Any] | str]) -> list[EnrichmentResult]:
-        """Fetch multiple repositories using GraphQL batching, falling back to sequential REST if needed."""
+        """Fetch bounded metadata batches, followed by individual READMEs."""
         targets = []
         repo_metadata = {}
         
@@ -82,13 +93,16 @@ class RepositoryEnricher:
         
         results = []
         # Pass 1: batch metadata (no readme — avoids 502 on large repos)
-        for i in range(0, len(targets), 10):
-            batch = targets[i:i+10]
+        for i in range(0, len(targets), self.metadata_batch_size):
+            batch = targets[i:i+self.metadata_batch_size]
             batch_res = {}
             try:
-                batch_res = self.graphql_client.get_repositories_batch(batch)
+                if self.metadata_projection == "legacy":
+                    batch_res = self.graphql_client.get_repositories_batch(batch)
+                else:
+                    batch_res = self.graphql_client.get_repositories_batch(batch, projection=self.metadata_projection)
             except Exception as e:
-                logger.warning(f"Batch {i//10 + 1} failed, retrying one-by-one: {e}")
+                logger.warning(f"Batch {i//self.metadata_batch_size + 1} failed, retrying one-by-one: {e}")
                 # Retry the batch one repo at a time
                 for owner, name in batch:
                     try:

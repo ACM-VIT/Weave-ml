@@ -17,6 +17,21 @@ def positive_int(value: object, *, name: str) -> int:
     return parsed
 
 
+def metadata_batch_size(value: object | None = None) -> int:
+    """Keep metadata aliases at the existing, conservative ten-repo ceiling.
+
+    This is an application response-size guard, not a GitHub alias limit.
+    Scheduler chunks can be larger and are split independently by the enricher.
+    """
+    parsed = positive_int(
+        os.getenv("GITHUB_METADATA_BATCH_SIZE", "10") if value is None else value,
+        name="GITHUB_METADATA_BATCH_SIZE",
+    )
+    if parsed > 10:
+        raise ValueError("GITHUB_METADATA_BATCH_SIZE must be between 1 and 10")
+    return parsed
+
+
 @dataclass(frozen=True, slots=True)
 class CorpusPipelineSettings:
     target_count: int = 50_000
