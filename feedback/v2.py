@@ -961,7 +961,7 @@ class OrderedFeedbackApplier:
             stored = self.qdrant.retrieve(
                 collection_name=self.settings.user_collection,
                 ids=[point.id],
-                with_payload=True,
+                with_payload=list(_USER_WRITE_CAS_FIELDS),
                 with_vectors=False,
             )
         except FeedbackProcessingError:
