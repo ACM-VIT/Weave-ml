@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from importlib.util import find_spec
+import json
 from types import SimpleNamespace
 import uuid
 
 import pytest
 
+from acquisition import backend_client
 from acquisition.backend_client import BackendIngestionClient, repository_upsert_record
 from trending.backend_storage import BackendTrendingStorage
 from trending_service import parse_args
@@ -169,6 +171,153 @@ def test_backend_transport_rejects_warning_result_before_publish():
     assert result.succeeded == []
     assert "owner/repo" in result.failed
     assert "incomplete" in result.failed["owner/repo"]
+    assert session.calls == []
+
+
+class _WireSession:
+    """HTTP boundary double that maps the actual received JSON records."""
+
+    def __init__(self, statuses=()):
+        self.calls = []
+        self.statuses = iter(statuses)
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        records = json.loads(kwargs["data"])["repositories"]
+        response = _Response(
+            {
+                "mappings": [
+                    {
+                        "github_id": record["github_id"],
+                        "repo_id": str(uuid.UUID(int=int(record["github_id"]))),
+                        "content_version": int(record["github_id"]),
+                    }
+                    for record in reversed(records)
+                ]
+            }
+        )
+        response.status_code = next(self.statuses, 200)
+        return response
+
+
+def _wire_client(session):
+    return BackendIngestionClient(
+        base_url="http://backend.test", internal_secret="secret", session=session
+    )
+
+
+def _wire_body(sources):
+    return json.dumps(
+        {"repositories": [repository_upsert_record(source) for source in sources]},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+@pytest.mark.parametrize("spare_bytes", [0, -1])
+def test_backend_batches_use_exact_utf8_envelope_size(monkeypatch, spare_bytes):
+    sources = [
+        _source(
+            full_name=f"owner/repo-{i}",
+            github_id=str(100 + i),
+            readme='雪😀"\n\\\x00' * 10,
+        )
+        for i in range(2)
+    ]
+    expected = _wire_body(sources)
+    limit = len(expected) + spare_bytes
+    monkeypatch.setattr(backend_client, "MAX_BODY_BYTES", limit)
+    session = _WireSession()
+
+    result = _wire_client(session).upsert_repositories_detailed(sources)
+
+    assert sorted(result.succeeded) == [source.repo_id for source in sources]
+    assert not result.failed
+    bodies = [call[1]["data"] for call in session.calls]
+    assert all(len(body) <= limit for body in bodies)
+    if spare_bytes == 0:
+        assert bodies == [expected]
+    else:
+        assert bodies == [_wire_body([source]) for source in sources]
+
+
+def test_backend_serializes_each_record_once_across_count_bounded_batches(monkeypatch):
+    sources = [
+        _source(full_name=f"owner/repo-{i}", github_id=str(1000 + i))
+        for i in range(101)
+    ]
+    dumps = json.dumps
+    encoded_values = []
+
+    def capture(value, **kwargs):
+        encoded_values.append(value)
+        return dumps(value, **kwargs)
+
+    monkeypatch.setattr(backend_client.json, "dumps", capture)
+    session = _WireSession()
+    result = _wire_client(session).upsert_repositories_detailed(sources)
+
+    assert not result.failed
+    assert sorted(result.succeeded) == sorted(source.repo_id for source in sources)
+    assert [
+        len(json.loads(call[1]["data"])["repositories"])
+        for call in session.calls
+    ] == [100, 1]
+    assert len(encoded_values) == len(sources)
+    assert [value["github_id"] for value in encoded_values] == [
+        source.payload["github_id"] for source in sources
+    ]
+    assert all(
+        mapping["content_version"] == int(github_id)
+        for github_id, mapping in result.mappings.items()
+    )
+
+
+@pytest.mark.parametrize("oversized_index", [0, 1])
+def test_backend_isolates_oversized_record_without_losing_valid_neighbors(
+    monkeypatch, oversized_index
+):
+    valid = _source(full_name="owner/valid", github_id="100", readme="small")
+    oversized = _source(full_name="owner/oversized", github_id="101", readme="x" * 4000)
+    sources = [valid]
+    sources.insert(oversized_index, oversized)
+    monkeypatch.setattr(backend_client, "MAX_BODY_BYTES", len(_wire_body([valid])))
+    session = _WireSession()
+
+    result = _wire_client(session).upsert_repositories_detailed(sources)
+
+    assert result.succeeded == ["owner/valid"]
+    assert set(result.failed) == {"owner/oversized"}
+    assert "body limit" in result.failed["owner/oversized"]
+    assert len(session.calls) == 1
+    assert json.loads(session.calls[0][1]["data"])["repositories"][0]["github_id"] == "100"
+
+
+def test_backend_retry_reuses_identical_bytes_and_request_identity(monkeypatch):
+    session = _WireSession(statuses=[503, 200])
+    monkeypatch.setattr(backend_client.time, "sleep", lambda _delay: None)
+    sources = [
+        _source(full_name=f"owner/repo-{i}", github_id=str(100 + i), readme='é"\n' * 10)
+        for i in range(2)
+    ]
+    expected = _wire_body(sources)
+
+    result = _wire_client(session).upsert_repositories_detailed(sources)
+
+    assert not result.failed
+    assert result.succeeded == ["owner/repo-1", "owner/repo-0"]
+    first, retry = [call[1] for call in session.calls]
+    assert first["data"] == retry["data"] == expected
+    assert first["data"] is retry["data"]
+    assert first["headers"]["x-request-id"] == retry["headers"]["x-request-id"]
+
+
+def test_backend_empty_delivery_does_not_publish_an_empty_batch():
+    session = _WireSession()
+    result = _wire_client(session).upsert_repositories_detailed([])
+
+    assert not result.succeeded
+    assert not result.failed
     assert session.calls == []
 
 
