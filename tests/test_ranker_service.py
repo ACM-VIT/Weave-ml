@@ -408,6 +408,101 @@ def test_synthetic_manifest_can_be_explicitly_manually_qualified(tmp_path):
     )
 
 
+
+@pytest.mark.parametrize("count", [0, 1, 150, 2000])
+def test_compact_and_diagnostic_outputs_match_scalar_baseline(loaded_ranker_service, count):
+    rng = np.random.default_rng(68)
+    candidates = [
+        {"id": str(index), "embedding": rng.normal(size=EMBEDDING_DIM),
+         "languages": ["Python"], "topics": ["Σ"],
+         "doc_quality": index / max(count, 1), "activity_score": 0.75}
+        for index in range(count)
+    ]
+    user = rng.normal(size=EMBEDDING_DIM)
+    loaded_ranker_service.model = MagicMock(wraps=loaded_ranker_service.model)
+    diagnostic = loaded_ranker_service.score_batch(user, ["Python", "ς"], candidates)
+    compact = loaded_ranker_service.score_batch_compact(user, ["Python", "ς"], candidates)
+    assert compact == [{"repo_id": result["repo_id"], "final_score": result["final_score"]}
+                       for result in diagnostic]
+    if not count:
+        assert not loaded_ranker_service.model.called
+        return
+    tensor = loaded_ranker_service.model.call_args.args[0]
+    with torch.no_grad():
+        outputs = loaded_ranker_service.model(tensor)
+    # Deliberately preserve the previous five transfers, clipping and scalar
+    # value function as an independent compatibility oracle.
+    predictions = np.column_stack([
+        np.clip(output.reshape(-1).cpu().numpy(), 0, 1) for output in outputs
+    ])
+    expected = []
+    for repo, row in zip(candidates, predictions):
+        values = dict(zip(("p_ctr", "p_save", "p_gh", "pred_dwell_fraction", "p_follow"),
+                          map(float, row)))
+        expected.append({"repo_id": repo["id"], "final_score": compute_value_score(values),
+                         "skill_match": 1.0, "predictions": values})
+    expected.sort(key=lambda result: result["final_score"], reverse=True)
+    assert diagnostic == expected  # Exact equality, including stable ordering.
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_compact_value_precision_preserves_near_ties_and_stable_order(loaded_ranker_service, dtype):
+    ctr = torch.tensor([0.5, 0.5, 0.50000006], dtype=dtype)
+    outputs = (ctr, *(torch.full((3,), 0.1, dtype=dtype) for _ in range(4)))
+    loaded_ranker_service.model = MagicMock(return_value=outputs)
+    candidates = [{"id": str(index), "embedding": np.zeros(EMBEDDING_DIM)}
+                  for index in range(3)]
+    results = loaded_ranker_service.score_batch_compact(np.zeros(EMBEDDING_DIM), [], candidates)
+    expected = [compute_value_score(dict(zip(
+        ("p_ctr", "p_save", "p_gh", "pred_dwell_fraction", "p_follow"),
+        (float(output[index]) for output in outputs),
+    ))) for index in range(3)]
+    assert [result["repo_id"] for result in results] == ["2", "0", "1"]
+    assert [result["final_score"] for result in results] == [expected[2], expected[0], expected[1]]
+
+
+@pytest.mark.parametrize("method", ["score_batch", "score_batch_compact"])
+def test_ranker_output_uses_one_transfer_in_inference_mode(loaded_ranker_service, monkeypatch, method):
+    original_cpu = torch.Tensor.cpu
+    original_model = loaded_ranker_service.model
+    transfers = []
+
+    def cpu(tensor, *args, **kwargs):
+        transfers.append(tuple(tensor.shape))
+        return original_cpu(tensor, *args, **kwargs)
+
+    def model(tensor):
+        assert torch.is_inference_mode_enabled()
+        assert not torch.is_grad_enabled()
+        return original_model(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", cpu)
+    loaded_ranker_service.model = model
+    getattr(loaded_ranker_service, method)(np.zeros(EMBEDDING_DIM), [],
+        [{"id": str(index), "embedding": np.zeros(EMBEDDING_DIM)} for index in range(3)])
+    assert transfers == [(3, 5)]
+    assert not torch.is_inference_mode_enabled()  # Context must not leak to training.
+
+
+@pytest.mark.parametrize("head", [0, 4])
+def test_compact_path_retains_nonfinite_prediction_rejection(loaded_ranker_service, head):
+    outputs = [torch.tensor(0.0) for _ in range(5)]
+    outputs[head] = torch.tensor(float("nan"))
+    loaded_ranker_service.model = MagicMock(return_value=outputs)
+    with pytest.raises(ValueError, match="non-finite predictions"):
+        loaded_ranker_service.score_batch_compact(np.zeros(EMBEDDING_DIM), [],
+            [{"id": "invalid", "embedding": np.zeros(EMBEDDING_DIM)}])
+
+
+def test_direct_ranker_training_still_supports_autograd():
+    model = MMoEHeavyRanker(INPUT_DIM).train()
+    inputs = torch.randn(2, INPUT_DIM, requires_grad=True)
+    loss = sum(output.sum() for output in model(inputs))
+    loss.backward()
+    assert inputs.grad is not None and torch.all(torch.isfinite(inputs.grad))
+    assert torch.count_nonzero(inputs.grad) > 0
+
+
 def test_score_batch_empty_candidates_returns_empty(loaded_ranker_service):
     assert loaded_ranker_service.score_batch(
         np.zeros(384, dtype=np.float32),

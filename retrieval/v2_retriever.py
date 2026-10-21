@@ -795,7 +795,12 @@ class QdrantV2Retriever:
             )
 
         try:
-            results = self.ranker.score_batch(
+            # Prefer compact serving results, retaining compatibility with
+            # older/custom rankers that expose only the diagnostic API.
+            score_batch = getattr(self.ranker, "score_batch_compact", None)
+            if not callable(score_batch):
+                score_batch = self.ranker.score_batch
+            results = score_batch(
                 user_vector,
                 self._profile_terms(user_profile),
                 ranker_candidates,

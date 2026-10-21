@@ -20,7 +20,7 @@ from inference.feature_spec import (
     INPUT_DIM,
     RANKER_MODEL_VERSION,
 )
-from inference.value_function import VALUE_WEIGHTS, compute_value_score
+from inference.value_function import VALUE_WEIGHTS
 from config import REPOSITORY_EMBEDDING_VERSION
 
 
@@ -450,6 +450,20 @@ class RankerService:
     def ready(self) -> bool:
         return self._model_loaded
 
+    def score_batch(self, user_embedding, user_skills, candidate_repos):
+        """Compatibility diagnostic API, including skill match and predictions.
+
+        Serving callers should use score_batch_compact to avoid debug objects.
+        Training continues to call MMoEHeavyRanker.forward directly, not here.
+        """
+        return self._score_batch(
+            user_embedding, user_skills, candidate_repos, diagnostics=True
+        )
+
+    def score_batch_compact(self, user_embedding, user_skills, candidate_repos):
+        """Preferred serving API: only repository ID and final score."""
+        return self._score_batch(user_embedding, user_skills, candidate_repos)
+
     def _embedding(self, value, *, field_name: str) -> np.ndarray:
         vector = np.asarray(value, dtype=np.float32)
         if vector.shape != (self.emb_dim,):
@@ -499,7 +513,7 @@ class RankerService:
             raise ValueError("Heavy ranker input contains non-finite values")
         return torch.from_numpy(X).to(self.device)
 
-    def score_batch(self, user_embedding, user_skills, candidate_repos):
+    def _score_batch(self, user_embedding, user_skills, candidate_repos, *, diagnostics=False):
         """
         Executes the MMoE network on a micro-batch (e.g. 15 or 150 repos).
         """
@@ -544,7 +558,7 @@ class RankerService:
             dense_features.append(row)
             
         dense_features = np.asarray(dense_features, dtype=np.float32)
-        unscaled_features = dense_features.copy()
+        skill_matches = dense_features[:, 9].copy() if diagnostics else None
         
         # Manually apply StandardScaler math
         dense_features = (dense_features - self.scaler_mean) / self.scaler_scale
@@ -556,44 +570,47 @@ class RankerService:
             
         X_tensor = self._input_tensor(user_vector, candidate_repos, dense_features)
 
-        # 2. Run Heavy Ranker Inference
-        with torch.no_grad():
-            p_ctr, p_save, p_gh, p_dwell, p_fol = self.model(X_tensor)
-            
-            # Ensure 1D array handling
-            if len(candidate_repos) == 1:
-                p_ctr, p_save, p_gh, p_dwell, p_fol = p_ctr.unsqueeze(0), p_save.unsqueeze(0), p_gh.unsqueeze(0), p_dwell.unsqueeze(0), p_fol.unsqueeze(0)
-                
-            p_ctr = np.clip(p_ctr.cpu().numpy(), 0.0, 1.0)
-            p_save = np.clip(p_save.cpu().numpy(), 0.0, 1.0)
-            p_gh = np.clip(p_gh.cpu().numpy(), 0.0, 1.0)
-            p_dwell = np.clip(p_dwell.cpu().numpy(), 0.0, 1.0)
-            p_fol = np.clip(p_fol.cpu().numpy(), 0.0, 1.0)
+        return self._rank_results(X_tensor, candidate_repos, skill_matches)
 
-        predictions = np.column_stack((p_ctr, p_save, p_gh, p_dwell, p_fol))
+    def _rank_results(self, X_tensor, candidate_repos, skill_matches=None):
+        """Inference-only output path; one stacked device-to-host transfer.
+
+        Float64 arithmetic follows the scalar value function's left-to-right
+        operation order, avoiding float32 rounding changes around score ties.
+        Python's stable sort retains candidate order for equal final scores.
+        """
+        with torch.inference_mode():
+            outputs = self.model(X_tensor)
+            if len(outputs) != 5 or any(
+                output.numel() != len(candidate_repos) for output in outputs
+            ):
+                raise ValueError("Heavy ranker produced invalid prediction shapes")
+            predictions = torch.stack(
+                [output.reshape(-1) for output in outputs], dim=1
+            ).cpu().numpy()
+            # Preserve legacy range and finite-check ordering (clip, then check).
+            np.clip(predictions, 0.0, 1.0, out=predictions)
         if not np.all(np.isfinite(predictions)):
             raise ValueError("Heavy ranker produced non-finite predictions")
 
-        # 3. Apply the value function and attach scores.
+        values = predictions.astype(np.float64, copy=False)
+        scores = (
+            VALUE_WEIGHTS["ctr"] * values[:, 0]
+            + VALUE_WEIGHTS["save"] * values[:, 1]
+            + VALUE_WEIGHTS["gh_open"] * values[:, 2]
+            + VALUE_WEIGHTS["dwell"] * values[:, 3]
+            + VALUE_WEIGHTS["follow"] * values[:, 4]
+        )
+        if not np.all(np.isfinite(scores)):
+            raise ValueError("Heavy ranker produced a non-finite value score")
         results = []
-        for i, repo in enumerate(candidate_repos):
-            predictions_dict = {
-                "p_ctr": float(p_ctr[i]),
-                "p_save": float(p_save[i]),
-                "p_gh": float(p_gh[i]),
-                "pred_dwell_fraction": float(p_dwell[i]),
-                "p_follow": float(p_fol[i]),
-            }
-            final_score = float(compute_value_score(predictions_dict))
-            if not np.isfinite(final_score):
-                raise ValueError("Heavy ranker produced a non-finite value score")
-            results.append({
-                "repo_id": repo['id'],
-                "final_score": final_score,
-                "skill_match": float(unscaled_features[i][9]), # For debug
-                "predictions": predictions_dict,
-            })
-            
-        # Sort descending by score
-        results = sorted(results, key=lambda x: x['final_score'], reverse=True)
-        return results
+        for index, repo in enumerate(candidate_repos):
+            result = {"repo_id": repo["id"], "final_score": float(scores[index])}
+            if skill_matches is not None:
+                result["skill_match"] = float(skill_matches[index])
+                result["predictions"] = dict(zip(
+                    ("p_ctr", "p_save", "p_gh", "pred_dwell_fraction", "p_follow"),
+                    map(float, predictions[index]),
+                ))
+            results.append(result)
+        return sorted(results, key=lambda result: result["final_score"], reverse=True)

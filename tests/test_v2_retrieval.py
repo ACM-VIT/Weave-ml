@@ -280,9 +280,15 @@ def test_v2_retrieval_applies_diversity_freshness_and_deterministic_exploration(
     assert first[0].repo_id == client.repo_ids[7]
 
 
-def test_v2_heavy_ranker_reranks_full_vector_candidates_and_reports_served_model():
+@pytest.mark.parametrize("compact", [False, True])
+def test_v2_heavy_ranker_reranks_full_vector_candidates_and_reports_served_model(compact):
     client = HeavyRankerQdrant()
     ranker = DeterministicHeavyRanker()
+    if compact:
+        ranker.score_batch_compact = ranker.score_batch
+        def diagnostic_must_not_run(*args, **kwargs):
+            raise AssertionError("V2 should prefer the compact serving API")
+        ranker.score_batch = diagnostic_must_not_run
     retriever = QdrantV2Retriever(
         client=client,
         ranker=ranker,
