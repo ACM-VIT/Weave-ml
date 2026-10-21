@@ -33,7 +33,7 @@ from api.runtime import (
 from api.metrics import record_recommendation, render_prometheus
 from config import constant_time_secret_matches, internal_api_header_name
 from embedding.qdrant_store import QdrantRepositoryStore
-from embedding.embeddings import SentenceTransformerEmbedder
+from embedding.query_cache import CachedQueryEmbedder, QueryCacheCapacityError
 from embedding.runtime import (
     EmbeddingCapacityError,
     EmbeddingDeadlineExceeded,
@@ -1085,9 +1085,20 @@ async def metrics() -> PlainTextResponse:
 
 def _search_repository_job(request: RepositorySearchRequest):
     from api.search import search_repositories
-    return search_repositories(
-        request, retriever(), SentenceTransformerEmbedder(model=shared_embedding_model())
+    search_retriever = retriever()
+    model = shared_embedding_model()
+    embedder = CachedQueryEmbedder(
+        model=model, cache=model.query_embedding_cache,
+        model_revision=model.query_embedding_revision,
+        embedding_version=search_retriever.embedding_version,
+        expected_size=search_retriever.embedding_dim,
     )
+    try:
+        return search_repositories(request, search_retriever, embedder)
+    except QueryCacheCapacityError as exc:
+        raise ServiceCapacityError("search") from exc
+    except TimeoutError as exc:
+        raise ServiceDeadlineExceeded("search") from exc
 
 
 @router.post(

@@ -156,7 +156,10 @@ def test_search_clamps_cosine_roundoff_and_rejects_invalid_scores():
 
 def test_query_embedding_does_not_construct_or_call_a_summary_provider():
     from api.v2 import _search_repository_job
-    with patch('api.v2.repository_embedding_pipeline', side_effect=AssertionError('summary runtime must not be constructed')), patch('api.v2.shared_embedding_model', return_value=object()), patch('api.v2.retriever', return_value=object()), patch('api.search.search_repositories', return_value={'items':[]}) as search:
+    from embedding.runtime import BoundedEmbeddingModel
+    model = BoundedEmbeddingModel(object(), max_concurrency=1)
+    search_retriever = SimpleNamespace(embedding_version='repo-embedding-v2', embedding_dim=REPOSITORY_EMBEDDING_DIM)
+    with patch('api.v2.repository_embedding_pipeline', side_effect=AssertionError('summary runtime must not be constructed')), patch('api.v2.shared_embedding_model', return_value=model), patch('api.v2.retriever', return_value=search_retriever), patch('api.search.search_repositories', return_value={'items':[]}) as search:
         _search_repository_job(request())
         search.assert_called_once()
 
@@ -280,3 +283,67 @@ async def _malformed_ingestion_search_scenario(adversary):
             embedding_runtime.reset_embedding_runtime_for_tests()
             service_runtime.shutdown_service_runtime()
             client.close()
+
+
+def test_search_reuses_only_embeddings_across_normalized_queries_and_filters(monkeypatch):
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from api.v2 import _search_repository_job
+    from embedding.runtime import BoundedEmbeddingModel
+
+    encoded = []
+    started, release = threading.Event(), threading.Event()
+
+    class Encoder:
+        def encode(self, texts, **kwargs):
+            encoded.extend(texts)
+            started.set()
+            assert release.wait(3)
+            return [[1.] + [0.] * (REPOSITORY_EMBEDDING_DIM - 1) for _ in texts]
+
+    model = BoundedEmbeddingModel(Encoder(), max_concurrency=1)
+    client = QdrantClient(':memory:')
+    collection = 'search_cache_filters'
+    client.create_collection(collection, vectors_config={QDRANT_VECTOR_NAME: models.VectorParams(
+        size=REPOSITORY_EMBEDDING_DIM, distance=models.Distance.COSINE,
+    )})
+    ids = [str(uuid.UUID(int=i)) for i in (1, 2)]
+    vector = [1.] + [0.] * (REPOSITORY_EMBEDDING_DIM - 1)
+    client.upsert(collection, [models.PointStruct(
+        id=id, vector={QDRANT_VECTOR_NAME: vector},
+        payload=_repository_payload(id, primary_language=language, topics=['vision']),
+    ) for id, language in zip(ids, ['Python', 'Rust'])])
+    retriever = QdrantV2Retriever(client=client, repository_collection=collection, heavy_ranker_enabled=False)
+    monkeypatch.setattr('api.v2.shared_embedding_model', lambda: model)
+    monkeypatch.setattr('api.v2.retriever', lambda: retriever)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(_search_repository_job, request(query='  Image  Understanding  ', filters={'languages': ['Python']}))
+            assert started.wait(2)
+            second = pool.submit(_search_repository_job, request(query='Image  Understanding', filters={'topics': ['vision']}, exclude_repo_ids=[ids[0]]))
+            try:
+                deadline = time.monotonic() + 2
+                while model.query_embedding_cache.snapshot()['waiters'] != 1:
+                    assert time.monotonic() < deadline
+                    time.sleep(.001)
+            finally:
+                release.set()
+            first, second = first.result(2), second.result(2)
+        excluded = _search_repository_job(request(query='Image  Understanding', exclude_repo_ids=ids))
+        assert first['items'] == [{'repo_id': ids[0], 'score': 1.}]
+        assert second['items'] == [{'repo_id': ids[1], 'score': 1.}]
+        assert excluded['items'] == []
+        assert first['search_id'] != second['search_id']
+        assert encoded == ['Image  Understanding']
+        # Preserve case and internal whitespace exactly; neither is normalized
+        # by the public request contract, so they must not collide in the cache.
+        _search_repository_job(request(query='Image Understanding'))
+        _search_repository_job(request(query='image  understanding'))
+        assert encoded == ['Image  Understanding', 'Image Understanding', 'image  understanding']
+        retriever.embedding_version = 'next-embedding-version'
+        assert _search_repository_job(request(query='Image  Understanding'))['items'] == []
+        assert len(encoded) == 4
+    finally:
+        release.set()
+        client.close()

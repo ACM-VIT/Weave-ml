@@ -14,12 +14,13 @@ import math
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
+from functools import lru_cache, wraps
 from typing import Any, Callable, TypeVar
 
 from config import EMBEDDING_MODEL_REVISION, REPOSITORY_EMBEDDING_MODEL
 from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
 from embedding.embeddings import SentenceTransformerEmbedder
+from embedding.query_cache import QueryEmbeddingCache
 from scripts.user_onboarding import UserOnboardingPipeline
 from summarization.runtime import card_summary_pipeline, shutdown_card_summary_runtime
 
@@ -131,6 +132,9 @@ class BoundedEmbeddingModel:
 
     def __init__(self, model: Any, *, max_concurrency: int) -> None:
         self._model = model
+        # Cache lifetime follows this exact loaded encoder, not a reusable ID.
+        self.query_embedding_cache = QueryEmbeddingCache()
+        self.query_embedding_revision = embedding_model_revision()
         self._slots = threading.BoundedSemaphore(max_concurrency)
 
     def encode(self, *args: Any, **kwargs: Any) -> Any:
@@ -152,7 +156,25 @@ class BoundedEmbeddingModel:
         }
 
 
-@lru_cache(maxsize=1)
+def _single_model_cache(factory):
+    # lru_cache alone may run a cold factory concurrently. Serialize the cache
+    # lookup as well as construction so first search jobs share one query cache.
+    cached = lru_cache(maxsize=1)(factory)
+    lock = threading.Lock()
+
+    @wraps(factory)
+    def resolve():
+        with lock:
+            return cached()
+
+    # Preserve the existing runtime status/reset and introspection contract.
+    resolve.cache_info = cached.cache_info
+    resolve.cache_clear = cached.cache_clear
+    resolve.cache_parameters = cached.cache_parameters
+    return resolve
+
+
+@_single_model_cache
 def shared_embedding_model() -> BoundedEmbeddingModel:
     concurrency = _positive_int("EMBEDDING_MAX_CONCURRENCY", 1, maximum=8)
     return BoundedEmbeddingModel(
