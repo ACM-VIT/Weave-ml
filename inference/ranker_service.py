@@ -440,6 +440,13 @@ class RankerService:
         Device transfer is blocking by default and owns its destination storage.
         No request buffer is stored or reused on this service.
         """
+        dense_features = np.asarray(dense_features, dtype=np.float32)
+        expected_dense_shape = (len(candidate_repos), FEATURE_COUNT)
+        if dense_features.shape != expected_dense_shape:
+            raise ValueError(
+                f"dense_features must have shape {expected_dense_shape}; "
+                f"got shape {dense_features.shape}"
+            )
         X = np.empty((len(candidate_repos), self.input_dim), dtype=np.float32)
         X[:, :self.emb_dim] = user_vector
         for index, repo in enumerate(candidate_repos):
@@ -448,11 +455,6 @@ class RankerService:
                 field_name=f"candidate {repo.get('id', '<unknown>')} embedding",
             )
         X[:, 2 * self.emb_dim:] = dense_features
-        if X.shape != (len(candidate_repos), self.input_dim):
-            raise ValueError(
-                f"Heavy ranker input has shape {X.shape}; expected "
-                f"({len(candidate_repos)}, {self.input_dim})"
-            )
         if not np.all(np.isfinite(X)):
             raise ValueError("Heavy ranker input contains non-finite values")
         return torch.from_numpy(X).to(self.device)
