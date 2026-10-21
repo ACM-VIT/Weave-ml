@@ -13,7 +13,13 @@ from inference.feature_spec import (
     FEATURE_SPEC_VERSION,
     INPUT_DIM,
 )
-from inference.ranker_service import MMoEHeavyRanker, RankerService
+from inference.ranker_service import (
+    MMoEHeavyRanker,
+    RankerService,
+    _cached_repository_keywords,
+    _repository_keywords,
+    calculate_match_score,
+)
 from inference.value_function import VALUE_WEIGHTS
 
 
@@ -430,3 +436,83 @@ def test_score_batch_rejects_non_finite_model_output(loaded_ranker_service):
             [],
             [{"id": "repo-1", "embedding": np.zeros(384, dtype=np.float32)}],
         )
+
+
+@pytest.mark.parametrize(
+    "skills,languages,topics,tags,expected",
+    [
+        ([" Python ", "RUST", "python"], [" python"], [" Rust "], [], 1.0),
+        (["STRASSE", "Σ", "missing"], ["Straße"], ["ς"], None, 2 / 3),
+        (["İ", "i"], ["i\u0307"], [], [], 0.5),
+        ([None, "", "   "], ["Python"], None, None, 0.0),
+        (None, None, None, None, 0.0),
+        (" Python ", "PYTHON", None, None, 1.0),
+        ([False, 7], False, [7, None], {}, 1.0),
+        (["py"], ["python"], None, None, 0.0),
+    ],
+)
+def test_keyword_features_preserve_golden_scores(
+    loaded_ranker_service, skills, languages, topics, tags, expected
+):
+    # Public helper and the actual batch feature must retain exact match rules,
+    # including Unicode casefolding, deduplication and missing/default values.
+    assert calculate_match_score(skills, languages, topics, tags) == expected
+    result = loaded_ranker_service.score_batch(
+        np.zeros(EMBEDDING_DIM), skills,
+        [{"id": "golden", "embedding": np.zeros(EMBEDDING_DIM),
+          "languages": languages, "topics": topics, "tags": tags}],
+    )
+    assert result[0]["skill_match"] == pytest.approx(expected)
+
+
+def test_keyword_cache_invalidates_mutable_repository_content(loaded_ranker_service):
+    candidate = {"id": "same-id", "embedding": np.zeros(EMBEDDING_DIM),
+                 "languages": ["Python"], "topics": [], "tags": []}
+    _cached_repository_keywords.cache_clear()
+    for field, value, expected in [
+        (None, None, 1 / 3),
+        ("languages", "RUST", 1 / 3),
+        ("topics", "Python", 2 / 3),
+        ("tags", "SQL", 1.0),
+    ]:
+        if field == "languages":
+            candidate[field][:] = [value]
+        elif field:
+            candidate[field].append(value)
+        scores = loaded_ranker_service.score_batch(
+            np.zeros(EMBEDDING_DIM), ["Python", "Rust", "SQL"], [candidate]
+        )
+        assert scores[0]["skill_match"] == pytest.approx(expected)
+    assert _cached_repository_keywords.cache_info().misses == 4
+    _repository_keywords(candidate["languages"], candidate["topics"], candidate["tags"])
+    assert _cached_repository_keywords.cache_info().hits == 1
+
+
+def test_keyword_cache_is_bounded_and_results_are_immutable():
+    _cached_repository_keywords.cache_clear()
+    for index in range(4100):
+        result = _repository_keywords([f"language-{index}"], None, None)
+    assert isinstance(result, frozenset)
+    assert _cached_repository_keywords.cache_info().currsize == 4096
+    _cached_repository_keywords.cache_clear()
+
+
+def test_score_batch_normalizes_single_use_user_keywords_once(loaded_ranker_service):
+    candidates = [
+        {"id": str(index), "embedding": np.zeros(EMBEDDING_DIM),
+         "languages": ["Python"]}
+        for index in range(3)
+    ]
+    scores = loaded_ranker_service.score_batch(
+        np.zeros(EMBEDDING_DIM), iter([" Python "]), candidates
+    )
+    assert [score["skill_match"] for score in scores] == [1.0, 1.0, 1.0]
+
+
+@pytest.mark.parametrize("topics", [["Σ" * 1025], [f"topic-{i}" for i in range(65)]])
+def test_oversized_keyword_metadata_preserves_scores_without_cache_retention(topics):
+    _cached_repository_keywords.cache_clear()
+    expected = {topic.casefold() for topic in topics}
+    assert _repository_keywords(None, topics, None) == expected
+    assert calculate_match_score(topics, None, topics, None) == 1.0
+    assert _cached_repository_keywords.cache_info().currsize == 0
