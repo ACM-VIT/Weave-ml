@@ -90,6 +90,88 @@ def loaded_ranker_service(tmp_path):
         )
 
 
+
+@pytest.mark.parametrize("count", [1, 150, 2000])
+def test_contiguous_ranker_input_matches_reference_for_pool_sizes(
+    loaded_ranker_service, count
+):
+    user = np.arange(EMBEDDING_DIM * 2, dtype=np.float32)[::2] / 1000
+    vectors = [np.roll(user, i)[::-1] for i in range(count)]
+    for vector in vectors:
+        vector.setflags(write=False)
+    candidates = [{"id": str(i), "embedding": vector}
+                  for i, vector in enumerate(vectors)]
+    loaded_ranker_service.model = MagicMock(wraps=loaded_ranker_service.model)
+    scores = loaded_ranker_service.score_batch(user, [], candidates)
+    tensor = loaded_ranker_service.model.call_args.args[0]
+    # Legacy tile/vstack/hstack assembly is the parity reference, including the
+    # existing scaler/clipping and all ten default feature values.
+    defaults = np.array([0.5, 0.5, 1000, 0, 0, 0, 365, 0, 0, 0], np.float32)
+    dense = np.clip((defaults - loaded_ranker_service.scaler_mean)
+                    / loaded_ranker_service.scaler_scale, -8, 8)
+    expected = np.hstack((np.tile(user, (count, 1)), np.vstack(vectors),
+                          np.tile(dense, (count, 1))))
+    np.testing.assert_array_equal(tensor.cpu().numpy(), expected)
+    assert tensor.is_contiguous() and tensor.dtype == torch.float32
+    assert len(scores) == count
+
+
+@pytest.mark.parametrize("field", ["user", "repo"])
+@pytest.mark.parametrize("bad", [np.zeros(383), np.zeros((1, 384)),
+                                 np.full(384, np.nan), np.full(384, np.inf)])
+def test_ranker_input_rejects_malformed_external_vectors(
+    loaded_ranker_service, field, bad
+):
+    user = bad if field == "user" else np.zeros(EMBEDDING_DIM)
+    repo = bad if field == "repo" else np.zeros(EMBEDDING_DIM)
+    with pytest.raises(ValueError, match="exactly 384|only finite"):
+        loaded_ranker_service.score_batch(user, [], [{"id": "bad", "embedding": repo}])
+
+
+def test_ranker_input_does_not_alias_caller_arrays_or_later_requests(loaded_ranker_service):
+    user = np.zeros(EMBEDDING_DIM, np.float32)
+    repo = np.ones(EMBEDDING_DIM, np.float32)
+    loaded_ranker_service.model = MagicMock(wraps=loaded_ranker_service.model)
+    loaded_ranker_service.score_batch(user, [], [{"id": "one", "embedding": repo}])
+    first = loaded_ranker_service.model.call_args.args[0]
+    user[:] = 0.25
+    repo[:] = 0.5
+    assert torch.all(first[0, :EMBEDDING_DIM] == 0)
+    assert torch.all(first[0, EMBEDDING_DIM:2 * EMBEDDING_DIM] == 1)
+    first[0, 0] = 9
+    assert user[0] == 0.25
+    loaded_ranker_service.score_batch(user, [], [{"id": "two", "embedding": repo}])
+    second = loaded_ranker_service.model.call_args.args[0]
+    assert not np.shares_memory(first.numpy(), second.numpy())
+    assert second[0, 0] == 0.25 and second[0, EMBEDDING_DIM] == 0.5
+
+
+def test_concurrent_ranker_requests_keep_independent_buffers(loaded_ranker_service):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    barrier = Barrier(2)
+    inputs = []
+
+    def model(tensor):
+        inputs.append(tensor)
+        barrier.wait(timeout=10)
+        return tensor[:, 0].squeeze(), *(torch.zeros(len(tensor)).squeeze() for _ in range(4))
+
+    loaded_ranker_service.model = model
+
+    def score(value):
+        return loaded_ranker_service.score_batch(
+            np.full(EMBEDDING_DIM, value), [],
+            [{"id": str(value), "embedding": np.full(EMBEDDING_DIM, value)}],
+        )[0]["final_score"]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        scores = list(executor.map(score, [0.25, 0.75]))
+    assert scores == [0.25, 0.75]
+    assert not np.shares_memory(inputs[0].numpy(), inputs[1].numpy())
+
+
 def test_ranker_service_rejects_scaler_with_wrong_feature_count(tmp_path):
     scaler_path = tmp_path / "feature_scaler.json"
     _write_scaler(scaler_path, feature_count=FEATURE_COUNT - 1)

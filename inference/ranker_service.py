@@ -431,6 +431,32 @@ class RankerService:
             return default
         return number if np.isfinite(number) else default
 
+    def _input_tensor(self, user_vector, candidate_repos, dense_features):
+        """Build a request-owned C-contiguous float32 inference buffer.
+
+        Assignment copies external vectors (including strided/read-only arrays)
+        into this one buffer. CPU from_numpy shares only this private buffer,
+        retained by the tensor for its full lifetime; no caller array is aliased.
+        Device transfer is blocking by default and owns its destination storage.
+        No request buffer is stored or reused on this service.
+        """
+        X = np.empty((len(candidate_repos), self.input_dim), dtype=np.float32)
+        X[:, :self.emb_dim] = user_vector
+        for index, repo in enumerate(candidate_repos):
+            X[index, self.emb_dim:2 * self.emb_dim] = self._embedding(
+                repo.get("embedding"),
+                field_name=f"candidate {repo.get('id', '<unknown>')} embedding",
+            )
+        X[:, 2 * self.emb_dim:] = dense_features
+        if X.shape != (len(candidate_repos), self.input_dim):
+            raise ValueError(
+                f"Heavy ranker input has shape {X.shape}; expected "
+                f"({len(candidate_repos)}, {self.input_dim})"
+            )
+        if not np.all(np.isfinite(X)):
+            raise ValueError("Heavy ranker input contains non-finite values")
+        return torch.from_numpy(X).to(self.device)
+
     def score_batch(self, user_embedding, user_skills, candidate_repos):
         """
         Executes the MMoE network on a micro-batch (e.g. 15 or 150 repos).
@@ -444,17 +470,6 @@ class RankerService:
 
         # 1. Prepare inputs
         user_vector = self._embedding(user_embedding, field_name="user_embedding")
-        user_embs = np.tile(user_vector, (len(candidate_repos), 1))
-        repo_embs = np.vstack(
-            [
-                self._embedding(
-                    repo.get("embedding"),
-                    field_name=f"candidate {repo.get('id', '<unknown>')} embedding",
-                )
-                for repo in candidate_repos
-            ]
-        )
-        
         dense_features = []
         for repo in candidate_repos:
             # Dynamically calculate the cross-feature!
@@ -488,17 +503,8 @@ class RankerService:
             STANDARDIZED_FEATURE_CLIP,
         )
             
-        # Concatenate into massive input tensor
-        X = np.hstack((user_embs, repo_embs, dense_features))
-        if X.shape != (len(candidate_repos), self.input_dim):
-            raise ValueError(
-                f"Heavy ranker input has shape {X.shape}; expected "
-                f"({len(candidate_repos)}, {self.input_dim})"
-            )
-        if not np.all(np.isfinite(X)):
-            raise ValueError("Heavy ranker input contains non-finite values")
-        X_tensor = torch.tensor(X, dtype=torch.float32).to(self.device)
-        
+        X_tensor = self._input_tensor(user_vector, candidate_repos, dense_features)
+
         # 2. Run Heavy Ranker Inference
         with torch.no_grad():
             p_ctr, p_save, p_gh, p_dwell, p_fol = self.model(X_tensor)
