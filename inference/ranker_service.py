@@ -5,6 +5,7 @@ import math
 import os
 from collections.abc import Iterable
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,8 @@ from config import REPOSITORY_EMBEDDING_VERSION
 logger = logging.getLogger("pipeline.ranker")
 STANDARDIZED_FEATURE_CLIP = 8.0
 _SHA256_HEX_LENGTH = 64
+_KEYWORD_CACHE_MAX_ELEMENTS = 64
+_KEYWORD_CACHE_MAX_CHARACTERS = 1024
 
 class MMoEHeavyRanker(nn.Module):
     def __init__(self, input_dim, num_experts=4):
@@ -89,16 +92,53 @@ def _keywords(values: object) -> set[str]:
     }
 
 
+def _keyword_content(values: object) -> tuple[str, ...]:
+    """Snapshot content, not identity, so mutable metadata cannot stale the cache."""
+    if values is None:
+        return ()
+    if isinstance(values, str):
+        return (str(values),)
+    if not isinstance(values, Iterable):
+        values = [values]
+    return tuple(str(value) for value in values if value is not None)
+
+
+@lru_cache(maxsize=4096)
+def _cached_repository_keywords(
+    languages: tuple[str, ...], topics: tuple[str, ...], tags: tuple[str, ...]
+) -> frozenset[str]:
+    # Immutable results are safe to share across ranking requests. The bounded,
+    # content-keyed cache invalidates for any language/topic/tag content change.
+    return frozenset(_keywords(languages) | _keywords(topics) | _keywords(tags))
+
+
+def _repository_keywords(languages, topics, tags) -> frozenset[str]:
+    content = (
+        _keyword_content(languages), _keyword_content(topics), _keyword_content(tags)
+    )
+    # Entry count alone cannot bound retained metadata. Bypass reuse for large
+    # values without truncating them or changing their matching semantics.
+    if (
+        sum(map(len, content)) > _KEYWORD_CACHE_MAX_ELEMENTS
+        or sum(len(value) for values in content for value in values)
+        > _KEYWORD_CACHE_MAX_CHARACTERS
+    ):
+        return _cached_repository_keywords.__wrapped__(*content)
+    return _cached_repository_keywords(*content)
+
+
+def _keyword_match_score(user_keywords, repo_keywords):
+    return len(user_keywords & repo_keywords) / len(user_keywords)
+
+
 def calculate_match_score(user_interests_skills, repo_languages, repo_topics, repo_tags):
     """Calculates the percentage of overlapping keywords dynamically."""
     user_keywords = _keywords(user_interests_skills)
     if not user_keywords:
         return 0.0
-
-    repo_keywords = (
-        _keywords(repo_languages) | _keywords(repo_topics) | _keywords(repo_tags)
+    return _keyword_match_score(
+        user_keywords, _repository_keywords(repo_languages, repo_topics, repo_tags)
     )
-    return len(user_keywords & repo_keywords) / len(user_keywords)
 
 class RankerService:
     def __init__(
@@ -455,10 +495,19 @@ class RankerService:
             ]
         )
         
+        user_keywords = _keywords(user_skills)
         dense_features = []
         for repo in candidate_repos:
             # Dynamically calculate the cross-feature!
-            skill_match = calculate_match_score(user_skills, repo.get('languages', []), repo.get('topics', []), repo.get('tags', []))
+            skill_match = (
+                _keyword_match_score(
+                    user_keywords,
+                    _repository_keywords(
+                        repo.get('languages'), repo.get('topics'), repo.get('tags')
+                    ),
+                )
+                if user_keywords else 0.0
+            )
             
             # The EXACT 10 features generated in DataGen:
             # batch_doc, batch_health, batch_readme, batch_stars, batch_forks, batch_issues, batch_pushed, batch_activity, batch_trend, skill_match_score
