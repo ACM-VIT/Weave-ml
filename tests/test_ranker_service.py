@@ -14,7 +14,7 @@ from inference.feature_spec import (
     INPUT_DIM,
 )
 from inference.ranker_service import MMoEHeavyRanker, RankerService
-from inference.value_function import VALUE_WEIGHTS
+from inference.value_function import VALUE_WEIGHTS, compute_value_score
 
 
 def _write_scaler(path, feature_count=FEATURE_COUNT):
@@ -113,7 +113,23 @@ def test_contiguous_ranker_input_matches_reference_for_pool_sizes(
                           np.tile(dense, (count, 1))))
     np.testing.assert_array_equal(tensor.cpu().numpy(), expected)
     assert tensor.is_contiguous() and tensor.dtype == torch.float32
-    assert len(scores) == count
+    with torch.no_grad():
+        outputs = loaded_ranker_service.model(torch.from_numpy(expected))
+    predictions = np.clip(np.column_stack([
+        output.reshape(-1).cpu().numpy() for output in outputs
+    ]), 0, 1)
+    expected_scores = [
+        {"repo_id": str(index), "final_score": compute_value_score(dict(zip(
+            ["p_ctr", "p_save", "p_gh", "pred_dwell_fraction", "p_follow"],
+            map(float, row),
+        )))}
+        for index, row in enumerate(predictions)
+    ]
+    expected_scores.sort(key=lambda result: result["final_score"], reverse=True)
+    assert [score["repo_id"] for score in scores] == [score["repo_id"] for score in expected_scores]
+    np.testing.assert_allclose([score["final_score"] for score in scores],
+                               [score["final_score"] for score in expected_scores],
+                               rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("field", ["user", "repo"])
