@@ -1,13 +1,16 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
+from qdrant_client import QdrantClient, models
 
 from config import (
     EMBEDDING_MODEL_REVISION,
     QDRANT_DISTANCE,
     QDRANT_PAYLOAD_INDEX_SCHEMA,
+    QDRANT_VECTOR_NAME,
     REPOSITORY_EMBEDDING_DIM,
     REPOSITORY_EMBEDDING_MODEL,
     REPOSITORY_EMBEDDING_VERSION,
@@ -220,6 +223,193 @@ class DeterministicHeavyRanker:
                 "final_score": 0.1,
             },
         ]
+
+
+@pytest.fixture
+def local_recommendation_corpus():
+    # Exercise real Qdrant filtering and limit ordering, without network access.
+    client = QdrantClient(":memory:")
+    repository_collection = "exclusion_repositories"
+    user_collection = "exclusion_users"
+    client.create_collection(
+        repository_collection,
+        vectors_config={
+            QDRANT_VECTOR_NAME: models.VectorParams(
+                size=REPOSITORY_EMBEDDING_DIM, distance=models.Distance.COSINE
+            )
+        },
+    )
+    client.create_collection(
+        user_collection,
+        vectors_config=models.VectorParams(
+            size=REPOSITORY_EMBEDDING_DIM, distance=models.Distance.COSINE
+        ),
+    )
+    user_id = str(uuid.UUID(int=10_000))
+    repo_ids = [str(uuid.UUID(int=index + 1)) for index in range(600)]
+    now = datetime(2026, 10, 21, tzinfo=timezone.utc)
+    points = []
+    for index, repo_id in enumerate(repo_ids):
+        vector = list(VECTOR)
+        vector[1] = index / len(repo_ids)
+        points.append(models.PointStruct(
+            id=repo_id,
+            vector={QDRANT_VECTOR_NAME: vector},
+            payload=_repository_payload(
+                repo_id,
+                stars=600 - index,
+                trend_velocity=float(600 - index),
+                activity_score=(600 - index) / 600,
+                pushed_at=(now - timedelta(days=index)).isoformat(),
+                primary_language=f"language-{index % 12}",
+            ),
+        ))
+    client.upsert(repository_collection, points=points)
+    client.upsert(user_collection, points=[models.PointStruct(
+        id=user_id, vector=VECTOR, payload=_user_payload()
+    )])
+    # Record real calls, not a fake implementation of Qdrant's filters.
+    for method in ("retrieve", "query_points", "scroll"):
+        setattr(client, method, Mock(wraps=getattr(client, method)))
+    yield SimpleNamespace(
+        client=client,
+        user_id=user_id,
+        repo_ids=repo_ids,
+        repository_collection=repository_collection,
+        user_collection=user_collection,
+    )
+    client.close()
+
+
+def _corpus_retriever(corpus, *, heavy):
+    ranker = DeterministicHeavyRanker()
+
+    def score_all(user_vector, user_skills, candidates):
+        ranker.calls.append((user_vector, user_skills, candidates))
+        return [
+            {"repo_id": candidate["id"], "final_score": 1 - index / 1_000}
+            for index, candidate in enumerate(candidates)
+        ]
+
+    ranker.score_batch = score_all
+    return QdrantV2Retriever(
+        client=corpus.client,
+        repository_collection=corpus.repository_collection,
+        user_collection=corpus.user_collection,
+        ranker=ranker if heavy else None,
+        heavy_ranker_enabled=heavy,
+        heavy_ranker_required=heavy,
+    )
+
+
+@pytest.mark.parametrize("heavy", [False, True], ids=["hybrid", "required-heavy"])
+@pytest.mark.parametrize("excluded_count", [150, 500])
+def test_history_exclusions_do_not_exhaust_a_bounded_candidate_pool(
+    local_recommendation_corpus, heavy, excluded_count
+):
+    corpus = local_recommendation_corpus
+    retriever = _corpus_retriever(corpus, heavy=heavy)
+    excluded = corpus.repo_ids[:excluded_count]
+
+    batch = retriever.recommend_batch(corpus.user_id, 45, excluded, "history-pool")
+
+    returned_ids = [item.repo_id for item in batch.items]
+    assert len(returned_ids) == len(set(returned_ids)) == 45
+    assert set(returned_ids) <= set(corpus.repo_ids[excluded_count:])
+    assert batch.ranker_applied is heavy
+    assert len(corpus.client.retrieve.call_args_list) == 1
+    assert len(corpus.client.query_points.call_args_list) == 1
+    assert len(corpus.client.scroll.call_args_list) == 4
+    assert corpus.client.query_points.call_args.kwargs["limit"] == 150
+    assert all(call.kwargs["limit"] == 75 for call in corpus.client.scroll.call_args_list)
+    if heavy:
+        candidates = retriever.ranker.calls[0][2]
+        assert 45 <= len(candidates) <= 150
+        assert not {candidate["id"] for candidate in candidates} & set(excluded)
+
+
+def test_discovery_only_applies_history_exclusions_before_channel_limits(
+    local_recommendation_corpus,
+):
+    corpus = local_recommendation_corpus
+    corpus.client.delete(
+        corpus.user_collection,
+        points_selector=models.PointIdsList(points=[corpus.user_id]),
+    )
+    retriever = _corpus_retriever(corpus, heavy=False)
+
+    batch = retriever.recommend_batch(
+        corpus.user_id, 45, corpus.repo_ids[:500], "history-discovery", cold_start=True
+    )
+
+    assert len(batch.items) == 45
+    assert {item.repo_id for item in batch.items} <= set(corpus.repo_ids[500:])
+    assert batch.retrieval_mode == "cold_start_discovery"
+    corpus.client.query_points.assert_not_called()
+    assert len(corpus.client.scroll.call_args_list) == 4
+
+
+@pytest.mark.parametrize("heavy", [False, True], ids=["hybrid", "required-heavy"])
+def test_history_exclusion_api_preserves_backend_generation_contract(
+    local_recommendation_corpus, monkeypatch, heavy,
+):
+    from fastapi.testclient import TestClient
+    from api import main as api_main
+
+    monkeypatch.setenv("INTERNAL_API_SECRET", "history-contract-secret")
+    corpus = local_recommendation_corpus
+    retriever = _corpus_retriever(corpus, heavy=heavy)
+    payload = {
+        "schema_version": 2,
+        "generation_id": str(uuid.UUID(int=20_000)),
+        "user_id": corpus.user_id,
+        "feed_version": 7,
+        "limit": 45,
+        "exclude_repo_ids": corpus.repo_ids[:500],
+        "context": {"cold_start": False},
+    }
+    with patch("api.v2.retriever", return_value=retriever):
+        response = TestClient(api_main.app).post(
+            "/api/v2/recommendations/generate",
+            headers={"x-internal-secret": "history-contract-secret"},
+            json=payload,
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert {key: body[key] for key in (
+        "schema_version", "generation_id", "user_id", "feed_version"
+    )} == {key: payload[key] for key in (
+        "schema_version", "generation_id", "user_id", "feed_version"
+    )}
+    assert len(body["items"]) == 45
+    assert {item["repo_id"] for item in body["items"]} <= set(corpus.repo_ids[500:])
+    assert body["served_ranker"] == ("heavy" if heavy else "hybrid")
+
+
+def test_exclusion_filter_keeps_defensive_validation_and_deduplication(
+    local_recommendation_corpus,
+):
+    corpus = local_recommendation_corpus
+    retriever = _corpus_retriever(corpus, heavy=True)
+    fixture = HeavyRankerQdrant()
+    excluded, valid, alias, invalid_features, invalid_vector, unstamped = corpus.repo_ids[:6]
+    points = [fixture._point(repo_id, score=0.9) for repo_id in (
+        excluded, valid, valid, alias, invalid_features, invalid_vector, unstamped
+    )]
+    points[3].payload["repo_id"] = corpus.repo_ids[6]
+    points[4].payload["doc_quality"] = float("nan")
+    points[5].vector = {QDRANT_VECTOR_NAME: [float("nan")] * REPOSITORY_EMBEDDING_DIM}
+    points[6].payload.pop(REPOSITORY_SERVING_ELIGIBILITY_FIELD)
+    # An untrusted/broken client may ignore filters or repeat points. Keep the
+    # existing in-process exclusion, canonical-ID, feature and vector checks.
+    corpus.client.query_points.side_effect = lambda **kwargs: SimpleNamespace(points=points)
+    corpus.client.scroll.side_effect = lambda **kwargs: (points, None)
+
+    batch = retriever.recommend_batch(corpus.user_id, 45, [excluded, excluded])
+
+    assert [item.repo_id for item in batch.items] == [valid]
+    assert [candidate["id"] for candidate in retriever.ranker.calls[0][2]] == [valid]
 
 
 def test_qdrant_only_retrieval_deduplicates_and_rejects_legacy_identity():
