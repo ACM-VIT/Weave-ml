@@ -28,8 +28,12 @@ def test_canonical_application_exposes_only_v2_api_paths():
     assert all(path.startswith("/api/v2/") for path in paths)
 
 
-def test_recommendation_contract_rejects_duplicate_exclusions():
-    item = uuid.uuid4()
+@pytest.mark.parametrize("exclusions", [
+    [str(uuid.UUID(int=1))] * 2,
+    [str(uuid.UUID(int=index + 1)) for index in range(501)],
+    ["owner/repository"],
+], ids=["duplicate", "over-500", "invalid-id"])
+def test_recommendation_contract_rejects_invalid_exclusions(exclusions):
     with pytest.raises(ValidationError):
         RecommendationRequest(
             schema_version=2,
@@ -37,7 +41,7 @@ def test_recommendation_contract_rejects_duplicate_exclusions():
             user_id=uuid.uuid4(),
             feed_version=1,
             limit=45,
-            exclude_repo_ids=[item, item],
+            exclude_repo_ids=exclusions,
             context={"cold_start": False},
         )
 
