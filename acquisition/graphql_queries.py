@@ -24,24 +24,18 @@ README_CANDIDATES = (
 
 # Discovers repositories via GraphQL search — no REST needed
 SEARCH_REPOSITORIES_QUERY = """
-query SearchRepositories($query: String!, $after: String) {
-  search(query: $query, type: REPOSITORY, first: 25, after: $after) {
-    repositoryCount
+query SearchRepositories($query: String!, $first: Int!, $after: String) {
+  search(query: $query, type: REPOSITORY, first: $first, after: $after) {
     pageInfo {
       hasNextPage
       endCursor
     }
     nodes {
       ... on Repository {
-        id
-        databaseId
         nameWithOwner
         name
         owner {
           login
-          __typename
-          ... on User { databaseId }
-          ... on Organization { databaseId }
         }
         stargazerCount
         description
@@ -58,10 +52,17 @@ query SearchRepositories($query: String!, $after: String) {
 """
 
 
-def build_batch_metadata_query(repos: list[tuple[str, str]]) -> str:
+def build_batch_metadata_query(repos: list[tuple[str, str]], *, projection: str = "legacy") -> str:
     """Ultra-lean batch query — metadata + topics + languages only.
     NO readme fields: readme text can be 30KB+ per repo and causes 502 in batches.
     READMEs are fetched separately via individual queries."""
+    if not 1 <= len(repos) <= 10:
+        raise ValueError("Metadata queries must contain between 1 and 10 repositories")
+    if projection not in {"legacy", "delivery"}:
+        raise ValueError("Unknown metadata projection")
+    # Local SQL persistence consumes pullRequests; raw legacy callers retain
+    # homepageUrl too. Neither field is sent by repository_upsert_record.
+    legacy_fields = "homepageUrl\n    pullRequests(states: OPEN) { totalCount }" if projection == "legacy" else ""
     parts = ["query GetBatchMetadata {"]
     for i, (owner, name) in enumerate(repos):
         alias = f"repo_{i}"
@@ -75,7 +76,7 @@ def build_batch_metadata_query(repos: list[tuple[str, str]]) -> str:
     name
     description
     url
-    homepageUrl
+    {legacy_fields}
     createdAt
     updatedAt
     pushedAt
@@ -89,7 +90,6 @@ def build_batch_metadata_query(repos: list[tuple[str, str]]) -> str:
     }}
     watchers {{ totalCount }}
     issues(states: OPEN) {{ totalCount }}
-    pullRequests(states: OPEN) {{ totalCount }}
     repositoryTopics(first: 20) {{
       nodes {{ topic {{ name }} }}
     }}
