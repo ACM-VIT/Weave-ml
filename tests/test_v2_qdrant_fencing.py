@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import uuid
 
+import pytest
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
@@ -21,7 +23,11 @@ from embedding.vector_contract import (
     repository_point_id,
     user_point_id,
 )
-from feedback.v2 import OrderedFeedbackApplier, PENDING_REJECTION_KEY
+from feedback.v2 import (
+    FeedbackWriteConflict,
+    OrderedFeedbackApplier,
+    PENDING_REJECTION_KEY,
+)
 from feedback.v2_settings import V2FeedbackSettings
 
 
@@ -352,3 +358,100 @@ def test_stale_onboarding_holder_cannot_overwrite_newer_profile() -> None:
     assert final.payload["profile_version"] == 3
     assert final.payload["job_id"] == newest_job
     assert final.vector == _vector(1)
+
+
+_USER_CAS_FIELDS = (
+    "profile_version",
+    "job_id",
+    "last_feedback_version",
+    "last_feedback_event_id",
+    FEEDBACK_STATE_REVISION_FIELD,
+)
+
+
+def _user_writer(client, store, writer):
+    if writer == "onboarding":
+        return store.retrieve_user, lambda snapshot, payload: store.compare_and_set_user(
+            USER_ID, _vector(1), payload=payload, expected_point=snapshot
+        )
+    applier = OrderedFeedbackApplier(
+        client,
+        replace(
+            V2FeedbackSettings.from_env(),
+            vector_dimension=VECTOR_SIZE,
+            user_collection=USER_PROFILE_COLLECTION_CONTRACT.collection_name,
+        ),
+    )
+
+    def write(snapshot, payload):
+        try:
+            applier._upsert(
+                models.PointStruct(id=snapshot.id, vector=_vector(1), payload=payload),
+                expected_payload=snapshot.payload,
+            )
+        except FeedbackWriteConflict:
+            return False
+        return True
+
+    return applier._user, write
+
+
+@pytest.mark.parametrize("writer", ["onboarding", "feedback"])
+@pytest.mark.parametrize("cursor", ["absent", None, 0])
+def test_user_verification_projects_only_cas_fields(monkeypatch, writer, cursor):
+    client, store = _user_store()
+    payload = {
+        "profile_version": 1,
+        "job_id": _job(),
+        "feedback_rejections": [{"reason": "large-ledger-" * 50}] * 2000,
+    }
+    if cursor != "absent":
+        payload.update(last_feedback_version=cursor, feedback_state_revision=cursor)
+        payload["last_feedback_event_id"] = None
+    store.upsert_user(USER_ID, _vector(), payload=payload)
+    read, write = _user_writer(client, store, writer)
+    retrieve = client.retrieve
+    readbacks = []
+
+    def capture(**kwargs):
+        records = retrieve(**kwargs)
+        readbacks.append((kwargs, records))
+        return records
+
+    monkeypatch.setattr(client, "retrieve", capture)
+    snapshot = read(USER_ID)
+    desired = dict(snapshot.payload)
+    assert write(snapshot, desired)
+
+    initial, verification = readbacks
+    assert initial[0]["with_payload"] is True
+    assert initial[0]["with_vectors"] is True
+    assert "feedback_rejections" in initial[1][0].payload
+    assert isinstance(verification[0]["with_payload"], list)
+    assert set(verification[0]["with_payload"]) == set(_USER_CAS_FIELDS)
+    assert verification[0]["with_vectors"] is False
+    assert set(verification[1][0].payload) <= set(_USER_CAS_FIELDS)
+    assert len(json.dumps(verification[1][0].payload)) < 500
+    assert len(json.dumps(initial[1][0].payload)) > 1_000_000
+
+
+@pytest.mark.parametrize("writer", ["onboarding", "feedback"])
+@pytest.mark.parametrize("field", _USER_CAS_FIELDS)
+def test_projected_user_verification_preserves_conflicts_and_retry(writer, field):
+    client, store = _user_store()
+    payload = _user_payload(1, _job())
+    store.upsert_user(USER_ID, _vector(), payload=payload)
+    read, write = _user_writer(client, store, writer)
+    stale = read(USER_ID)
+    competing_value = _job() if field in {"job_id", "last_feedback_event_id"} else 2
+    client.set_payload(
+        USER_PROFILE_COLLECTION_CONTRACT.collection_name,
+        {field: competing_value},
+        points=[stale.id],
+        wait=True,
+    )
+
+    assert not write(stale, dict(stale.payload))
+    fresh = read(USER_ID)
+    assert fresh.payload[field] == competing_value
+    assert write(fresh, dict(fresh.payload))

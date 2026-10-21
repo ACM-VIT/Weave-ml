@@ -30,12 +30,14 @@ def test_corpus_cli_value_overrides_invalid_environment_default(monkeypatch) -> 
     assert args.corpus_target == 25
 
 
-def test_corpus_config_validation_opens_no_network_connections(monkeypatch) -> None:
+@pytest.mark.parametrize("metadata_size, expected", [("10", 0), ("11", 1)])
+def test_corpus_config_validation_opens_no_network_connections(monkeypatch, metadata_size, expected) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     monkeypatch.setenv("BACKEND_URL", "http://backend.test")
     monkeypatch.setenv("INTERNAL_API_SECRET", "test-secret")
     monkeypatch.setenv("CORPUS_TARGET_COUNT", "50000")
     monkeypatch.setenv("ACQUISITION_MAX_CYCLES", "1")
+    monkeypatch.setenv("GITHUB_METADATA_BATCH_SIZE", metadata_size)
 
     with patch(
         "database.connector.PostgreSQLConnector.connect",
@@ -46,7 +48,7 @@ def test_corpus_config_validation_opens_no_network_connections(monkeypatch) -> N
     ):
         result = corpus_main(["--validate-config"])
 
-    assert result == 0
+    assert result == expected
 
 
 def test_corpus_config_validation_reports_missing_required_values(monkeypatch) -> None:

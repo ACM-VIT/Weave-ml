@@ -99,6 +99,15 @@ Discover, enrich, filter, and index repositories:
 python main.py --limit 150 --batch-size 15 --workers 4
 ```
 
+`--batch-size` controls scheduler chunks, not GraphQL response size.
+`GITHUB_METADATA_BATCH_SIZE` independently bounds metadata queries to 1–10
+repositories (default 10, an application response-size guard). Backend delivery
+omits homepage and pull-request-count fields; the default legacy/local enrichment
+projection retains them. READMEs remain individual requests. Discovery's
+`DiscoveryConfig.per_query` sets GraphQL `first` to 1–100 (default 20), and
+`pages_per_query` permits 1–10 cursor pages (default 1). Partial pages retain usable
+nodes but do not advance their cursor. Effective query bounds are logged.
+
 Refresh GitHub Trending once or run the scheduler:
 
 ```bash

@@ -5,6 +5,7 @@ import math
 import os
 from collections.abc import Iterable
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,8 @@ from config import REPOSITORY_EMBEDDING_VERSION
 logger = logging.getLogger("pipeline.ranker")
 STANDARDIZED_FEATURE_CLIP = 8.0
 _SHA256_HEX_LENGTH = 64
+_KEYWORD_CACHE_MAX_ELEMENTS = 64
+_KEYWORD_CACHE_MAX_CHARACTERS = 1024
 
 class MMoEHeavyRanker(nn.Module):
     def __init__(self, input_dim, num_experts=4):
@@ -89,16 +92,53 @@ def _keywords(values: object) -> set[str]:
     }
 
 
+def _keyword_content(values: object) -> tuple[str, ...]:
+    """Snapshot content, not identity, so mutable metadata cannot stale the cache."""
+    if values is None:
+        return ()
+    if isinstance(values, str):
+        return (str(values),)
+    if not isinstance(values, Iterable):
+        values = [values]
+    return tuple(str(value) for value in values if value is not None)
+
+
+@lru_cache(maxsize=4096)
+def _cached_repository_keywords(
+    languages: tuple[str, ...], topics: tuple[str, ...], tags: tuple[str, ...]
+) -> frozenset[str]:
+    # Immutable results are safe to share across ranking requests. The bounded,
+    # content-keyed cache invalidates for any language/topic/tag content change.
+    return frozenset(_keywords(languages) | _keywords(topics) | _keywords(tags))
+
+
+def _repository_keywords(languages, topics, tags) -> frozenset[str]:
+    content = (
+        _keyword_content(languages), _keyword_content(topics), _keyword_content(tags)
+    )
+    # Entry count alone cannot bound retained metadata. Bypass reuse for large
+    # values without truncating them or changing their matching semantics.
+    if (
+        sum(map(len, content)) > _KEYWORD_CACHE_MAX_ELEMENTS
+        or sum(len(value) for values in content for value in values)
+        > _KEYWORD_CACHE_MAX_CHARACTERS
+    ):
+        return _cached_repository_keywords.__wrapped__(*content)
+    return _cached_repository_keywords(*content)
+
+
+def _keyword_match_score(user_keywords, repo_keywords):
+    return len(user_keywords & repo_keywords) / len(user_keywords)
+
+
 def calculate_match_score(user_interests_skills, repo_languages, repo_topics, repo_tags):
     """Calculates the percentage of overlapping keywords dynamically."""
     user_keywords = _keywords(user_interests_skills)
     if not user_keywords:
         return 0.0
-
-    repo_keywords = (
-        _keywords(repo_languages) | _keywords(repo_topics) | _keywords(repo_tags)
+    return _keyword_match_score(
+        user_keywords, _repository_keywords(repo_languages, repo_topics, repo_tags)
     )
-    return len(user_keywords & repo_keywords) / len(user_keywords)
 
 class RankerService:
     def __init__(
@@ -445,6 +485,34 @@ class RankerService:
             return default
         return number if np.isfinite(number) else default
 
+    def _input_tensor(self, user_vector, candidate_repos, dense_features):
+        """Build a request-owned C-contiguous float32 inference buffer.
+
+        Assignment copies external vectors (including strided/read-only arrays)
+        into this one buffer. CPU from_numpy shares only this private buffer,
+        retained by the tensor for its full lifetime; no caller array is aliased.
+        Device transfer is blocking by default and owns its destination storage.
+        No request buffer is stored or reused on this service.
+        """
+        dense_features = np.asarray(dense_features, dtype=np.float32)
+        expected_dense_shape = (len(candidate_repos), FEATURE_COUNT)
+        if dense_features.shape != expected_dense_shape:
+            raise ValueError(
+                f"dense_features must have shape {expected_dense_shape}; "
+                f"got shape {dense_features.shape}"
+            )
+        X = np.empty((len(candidate_repos), self.input_dim), dtype=np.float32)
+        X[:, :self.emb_dim] = user_vector
+        for index, repo in enumerate(candidate_repos):
+            X[index, self.emb_dim:2 * self.emb_dim] = self._embedding(
+                repo.get("embedding"),
+                field_name=f"candidate {repo.get('id', '<unknown>')} embedding",
+            )
+        X[:, 2 * self.emb_dim:] = dense_features
+        if not np.all(np.isfinite(X)):
+            raise ValueError("Heavy ranker input contains non-finite values")
+        return torch.from_numpy(X).to(self.device)
+
     def _score_batch(self, user_embedding, user_skills, candidate_repos, *, diagnostics=False):
         """
         Executes the MMoE network on a micro-batch (e.g. 15 or 150 repos).
@@ -458,21 +526,19 @@ class RankerService:
 
         # 1. Prepare inputs
         user_vector = self._embedding(user_embedding, field_name="user_embedding")
-        user_embs = np.tile(user_vector, (len(candidate_repos), 1))
-        repo_embs = np.vstack(
-            [
-                self._embedding(
-                    repo.get("embedding"),
-                    field_name=f"candidate {repo.get('id', '<unknown>')} embedding",
-                )
-                for repo in candidate_repos
-            ]
-        )
-        
+        user_keywords = _keywords(user_skills)
         dense_features = []
         for repo in candidate_repos:
             # Dynamically calculate the cross-feature!
-            skill_match = calculate_match_score(user_skills, repo.get('languages', []), repo.get('topics', []), repo.get('tags', []))
+            skill_match = (
+                _keyword_match_score(
+                    user_keywords,
+                    _repository_keywords(
+                        repo.get('languages'), repo.get('topics'), repo.get('tags')
+                    ),
+                )
+                if user_keywords else 0.0
+            )
             
             # The EXACT 10 features generated in DataGen:
             # batch_doc, batch_health, batch_readme, batch_stars, batch_forks, batch_issues, batch_pushed, batch_activity, batch_trend, skill_match_score
@@ -502,17 +568,8 @@ class RankerService:
             STANDARDIZED_FEATURE_CLIP,
         )
             
-        # Concatenate into massive input tensor
-        X = np.hstack((user_embs, repo_embs, dense_features))
-        if X.shape != (len(candidate_repos), self.input_dim):
-            raise ValueError(
-                f"Heavy ranker input has shape {X.shape}; expected "
-                f"({len(candidate_repos)}, {self.input_dim})"
-            )
-        if not np.all(np.isfinite(X)):
-            raise ValueError("Heavy ranker input contains non-finite values")
-        X_tensor = torch.tensor(X, dtype=torch.float32).to(self.device)
-        
+        X_tensor = self._input_tensor(user_vector, candidate_repos, dense_features)
+
         return self._rank_results(X_tensor, candidate_repos, skill_matches)
 
     def _rank_results(self, X_tensor, candidate_repos, skill_matches=None):

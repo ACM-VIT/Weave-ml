@@ -231,7 +231,7 @@ class QdrantUserProfileStore:
         records = self.client.retrieve(
             collection_name=self.contract.collection_name,
             ids=[target_id],
-            with_payload=True,
+            with_payload=list(compare_fields),
             with_vectors=False,
         )
         if not records:
