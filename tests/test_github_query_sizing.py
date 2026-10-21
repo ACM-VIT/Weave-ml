@@ -52,15 +52,95 @@ def test_search_pages_follow_cursor_but_stop_after_partial_response(partial):
         assert client.execute.call_args_list[1].args[1]["after"] == "cursor-1"
 
 
-def test_later_search_page_failure_keeps_completed_page():
+def test_later_search_page_failure_keeps_completed_page(caplog):
     client = MagicMock()
     client.execute.side_effect = [{"data": {"search": {
         "nodes": [{"nameWithOwner": "owner/first"}],
         "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
-    }}}, GitHubGraphQLClientError("transient failure")]
+    }}}, GitHubGraphQLClientError("private response body", category="server", status_code=502)]
     results = GitHubDiscoveryEngine(client, config=DiscoveryConfig(pages_per_query=3))._search_graphql("test", 1)
     assert [item["full_name"] for item in results] == ["owner/first"]
     assert client.execute.call_count == 2
+    assert "server" in caplog.text and "502" in caplog.text
+    assert "private response body" not in caplog.text
+
+
+def test_invalid_json_on_later_page_keeps_completed_page():
+    first = MagicMock(status_code=200)
+    first.json.return_value = {"data": {"search": {
+        "nodes": [{"nameWithOwner": "owner/first"}],
+        "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+    }}}
+    invalid = MagicMock(status_code=200)
+    invalid.json.side_effect = ValueError("malformed JSON")
+    session = MagicMock()
+    session.post.side_effect = [first, invalid]
+    client = GitHubGraphQLClient(token="test-token", session=session)
+
+    results = GitHubDiscoveryEngine(client, config=DiscoveryConfig(pages_per_query=3))._search_graphql("test", 1)
+
+    assert [item["full_name"] for item in results] == ["owner/first"]
+    assert session.post.call_count == 2
+
+
+def test_invalid_json_on_first_page_is_still_a_failure():
+    invalid = MagicMock(status_code=200)
+    invalid.json.side_effect = ValueError("malformed JSON")
+    session = MagicMock()
+    session.post.return_value = invalid
+    client = GitHubGraphQLClient(token="test-token", session=session)
+
+    with pytest.raises(GitHubGraphQLClientError, match="invalid JSON"):
+        GitHubDiscoveryEngine(client)._search_graphql("test", 1)
+
+
+def test_later_page_http_diagnostic_does_not_log_response_body(caplog):
+    first = MagicMock(status_code=200)
+    first.json.return_value = {"data": {"search": {
+        "nodes": [{"nameWithOwner": "owner/first"}],
+        "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+    }}}
+    failure = MagicMock(status_code=401, text="Authorization: Bearer private-secret https://user:password@example.test")
+    session = MagicMock()
+    session.post.side_effect = [first, failure]
+    client = GitHubGraphQLClient(token="test-token", session=session)
+
+    results = GitHubDiscoveryEngine(client, config=DiscoveryConfig(pages_per_query=3))._search_graphql("test", 1)
+
+    assert [item["full_name"] for item in results] == ["owner/first"]
+    assert "http" in caplog.text and "401" in caplog.text
+    assert "private-secret" not in caplog.text
+    assert "password" not in caplog.text
+
+
+@pytest.mark.parametrize("envelope", [None, [], 1, {"data": None}, {"data": []}, {"data": "invalid"}, {"errors": [None]}, {"errors": "invalid"}])
+def test_invalid_response_envelope_preserves_only_completed_pages(envelope):
+    first = MagicMock(status_code=200)
+    first.json.return_value = {"data": {"search": {
+        "nodes": [{"nameWithOwner": "owner/first"}],
+        "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+    }}}
+    invalid = MagicMock(status_code=200)
+    invalid.json.return_value = envelope
+    session = MagicMock()
+    session.post.side_effect = [first, invalid]
+    client = GitHubGraphQLClient(token="test-token", session=session)
+
+    results = GitHubDiscoveryEngine(client, config=DiscoveryConfig(pages_per_query=3))._search_graphql("test", 1)
+    assert [item["full_name"] for item in results] == ["owner/first"]
+
+    session.post.side_effect = [invalid]
+    with pytest.raises(GitHubGraphQLClientError):
+        GitHubDiscoveryEngine(client)._search_graphql("test", 1)
+
+
+def test_unusable_rate_limit_metadata_does_not_drop_search_results():
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"data": {"rateLimit": None, "search": {"nodes": [{"nameWithOwner": "owner/repo"}]}}}
+    session = MagicMock()
+    session.post.return_value = response
+    client = GitHubGraphQLClient(token="test-token", session=session)
+    assert GitHubDiscoveryEngine(client)._search_graphql("test", 1)[0]["full_name"] == "owner/repo"
 
 
 class MetadataFixture(GitHubGraphQLClient):

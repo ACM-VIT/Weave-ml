@@ -80,10 +80,13 @@ class GitHubDiscoveryEngine:
                     SEARCH_REPOSITORIES_QUERY,
                     {"query": query_str, "first": per_page, "after": after},
                 )
-            except GitHubGraphQLClientError:
+            except GitHubGraphQLClientError as exc:
                 if not repos:
                     raise
-                logger.warning("Discovery page failed; retaining completed pages without advancing")
+                logger.warning(
+                    "Discovery page failed (category=%s status=%s); retaining completed pages without advancing",
+                    exc.category, exc.status_code,
+                )
                 break
             data = result.get("data") if isinstance(result, dict) else None
             search = data.get("search") if isinstance(data, dict) else None
