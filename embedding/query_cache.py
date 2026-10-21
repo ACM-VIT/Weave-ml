@@ -119,6 +119,11 @@ class QueryEmbeddingCache:
                 try:
                     value = future.result(timeout=wait_seconds)
                 except FutureTimeoutError as exc:
+                    if (future.done() and not future.cancelled()
+                            and future.exception() is exc):
+                        # result() re-raised the owner's stored exception, not
+                        # a waiter deadline. Preserve that exact error.
+                        raise
                     # Before Python 3.11 this is not the built-in TimeoutError
                     # caught by the search route. Keep one boundary contract.
                     raise TimeoutError('query embedding wait deadline was exceeded') from exc

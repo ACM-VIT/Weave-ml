@@ -280,16 +280,23 @@ async def test_shared_query_flight_preserves_search_admission_during_http_interr
                 return
             if interruption == 'timeout':
                 assert [response.status_code for response in await asyncio.gather(*tasks)] == [503, 503]
+                await until(lambda: model.query_embedding_cache.snapshot()['waiters'] == 0
+                            and runtime.service_runtime_status()['search']['outstanding'] == 1)
             else:
                 tasks[0 if interruption == 'cancel_owner' else 1].cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await tasks[0 if interruption == 'cancel_owner' else 1]
-            # Neither cancellation nor the HTTP deadline frees a running worker
-            # or removes the shared flight before the real encoder completes.
-            assert runtime.service_runtime_status()['search']['outstanding'] == 2
+            # A completed cache waiter may release its own worker. Cancellation
+            # must retain every still-live worker; the owner always holds its
+            # slot/flight until the real encoder completes.
+            if interruption == 'timeout':
+                assert runtime.service_runtime_status()['search']['outstanding'] == 1
+                assert model.query_embedding_cache.snapshot()['waiters'] == 0
+            else:
+                assert runtime.service_runtime_status()['search']['outstanding'] == 2
+                assert model.query_embedding_cache.snapshot()['waiters'] == 1
+                assert (await submit()).status_code == 503
             assert model.query_embedding_cache.snapshot()['flights'] == 1
-            assert model.query_embedding_cache.snapshot()['waiters'] == 1
-            assert (await submit()).status_code == 503
             release.set()
             if interruption != 'timeout':
                 assert (await tasks[1 if interruption == 'cancel_owner' else 0]).status_code == 200

@@ -118,11 +118,12 @@ def test_invalid_vectors_never_enter_cache_or_leave_flights(invalid):
 def test_encoder_failure_wakes_waiters_and_next_call_retries(error):
     cache = QueryEmbeddingCache()
     started, release = threading.Event(), threading.Event()
+    failure = error('synthetic encoder failure')
 
     def fail():
         started.set()
         assert release.wait(3)
-        raise error('synthetic encoder failure')
+        raise failure
 
     with ThreadPoolExecutor(max_workers=3) as pool:
         owner = pool.submit(lookup, cache, compute=fail)
@@ -133,8 +134,9 @@ def test_encoder_failure_wakes_waiters_and_next_call_retries(error):
         finally:
             release.set()
         for future in [owner, *waiters]:
-            with pytest.raises(error, match='synthetic encoder failure'):
+            with pytest.raises(error, match='synthetic encoder failure') as caught:
                 future.result(2)
+            assert caught.value is failure
     assert cache.snapshot()['entries'] == cache.snapshot()['flights'] == cache.snapshot()['waiters'] == 0
     assert lookup(cache) == [1., 0.]
 
