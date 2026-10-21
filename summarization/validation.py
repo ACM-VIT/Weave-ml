@@ -36,7 +36,7 @@ _README_SECTION = re.compile(
     re.IGNORECASE,
 )
 _LICENSE_BOILERPLATE = re.compile(
-    r"\blicensed under\b|(?:^|[.!?][ \t]+|\n)[ \t]*GPL(?:[ -]?v?\d+(?:\.\d+)*)?[ \t]*(?:[.!?:]|$)",
+    r"\blicensed under\b|(?:^|[.!?][ \t]+|\n)[ \t]*GPL(?:[ \t-]*v?\d+(?:\.\d+)*(?:\+|[ \t]+or[ \t]+later)?|[ \t]*\+|[ \t]+or[ \t]+later)?[ \t]*(?:[.!?:]|$)",
     re.IGNORECASE,
 )
 _WORD = re.compile(r"[a-z0-9]+(?:['’-][a-z0-9]+)?", re.IGNORECASE)
