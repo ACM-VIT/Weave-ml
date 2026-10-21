@@ -400,7 +400,12 @@ def test_qdrant_summary_cas_fences_a_concurrent_highlight_update() -> None:
     assert card_summary_from_payload(losing.payload) == _artifact()
 
 
-def test_provider_outage_allows_first_duplicate_and_current_fallback_deliveries() -> None:
+@pytest.mark.parametrize('description', [
+    'A review workspace for teams maintaining shared developer tools.',
+    'It supports common formats, e.g. JSON and YAML. Developers can extend it, e.g. with custom parsers.',
+    'Tools detect GPL boundaries across projects. Teams can track policy changes.',
+])
+def test_provider_outage_allows_first_duplicate_and_current_fallback_deliveries(description) -> None:
     from summarization.provider import SummaryProviderError
 
     class UnavailableProvider:
@@ -417,6 +422,7 @@ def test_provider_outage_allows_first_duplicate_and_current_fallback_deliveries(
     )
     client, store = _qdrant_store()
     request = _job()
+    request.repository.description = description
     try:
         with patch("api.v2._repository_points", side_effect=lambda _id: client.retrieve(
             store.collection_name, [REPO_ID], with_payload=True
@@ -426,11 +432,78 @@ def test_provider_outage_allows_first_duplicate_and_current_fallback_deliveries(
             first = _embed_repository_job_locked(request, OwnedLock())
             duplicate = _embed_repository_job_locked(request, OwnedLock())
             assert provider.calls == 1, "duplicate delivery must replay its stored result"
-            current = _embed_repository_job_locked(_job(), OwnedLock())
+            next_request = _job()
+            next_request.repository.description = description
+            current = _embed_repository_job_locked(next_request, OwnedLock())
         assert [first["status"], duplicate["status"], current["status"]] == ["applied", "duplicate", "current"]
         assert first["card_summary"]["source"] == "description_fallback"
         assert first["card_summary"] == duplicate["card_summary"] == current["card_summary"]
         assert provider.calls == 2, "a separate delivery may attempt to upgrade a valid fallback"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('same_job', [True, False], ids=['duplicate', 'current'])
+def test_previously_saved_abbreviation_fallback_is_repaired(same_job):
+    request = _job()
+    request.repository.description = (
+        'It supports common formats, e.g. JSON and YAML. '
+        'Developers can extend it, e.g. with custom parsers.'
+    )
+    malformed = CardSummaryArtifact(**{
+        **_artifact('It supports common formats, e.g. JSON and YAML.').model_dump(),
+        'source': 'description_fallback',
+        'model_version': CARD_SUMMARY_FALLBACK_MODEL_VERSION,
+    })
+    point = _point(request, artifact=malformed,
+                   stored_job=str(request.job_id) if same_job else str(uuid.uuid4()))
+    pipeline = RepositoryEmbeddingPipeline(embedder=FakeEmbedder())
+
+    class Store:
+        def compare_and_set_card_summary(self, *, expected_point, artifact):
+            return SimpleNamespace(id=expected_point.id, payload={
+                **expected_point.payload, **card_summary_payload(artifact),
+            })
+
+    with patch('api.v2._repository_points', return_value=[point]), patch(
+        'api.v2.repository_embedding_pipeline', return_value=pipeline
+    ), patch('api.v2.repository_store', return_value=Store()):
+        response = _embed_repository_job_locked(request, OwnedLock())
+    assert response['status'] == ('duplicate' if same_job else 'current')
+    assert response['card_summary']['summary'] == request.repository.description
+
+
+def test_unicode_boundary_artifact_survives_qdrant_persistence_and_replay():
+    from pathlib import Path
+    case = next(case for case in json.loads(
+        Path('tests/fixtures/summary_compatibility.json').read_text()
+    ) if case['name'] == '360 codepoints')
+
+    class Provider:
+        def generate(self, *args, **kwargs):
+            return json.dumps({'summary': case['summary'], 'highlights': case['highlights']})
+
+    pipeline = RepositoryEmbeddingPipeline(
+        embedder=FakeEmbedder(), card_summarizer=CardSummaryPipeline(provider=Provider()),
+    )
+    client, store = _qdrant_store()
+    request = _job()
+    try:
+        with patch('api.v2._repository_points', side_effect=lambda _id: client.retrieve(
+            store.collection_name, [REPO_ID], with_payload=True
+        )), patch('api.v2.repository_embedding_pipeline', return_value=pipeline), patch(
+            'api.v2.repository_store', return_value=store
+        ):
+            responses = [
+                _embed_repository_job_locked(request, OwnedLock()),
+                _embed_repository_job_locked(request, OwnedLock()),
+                _embed_repository_job_locked(_job(), OwnedLock()),
+            ]
+        assert [response['status'] for response in responses] == ['applied', 'duplicate', 'current']
+        for response in responses:
+            assert response['card_summary']['source'] == 'generated'
+            assert response['card_summary']['summary'] == case['summary']
+            assert response['card_summary']['highlights'] == case['highlights']
     finally:
         client.close()
 

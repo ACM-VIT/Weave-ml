@@ -16,6 +16,7 @@ from .contracts import (
     CARD_SUMMARY_MIN_GENERATED_CHARS,
     CardSummaryContent,
 )
+from .sentences import has_two_or_three_complete_sentences
 
 
 _MARKDOWN = re.compile(
@@ -34,8 +35,11 @@ _README_SECTION = re.compile(
     r"reference|table of contents|badges?)\b",
     re.IGNORECASE,
 )
+_LICENSE_BOILERPLATE = re.compile(
+    r"\blicensed under\b|(?:^|[.!?][ \t]+|\n)[ \t]*GPL(?:[ -]?v?\d+(?:\.\d+)*)?[ \t]*(?:[.!?:]|$)",
+    re.IGNORECASE,
+)
 _WORD = re.compile(r"[a-z0-9]+(?:['’-][a-z0-9]+)?", re.IGNORECASE)
-_SENTENCE_END = re.compile(r"[.!?](?:[\"')\]]+)?(?=\s|$)")
 _HTML = re.compile(r"<(?:/?[A-Za-z]|!)[^<>]*>")
 _IDENTIFIER = re.compile(r"\w+")
 
@@ -174,7 +178,7 @@ def _unsafe_text(value: str) -> list[str]:
         reasons.append("summary contains Markdown structure or code")
     if _COMMAND.search(value):
         reasons.append("summary contains a command or installation instruction")
-    if _README_SECTION.search(value):
+    if _README_SECTION.search(value) or _LICENSE_BOILERPLATE.search(value):
         reasons.append("summary contains an excluded README section")
     return reasons
 
@@ -193,8 +197,7 @@ def validate_generated_summary(
         reasons.append(f"summary exceeds {CARD_SUMMARY_MAX_CHARS} characters")
     if len(normalized) < CARD_SUMMARY_MIN_GENERATED_CHARS:
         reasons.append("summary is too short for a useful discovery card")
-    sentence_count = len(_SENTENCE_END.findall(normalized))
-    if sentence_count not in {2, 3} or not _SENTENCE_END.search(normalized[-4:]):
+    if not has_two_or_three_complete_sentences(normalized):
         reasons.append("summary must contain exactly two or three complete sentences")
 
     normalized_highlights: list[str] = []

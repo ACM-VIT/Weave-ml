@@ -19,7 +19,9 @@ from .contracts import (
 from .provider import SummaryProvider, SummaryProviderError
 from .settings import SummarySettings
 from .source import build_summary_source
+from .sentences import has_two_or_three_complete_sentences, split_summary_sentences
 from .validation import (
+    _LICENSE_BOILERPLATE,
     SummaryValidationError,
     normalize_summary,
     parse_summary_response,
@@ -36,7 +38,6 @@ _UNSAFE_SENTENCE = re.compile(
     r"table of contents|badges?)\b)",
     re.IGNORECASE,
 )
-_SENTENCE = re.compile(r".+?[.!?](?=\s|$)|.+$", re.DOTALL)
 _MARKDOWN_STRUCTURE = re.compile(
     r"(?m)^[ \t]*(?:#{1,6}[ \t]+|[-*+][ \t]+|\d+[.)][ \t]+)|```|~~~|`"
 )
@@ -85,9 +86,10 @@ def description_fallback_artifact(
 
     raw_description = _plain_description(repo.get("description"))
     safe_sentences = [
-        normalize_summary(match.group(0))
-        for match in _SENTENCE.finditer(raw_description)
-        if match.group(0).strip() and not _UNSAFE_SENTENCE.search(match.group(0))
+        normalize_summary(sentence)
+        for sentence in split_summary_sentences(raw_description)
+        if sentence.strip() and not _UNSAFE_SENTENCE.search(sentence)
+        and not _LICENSE_BOILERPLATE.search(sentence)
     ]
     if len(safe_sentences) >= 2:
         first = _bounded(safe_sentences[0], 175)
@@ -133,6 +135,12 @@ def description_fallback_artifact(
             summary = f"{summary}."
         summary = f"{summary} {supplement}"
     summary = _bounded(summary, CARD_SUMMARY_MAX_CHARS)
+    if summary and summary[-1] not in '.!?':
+        summary = _bounded(summary + '.', CARD_SUMMARY_MAX_CHARS)
+    # Truncation or unusual metadata must not create a permanently undeliverable
+    # fallback. Keep the same sentence requirement as the canonical backend.
+    if not has_two_or_three_complete_sentences(summary):
+        summary = 'This is a GitHub repository. Its description does not yet provide more project details.'
     return CardSummaryArtifact(
         summary=summary,
         highlights=[],
@@ -159,6 +167,7 @@ class CardSummaryPipeline:
         if (
             artifact.prompt_version != self.settings.prompt_version
             or artifact.format_version != self.settings.format_version
+            or not has_two_or_three_complete_sentences(artifact.summary)
         ):
             return False
         if artifact.source == "generated":

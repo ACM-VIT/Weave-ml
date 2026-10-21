@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_vali
 CARD_SUMMARY_PROMPT_VERSION = "repo-card-summary-v1"
 CARD_SUMMARY_FORMAT_VERSION = "repo-card-summary-json-v1"
 CARD_SUMMARY_FALLBACK_MODEL_VERSION = "repository-description-fallback-v1"
+# Lengths are Unicode codepoints (Python len, PostgreSQL char_length), not UTF-16.
 CARD_SUMMARY_MAX_CHARS = 360
 CARD_SUMMARY_MIN_GENERATED_CHARS = 180
 CARD_SUMMARY_MAX_HIGHLIGHTS = 3
