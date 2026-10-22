@@ -19,6 +19,7 @@ from utils.deadline import (
     deadline_scope, deadline_status,
 )
 from utils.runtime_lifecycle import runtime_admission
+from utils.observability import WorkObservation, span_scope
 
 
 T = TypeVar("T")
@@ -130,6 +131,7 @@ class _BoundedExecutor:
     def submit(
         self, function: Callable[..., T], *args: Any,
         deadline: RequestDeadline | None = None,
+        observation: WorkObservation | None = None,
     ) -> Future[T]:
         """Retain admission until actual worker completion, including cancellation."""
         with runtime_admission():
@@ -139,18 +141,26 @@ class _BoundedExecutor:
                 raise ServiceCapacityError(self.operation)
             with self._lock:
                 self._outstanding += 1
+            observation = observation or WorkObservation(self.operation)
             try:
                 with deadline_scope(deadline):
                     context = copy_context()
                 def invoke() -> T:
-                    check_deadline()
-                    return function(*args)
+                    observation.start()
+                    try:
+                        with span_scope(self.operation):
+                            check_deadline()
+                            return function(*args)
+                    finally:
+                        observation.worker_stopped()
                 future = self.executor.submit(context.run, invoke)
             except BaseException:
+                observation.finish("error")
                 self._release()
                 raise
         def completed(_future) -> None:
             try:
+                observation.complete_future(_future)
                 if deadline is not None and not _future.cancelled():
                     deadline.finish(self.operation)
             finally:
@@ -166,19 +176,22 @@ class _BoundedExecutor:
                 deadline.remaining()
             except CooperativeDeadlineExceeded as exc:
                 raise ServiceDeadlineExceeded(self.operation) from exc
-        future = self.submit(function, *args, deadline=deadline)
+        observation = WorkObservation(self.operation)
+        future = self.submit(function, *args, deadline=deadline, observation=observation)
         try:
             return await asyncio.wait_for(
                 asyncio.wrap_future(future),
                 timeout=deadline.remaining() if deadline is not None else self.timeout,
             )
         except CooperativeDeadlineExceeded as exc:
+            observation.abandon("timeout")
             if deadline is not None:
                 deadline.cancel("timeout")
             future.cancel()  # A pre-wait expiry must also remove queued work.
             self.record_timeout()
             raise ServiceDeadlineExceeded(self.operation) from exc
         except asyncio.CancelledError:
+            observation.abandon("cancelled")
             if deadline is not None:
                 deadline.cancel()
             future.cancel()
@@ -186,6 +199,7 @@ class _BoundedExecutor:
         except asyncio.TimeoutError as exc:
             if future.done() and not future.cancelled():
                 return future.result()
+            observation.abandon("timeout")
             if deadline is not None:
                 deadline.cancel("timeout")
             self.record_timeout()
