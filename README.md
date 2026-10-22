@@ -23,6 +23,9 @@ Machine-learning and data-pipeline services for [gh-social](https://github.com/S
 - PostgreSQL only for offline acquisition and evaluation tooling
 - A GitHub personal access token for acquisition and trending ingestion
 
+README chunking and the opt-in token-aware, section-weighted representation are documented in
+[README embedding aggregation](docs/README_EMBEDDING_AGGREGATION.md), including baseline evaluation and coordinated migration.
+
 Local development downloads the configured SentenceTransformer on first use.
 The production image instead bakes an immutable model revision and starts with
 Hugging Face/Transformers offline mode enabled; runtime downloads are refused.

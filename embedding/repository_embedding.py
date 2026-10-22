@@ -70,6 +70,7 @@ class RepositoryEmbeddingConfig:
     version: str = REPOSITORY_EMBEDDING_VERSION
     readme_chunk_chars: int = README_CHUNK_CHARS
     readme_chunk_overlap_chars: int = README_CHUNK_OVERLAP_CHARS
+    readme_chunk_overlap_tokens: int = 32
     tower_weights: dict[str, float] = field(default_factory=lambda: dict(REPO_TOWER_WEIGHTS))
 
     def __post_init__(self) -> None:
@@ -92,6 +93,12 @@ class RepositoryEmbeddingConfig:
             )
         if not isinstance(self.version, str) or not self.version.strip():
             raise ValueError("version must be a non-empty string")
+        if (
+            isinstance(self.readme_chunk_overlap_tokens, bool)
+            or not isinstance(self.readme_chunk_overlap_tokens, Integral)
+            or not 0 <= self.readme_chunk_overlap_tokens < 2048
+        ):
+            raise ValueError("readme_chunk_overlap_tokens must be an integer between 0 and 2047")
         if (
             isinstance(self.readme_chunk_chars, bool)
             or not isinstance(self.readme_chunk_chars, Integral)

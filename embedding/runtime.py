@@ -171,6 +171,11 @@ class BoundedEmbeddingModel:
     def max_seq_length(self) -> int:
         return getattr(self._model, "max_seq_length", 256)
 
+    @property
+    def tokenizer(self):
+        """Expose the exact frozen encoder tokenizer for README chunking."""
+        return self._model.tokenizer
+
     def encode(self, *args: Any, **kwargs: Any) -> Any:
         ticket = object()
         with self._condition:
