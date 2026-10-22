@@ -77,6 +77,7 @@ ENV V2_REFRESH_TIMEOUT_SECONDS=45
 ENV V2_HEALTH_EXECUTOR_WORKERS=2
 ENV V2_HEALTH_MAX_OUTSTANDING=4
 ENV EMBEDDING_WARMUP_ON_STARTUP=true
+ENV INFERENCE_WARMUP_TIMEOUT_SECONDS=120
 
 # Create the runtime identity before copying layers so ownership changes do not
 # duplicate the baked model whenever application source changes.

@@ -56,10 +56,11 @@ def health_probe_cache(monkeypatch):
     from utils import runtime_lifecycle
 
     monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("EMBEDDING_WARMUP_ON_STARTUP", "false")
     monkeypatch.setenv("V2_HEALTH_REFRESH_SECONDS", "15")
     monkeypatch.setenv("V2_HEALTH_MAX_AGE_SECONDS", "45")
     monkeypatch.setenv("V2_HEALTH_TIMEOUT_SECONDS", "5")
-    monkeypatch.setattr(v2, "_shutdown_plan", None)
+    monkeypatch.setattr(v2, "_runtime_retirement", None)
     monkeypatch.setattr(runtime_lifecycle, "_retiring", threading.Event())
     monkeypatch.setattr(v2, "embedding_runtime_status", lambda: {"embedding_runtime_ready": True})
     monkeypatch.setattr(v2, "service_runtime_status", lambda: {})

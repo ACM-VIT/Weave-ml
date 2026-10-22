@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 import re
 import time
+import threading
 import uuid
 
 from dotenv import load_dotenv
@@ -18,6 +20,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from config import constant_time_secret_matches, internal_api_header_name
 from api.metrics import record_api_request
+from utils.observability import authenticated_request_id, operation_for_path, span_scope
 
 load_dotenv()
 
@@ -63,8 +66,14 @@ def _error_response(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start and validate the V2-only runtime."""
-    from api.v2 import health_diagnostics, shutdown_v2_runtime, validate_v2_runtime_configuration
-    from embedding.runtime import embedding_warmup_enabled, warm_embedding_runtime
+    from api.v2 import (
+        begin_v2_runtime_retirement, health_diagnostics, retriever,
+        validate_v2_runtime_configuration,
+    )
+    from embedding.runtime import (
+        embedding_warmup_enabled, inference_warmup_timeout_seconds,
+        warm_embedding_runtime,
+    )
     from scripts.validate_production_config import validate_production_config
 
     if os.getenv("APP_ENV", "development").strip().casefold() == "production":
@@ -82,19 +91,105 @@ async def lifespan(app: FastAPI):
     if settings.production and not warmup_enabled:
         raise RuntimeError("EMBEDDING_WARMUP_ON_STARTUP must be enabled in production")
     app.state.feedback_settings = settings
-    if warmup_enabled:
-        app.state.embedding_runtime = await asyncio.to_thread(warm_embedding_runtime)
-    app.state.feedback_settings = settings
-    diagnostic_task = asyncio.create_task(health_diagnostics().run_periodic())
+    app.state.inference_warmup_ready = False
+    app.state.inference_warmup = {}
+    app.state.inference_warmup_duration_seconds = None
+    stop_warmup = threading.Event()
+    diagnostic_task = None
+    warmup_executor = None
+    warmup_future = None
+    warmup_deadline = None
+    runtime = retriever()
+
+    def warm_inference() -> dict:
+        if stop_warmup.is_set() or time.monotonic() >= warmup_deadline:
+            stop_warmup.set()
+            raise RuntimeError("Inference warmup was stopped")
+        embedding = warm_embedding_runtime(stop_warmup)
+        if stop_warmup.is_set() or time.monotonic() >= warmup_deadline:
+            stop_warmup.set()
+            raise RuntimeError("Inference warmup was stopped")
+        ranker_status = {
+            "heavy_ranker_warmup_ready": False,
+            "heavy_ranker_warmup_required": runtime.heavy_ranker_required,
+            "heavy_ranker_warmup_state": "not_required",
+            "heavy_ranker_warmup_duration_seconds": None,
+        }
+        if runtime.heavy_ranker_enabled:
+            if runtime.ranker is None:
+                if runtime.heavy_ranker_required:
+                    raise RuntimeError("Required heavy ranker is unavailable for warmup")
+                ranker_status["heavy_ranker_warmup_state"] = "unavailable_optional"
+            else:
+                try:
+                    ranker_status.update(runtime.ranker.warmup(stop=stop_warmup))
+                except Exception:
+                    # Non-strict deployments already permit hybrid fallback.
+                    # Do not turn a stop/deadline into successful degradation.
+                    if (
+                        runtime.heavy_ranker_required or stop_warmup.is_set()
+                        or time.monotonic() >= warmup_deadline
+                    ):
+                        raise
+                    ranker_status.update(runtime.ranker.warmup_status())
+                    runtime.ranker = None
+                    runtime.ranker_error = "heavy ranker inference warmup failed"
+                    logger.warning("Optional heavy ranker warmup failed; using hybrid fallback")
+        if time.monotonic() >= warmup_deadline:
+            stop_warmup.set()
+            raise RuntimeError("Inference warmup exceeded its startup deadline")
+        return {**embedding, **ranker_status}
+
     try:
+        if warmup_enabled:
+            started = time.monotonic()
+            timeout = inference_warmup_timeout_seconds()
+            warmup_deadline = started + timeout
+            # One process-owned future allows cleanup to follow the real native
+            # worker rather than an already-cancelled asyncio waiter.
+            warmup_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="ml-startup-warmup"
+            )
+            warmup_future = warmup_executor.submit(warm_inference)
+            wrapped = asyncio.wrap_future(warmup_future)
+            wrapped.add_done_callback(
+                lambda done: None if done.cancelled() else done.exception()
+            )
+            try:
+                app.state.inference_warmup = await asyncio.wait_for(
+                    asyncio.shield(wrapped), timeout=timeout,
+                )
+                if time.monotonic() >= warmup_deadline:
+                    raise RuntimeError("Inference warmup exceeded its startup deadline")
+            except asyncio.TimeoutError:
+                raise RuntimeError("Inference warmup exceeded its startup deadline") from None
+            finally:
+                app.state.inference_warmup_duration_seconds = time.monotonic() - started
+            # Only the successful bounded waiter can open readiness. A timed-out
+            # worker cannot flip this flag when it eventually finishes.
+            app.state.embedding_runtime = app.state.inference_warmup
+            app.state.inference_warmup_ready = True
+        diagnostic_task = asyncio.create_task(health_diagnostics().run_periodic())
         yield
     finally:
-        diagnostic_task.cancel()
+        stop_warmup.set()
+        app.state.inference_warmup_ready = False
         try:
-            await diagnostic_task
-        except asyncio.CancelledError:
-            pass
-        await asyncio.to_thread(shutdown_v2_runtime)
+            # Own this exact generation's drain before any shutdown await can yield.
+            retirement = begin_v2_runtime_retirement(after_startup=warmup_future)
+            drain_future = retirement.start_drain()
+            if diagnostic_task is not None:
+                diagnostic_task.cancel()
+                try:
+                    await diagnostic_task
+                except asyncio.CancelledError:
+                    pass
+            # Native callback ownership or actual executor submission already
+            # exists. Cancelling this waiter cannot abandon the retired worker.
+            await asyncio.shield(drain_future)
+        finally:
+            if warmup_executor is not None:
+                warmup_executor.shutdown(wait=False, cancel_futures=True)
 
 
 app = FastAPI(
@@ -198,6 +293,8 @@ async def unhandled_service_error(request: Request, exc: Exception):
 @app.middleware("http")
 async def authenticate_non_health_routes(request: Request, call_next):
     """Fail closed for every route, including all health tiers."""
+    # Preserve the existing response/error request-id contract. Legacy values
+    # are never adopted by trace context or exported in diagnostic spans.
     supplied_request_id = request.headers.get("x-request-id", "").strip()
     request.state.request_id = (
         supplied_request_id
@@ -257,7 +354,20 @@ async def authenticate_non_health_routes(request: Request, call_next):
             message="Unauthorized.",
             retryable=False,
         )
-    response = await call_next(request)
+    request_ids = request.headers.getlist("x-request-id")
+    traceparents = request.headers.getlist("traceparent")
+    correlation_request_id = authenticated_request_id(
+        request_ids[0] if len(request_ids) == 1 else None,
+    )
+    # call_next returns a response object. This span does not establish full
+    # body delivery, client receipt, or frontend rendering completion.
+    with span_scope(
+        operation_for_path(request.url.path), server=True,
+        request_id=correlation_request_id,
+        authenticated_traceparent=traceparents[0] if len(traceparents) == 1 else None,
+    ) as span:
+        response = await call_next(request)
+        span.set_http_status(response.status_code)
     response.headers["x-request-id"] = request.state.request_id
     return response
 

@@ -7,7 +7,7 @@ import math
 import os
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 from functools import lru_cache
 from typing import Any
@@ -46,6 +46,7 @@ from embedding.runtime import (
     embedding_runtime_status,
     embedding_timeout_seconds,
     embedding_warmup_enabled,
+    inference_warmup_timeout_seconds,
     repository_embedding_pipeline,
     shared_embedding_model,
     run_embedding_job,
@@ -169,9 +170,60 @@ class _RuntimeCleanupPlan:
             return failures
 
 
+class _RuntimeRetirement:
+    """One generation owns its exact workers, cleanup plan and submitted drain."""
+
+    def __init__(self, plan, diagnostics, startup_future) -> None:
+        self.plan = plan
+        self.diagnostics = diagnostics
+        self.startup_future = startup_future
+        self._lock = threading.Lock()
+        self._startup_callback_registered = False
+        self._drain_future: asyncio.Future | None = None
+
+    def start_drain(self) -> asyncio.Future:
+        """Own actual worker callbacks/submissions before the caller can yield."""
+        loop = asyncio.get_running_loop()
+        if self._register_startup_drain():
+            # The native Future, not an asyncio Task, now owns eventual cleanup.
+            registered = loop.create_future()
+            registered.set_result(None)
+            return registered
+        with self._lock:
+            if self._drain_future is None or (
+                self._drain_future.done() and self.plan.status()["state"] == "failed"
+            ):
+                # Submit synchronously: loop teardown must not cancel a Task
+                # before it has even enqueued the actual cleanup worker.
+                self._drain_future = loop.run_in_executor(None, self.drain)
+            return self._drain_future
+
+    def _register_startup_drain(self) -> bool:
+        with self._lock:
+            barrier = self.startup_future
+            if barrier is None or barrier.done():
+                return False
+            if self._startup_callback_registered:
+                return True
+            self._startup_callback_registered = True
+        # add_done_callback may run inline if the native worker just finished.
+        # Never register while holding the retirement lock.
+        barrier.add_done_callback(lambda _future: self._drain_dependencies())
+        return True
+
+    def drain(self) -> None:
+        if not self._register_startup_drain():
+            self._drain_dependencies()
+
+    def _drain_dependencies(self) -> None:
+        if self.diagnostics is not None:
+            self.diagnostics.retire(self.plan.run)
+        else:
+            self.plan.run()
+
+
 _shutdown_lock = threading.Lock()
-_shutdown_plan: _RuntimeCleanupPlan | None = None
-_retiring_diagnostics: HealthDiagnostics | None = None
+_runtime_retirement: _RuntimeRetirement | None = None
 
 
 class V2ServiceHTTPException(HTTPException):
@@ -340,25 +392,32 @@ def onboarding_pipeline():
     return pipeline
 
 
-def shutdown_v2_runtime() -> None:
-    """Retire actual diagnostics and retry only captured failed cleanup actions."""
-    global _shutdown_plan, _retiring_diagnostics
+def begin_v2_runtime_retirement(
+    *, after_startup: Future | None = None,
+) -> _RuntimeRetirement:
+    """Atomically return the exact retired generation without closing clients."""
+    global _runtime_retirement
     with _shutdown_lock:
-        if _shutdown_plan is None:
-            if health_diagnostics.cache_info().currsize:
-                _retiring_diagnostics = health_diagnostics()
-            # Freeze every queue/factory before any executor can be captured or
-            # joined. Admitted workers retain their resources until real exit.
+        if _runtime_retirement is None:
+            # Freeze queue/factory admission before capturing this generation.
+            # Already-admitted workers and startup retain their resources until
+            # the generation-owned cleanup plan drains their real completion.
             stop_runtime_admission()
-            _shutdown_plan = _RuntimeCleanupPlan(
-                _runtime_cleanup_actions, _runtime_drain_actions,
+            diagnostics = None
+            if health_diagnostics.cache_info().currsize:
+                diagnostics = health_diagnostics()
+                diagnostics.close()
+            _runtime_retirement = _RuntimeRetirement(
+                _RuntimeCleanupPlan(_runtime_cleanup_actions, _runtime_drain_actions),
+                diagnostics, after_startup,
             )
-        plan = _shutdown_plan
-        diagnostics = _retiring_diagnostics
-    if diagnostics is not None:
-        diagnostics.retire(plan.run)
-    else:
-        plan.run()
+        return _runtime_retirement
+
+
+def shutdown_v2_runtime(retirement: _RuntimeRetirement | None = None) -> None:
+    """Operate only on a captured generation, never reread resettable globals."""
+    generation = retirement if retirement is not None else begin_v2_runtime_retirement()
+    generation.drain()
 
 
 def _runtime_drain_actions():
@@ -400,14 +459,14 @@ def _runtime_cleanup_actions():
 
 
 def _prepare_runtime_startup() -> None:
-    global _shutdown_plan, _retiring_diagnostics
+    global _runtime_retirement
     with _shutdown_lock:
-        if _shutdown_plan is not None:
-            if _shutdown_plan.status()["state"] != "completed":
+        retirement = _runtime_retirement
+        if retirement is not None:
+            if retirement.plan.status()["state"] != "completed":
                 raise RuntimeError("Previous runtime cleanup is incomplete")
             health_diagnostics.cache_clear()
-            _shutdown_plan = None
-            _retiring_diagnostics = None
+            _runtime_retirement = None
             resume_runtime_admission()
 
 
@@ -555,6 +614,7 @@ def validate_v2_runtime_configuration() -> V2FeedbackSettings:
     HealthSettings.from_env()
     embedding_timeout_seconds()
     embedding_warmup_enabled()
+    inference_warmup_timeout_seconds()
     # Constructing settings is network-free and catches malformed provider
     # configuration before an ingest request can occupy an embedding worker.
     SummarySettings.from_env()
@@ -1224,18 +1284,20 @@ def _collect_health_diagnostics(stop: threading.Event) -> tuple[bool, dict[str, 
 
 @lru_cache(maxsize=1)
 def health_diagnostics() -> HealthDiagnostics:
-    if _shutdown_plan is not None and _retiring_diagnostics is not None:
-        return _retiring_diagnostics
+    retirement = _runtime_retirement
+    if retirement is not None and retirement.diagnostics is not None:
+        return retirement.diagnostics
     diagnostics = HealthDiagnostics(_collect_health_diagnostics, HealthSettings.from_env())
-    if _shutdown_plan is not None:
+    if retirement is not None:
         diagnostics.close()
     return diagnostics
 
 
 def _readiness_response(
-    snapshot: dict[str, Any], *, tier: str = "readiness"
+    snapshot: dict[str, Any], request: Request, *, tier: str = "readiness"
 ) -> dict[str, Any]:
-    if _shutdown_plan is not None:
+    retirement = _runtime_retirement
+    if retirement is not None:
         # Do not inspect lazy model/executor factories after shutdown has begun.
         raise V2ServiceHTTPException(
             status_code=503,
@@ -1245,7 +1307,7 @@ def _readiness_response(
             details={
                 **snapshot, "status": "unhealthy", "tier": tier,
                 "runtime_failure": "runtime_stopping",
-                "runtime_cleanup": _shutdown_plan.status(),
+                "runtime_cleanup": retirement.plan.status(),
             },
         )
     embedding = embedding_runtime_status()
@@ -1255,10 +1317,22 @@ def _readiness_response(
     ):
         snapshot["status"] = "unhealthy"
         snapshot["runtime_failure"] = "embedding_runtime_not_ready"
+    warmup_required = embedding_warmup_enabled()
+    warmup_ready = getattr(request.app.state, "inference_warmup_ready", False) is True
+    if warmup_required and not warmup_ready:
+        snapshot["status"] = "unhealthy"
+        snapshot["runtime_failure"] = "inference_warmup_not_ready"
     result = {
         **snapshot,
         "runtime_cleanup": {"state": "not_started", "failed_steps": []},
+        **getattr(request.app.state, "inference_warmup", {}),
+        # Startup identity is historical; live model/cache fields must win.
         **embedding,
+        "inference_warmup_required": warmup_required,
+        "inference_warmup_ready": warmup_ready,
+        "inference_warmup_duration_seconds": getattr(
+            request.app.state, "inference_warmup_duration_seconds", None
+        ),
         "tier": tier,
         "service_executors": {
             **service_runtime_status(),
@@ -1266,6 +1340,9 @@ def _readiness_response(
         },
         "database_required": False,
     }
+    if tier == "deep":
+        from utils.observability import diagnostic_snapshot
+        result["observability"] = diagnostic_snapshot()
     if result["status"] != "healthy":
         raise V2ServiceHTTPException(
             status_code=503,
@@ -1287,13 +1364,13 @@ async def liveness():
 @router.get("/health", dependencies=[Depends(require_internal_secret)])
 async def health(request: Request):
     """Legacy-compatible detailed readiness from explicitly dated observations."""
-    return _readiness_response(health_diagnostics().snapshot())
+    return _readiness_response(health_diagnostics().snapshot(), request)
 
 
 @router.get("/health/deep", dependencies=[Depends(require_internal_secret)])
-async def deep_health():
+async def deep_health(request: Request):
     """Explicit bounded refresh, coalesced and rate-limited across all callers."""
-    return _readiness_response(await health_diagnostics().refresh(), tier="deep")
+    return _readiness_response(await health_diagnostics().refresh(), request, tier="deep")
 
 
 @router.get(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 import os
@@ -11,9 +12,11 @@ import time
 import uuid
 from collections.abc import Mapping
 from concurrent.futures import Future
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Callable
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
@@ -44,8 +47,9 @@ from inference.feed_assembly import FeedAssemblySystem
 from inference.feature_spec import FEATURE_ORDER
 from inference.ranker_service import RankerService
 from inference.runtime import RecommendationDeadlineExceeded, recommendation_timeout_seconds
-from retrieval.metrics import record_candidate_read
 from retrieval.config import TOTAL_CANDIDATE_POOL
+from retrieval.discovery_cache import DiscoveryRevision, PoolLease, SharedDiscoveryCache
+from retrieval.metrics import record_candidate_read
 from retrieval.runtime import RetrievalWork, validate_retrieval_runtime
 from utils.deadline import CooperativeDeadlineExceeded, check_deadline, current_deadline, qdrant_timeout
 from scripts.user_onboarding import TARGET_VECTOR_NAME, USER_PROFILES_COLLECTION
@@ -54,7 +58,7 @@ logger = logging.getLogger("pipeline.v2_retrieval")
 
 _COUNTER_LIMIT = (2**63) - 1
 _MINIMUM_QDRANT_SERVER_VERSION = (1, 18, 0)
-_MAX_RETRIEVAL_ROUNDS = 3  # initial selection plus at most two refills
+_MAX_RETRIEVAL_ROUNDS = 3
 _CANDIDATE_READ_MULTIPLIER = 6
 _FALLBACK_MESSAGES = {
     "HEAVY_UNAVAILABLE": "heavy ranker is unavailable",
@@ -62,6 +66,7 @@ _FALLBACK_MESSAGES = {
     "NO_ELIGIBLE_CANDIDATES": "no eligible candidates were retrieved",
     "INVALID_HEAVY_OUTPUT": "heavy ranker returned an incomplete or invalid candidate set",
     "HEAVY_SCORING_FAILED": "heavy ranker scoring failed",
+    "CANDIDATE_VECTORS_UNAVAILABLE": "retained candidate vectors are unavailable",
 }
 
 _DISCOVERY_SOURCES = {
@@ -93,6 +98,11 @@ _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS = [
     "repo_id",
     REPOSITORY_SERVING_ELIGIBILITY_FIELD,
     "content_version",
+    "content_job_id",
+    "content_hash",
+    "source_hash",
+    "feature_version",
+    "feature_job_id",
     "embedding_model",
     "embedding_model_revision",
     "embedding_version",
@@ -178,6 +188,15 @@ def _read_point_ids(points: list) -> set[str | int]:
     return ids
 
 
+@dataclass(slots=True)
+class _DiscoveryPlan:
+    futures: list[tuple[str, Future]] = field(default_factory=list)
+    lease: PoolLease | None = None
+    revision: DiscoveryRevision | None = None
+    budget: _CandidateReadBudget | None = None
+    read_ids: set[str | int] = field(default_factory=set)
+
+
 class QdrantV2Retriever:
     """V2 candidate retrieval plus fail-safe heavy-ranker serving."""
 
@@ -196,6 +215,8 @@ class QdrantV2Retriever:
         compatible_embedding_versions: set[str] | None = None,
         minimum_eligible_repositories: int | None = None,
         allow_unqualified_ranker: bool | None = None,
+        discovery_revision_provider: Callable[[], DiscoveryRevision | None] | None = None,
+        discovery_cache: SharedDiscoveryCache | None = None,
     ) -> None:
         validate_retrieval_runtime()
         self.qdrant_timeout_seconds = self._float_env(
@@ -208,6 +229,13 @@ class QdrantV2Retriever:
         )
         self.repository_collection = repository_collection
         self.user_collection = user_collection
+        # The provider must be a bounded, authoritative snapshot covering all
+        # serving-relevant writes/deletes, not a count or process-local counter.
+        # No production provider is wired by default: missing/unavailable means
+        # genuinely uncached discovery, including when a cache was injected.
+        self._discovery_revision_provider = discovery_revision_provider
+        self._discovery_cache_scope = uuid.uuid4().hex
+        self._discovery_cache = discovery_cache or SharedDiscoveryCache()
         self.max_candidates = max(50, min(max_candidates, 2_000))
         self.app_env = os.getenv("APP_ENV", "development").strip().casefold()
         if assembler is None:
@@ -519,7 +547,10 @@ class QdrantV2Retriever:
         return models.Filter(
             must=must,
             must_not=(
-                [models.HasIdCondition(has_id=sorted(exclude_repo_ids, key=str))]
+                [models.HasIdCondition(has_id=sorted(
+                    exclude_repo_ids,
+                    key=lambda value: (0, value) if isinstance(value, int) else (1, value),
+                ))]
                 if exclude_repo_ids else None
             ),
         )
@@ -706,6 +737,64 @@ class QdrantV2Retriever:
             **qdrant_timeout(self.qdrant_timeout_seconds),
         )
 
+    def _fetch_retained_vectors(self, repo_ids: list[str]) -> list[Any]:
+        return self.client.retrieve(
+            collection_name=self.repository_collection,
+            ids=repo_ids,
+            with_payload=(
+                _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS + _HEAVY_RANKER_PAYLOAD_FIELDS
+            ),
+            with_vectors=[QDRANT_VECTOR_NAME],
+            **qdrant_timeout(self.qdrant_timeout_seconds),
+        )
+
+    def _hydrate_retained_candidates(
+        self,
+        ranked: list[RankedRepository],
+        metadata: dict[str, dict[str, Any]],
+    ) -> tuple[list[RankedRepository], dict[str, list[float] | None]]:
+        if not ranked:
+            return [], {}
+        # Fusion and max-candidate selection have already deduplicated IDs.
+        # Keep this defensive bound if another caller reuses this helper.
+        ids = list(dict.fromkeys(item.repo_id for item in ranked))[:self.max_candidates]
+        with RetrievalWork() as work:
+            records = work.result(work.submit(
+                "vectors", self._fetch_retained_vectors, ids,
+            ))
+        requested = set(ids)
+        eligible: dict[str, _EligibleRepositoryPoint] = {}
+        seen: set[str] = set()
+        for record in records:
+            point_id = str(getattr(record, "id", ""))
+            if point_id not in requested:
+                continue
+            if point_id in seen:
+                # Ambiguous duplicate responses must not choose a version by
+                # response order, even if a broken client returns two copies.
+                eligible.pop(point_id, None)
+                continue
+            seen.add(point_id)
+            # Never use the payload-only eligibility cache for this second read.
+            point = self._eligible_repository_point(record, require_vector=True)
+            previous = metadata.get(point_id)
+            if point is None or previous is None:
+                continue
+            # Do not combine a stale semantic/discovery score with newer
+            # content, feature or eligibility metadata. Deleted/changed points
+            # are dropped from heavy input AND any optional hybrid fallback.
+            if any(
+                previous.get(field) != point.payload.get(field)
+                for field in _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS
+            ):
+                continue
+            eligible[point_id] = point
+        retained = [item for item in ranked if item.repo_id in eligible]
+        vectors = {repo_id: point.vector for repo_id, point in eligible.items()}
+        for repo_id, point in eligible.items():
+            metadata[repo_id] = point.payload
+        return retained, vectors
+
     def _collect_semantic(
         self, response: Any,
         cache: dict[tuple[str, bool], _EligibleRepositoryPoint | None] | None,
@@ -729,9 +818,10 @@ class QdrantV2Retriever:
         cache: dict[tuple[str, bool], _EligibleRepositoryPoint | None] | None = None,
         *,
         include_vectors: bool = True,
-        exclude_repo_ids: set[str] | None = None,
+        exclude_repo_ids: set[str | int] | None = None,
         minimum_candidates: int | None = None,
         budget: _CandidateReadBudget | None = None,
+        work: RetrievalWork | None = None,
     ) -> list[tuple[_EligibleRepositoryPoint, float]]:
         target = min(limit, self.max_candidates)
         minimum = min(
@@ -740,13 +830,13 @@ class QdrantV2Retriever:
         budget = budget or self._candidate_read_budget()
         excluded: set[str | int] = set(exclude_repo_ids or ())
         eligible: dict[str, tuple[_EligibleRepositoryPoint, float]] = {}
-        with RetrievalWork() as work:
+        with RetrievalWork() if work is None else nullcontext(work) as active_work:
             for _ in range(_MAX_RETRIEVAL_ROUNDS):
                 read_limit = budget.reserve(target - len(eligible))
                 if not read_limit:
                     break
                 try:
-                    response = work.result(work.submit(
+                    response = active_work.result(active_work.submit(
                         "semantic", self._fetch_semantic, vector, read_limit,
                         include_vectors=include_vectors, exclude_repo_ids=set(excluded),
                     ))
@@ -817,6 +907,95 @@ class QdrantV2Retriever:
             )))
         return futures
 
+    def _collect_discovery_channels(
+        self,
+        work: RetrievalWork,
+        futures: list[tuple[str, Future]],
+        cache: dict[tuple[str, bool], _EligibleRepositoryPoint | None] | None,
+        *,
+        include_vectors: bool,
+        requested_per_channel: int,
+        exclude_repo_ids: set[str | int] | None = None,
+        existing_repo_ids: set[str] | None = None,
+    ) -> tuple[list[list[tuple[_EligibleRepositoryPoint, str]]], int, bool, set[str | int]]:
+        channel_points: list[list[tuple[_EligibleRepositoryPoint, str]]] = []
+        successful_channels = 0
+        all_short = True
+        fresh_ids: set[str] = set(existing_repo_ids or ())
+        read_ids: set[str | int] = set()
+        excluded = exclude_repo_ids or set()
+        # Completion order must never affect candidate eligibility or fusion.
+        # Only this admitted request worker validates and publishes its pool.
+        for channel, future in futures:
+            read_succeeded = False
+            try:
+                records = work.result(future)
+            except CooperativeDeadlineExceeded:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "V2 discovery channel failed",
+                    extra={
+                        "retrieval_context": {
+                            "channel": channel,
+                            "error_type": type(exc).__name__,
+                        }
+                    },
+                )
+                records = []
+            else:
+                read_succeeded = True
+                successful_channels += 1
+                read_ids.update(_read_point_ids(records))
+                if len(records) >= requested_per_channel:
+                    all_short = False
+            eligible_points: list[tuple[_EligibleRepositoryPoint, str]] = []
+            for point in records[:self.max_candidates]:
+                candidate = self._eligible_repository_point(
+                    point, cache, require_vector=include_vectors,
+                )
+                if candidate is not None:
+                    eligible_points.append((candidate, _DISCOVERY_SOURCES[channel]))
+            fresh = {
+                point.repo_id for point, _source in eligible_points
+                if point.repo_id not in excluded and point.repo_id not in fresh_ids
+            }
+            fresh_ids.update(fresh)
+            if read_succeeded:
+                record_candidate_read(channel, records, len(fresh))
+            channel_points.append(eligible_points)
+
+        if successful_channels == 0:
+            raise RetrievalDependencyError(
+                "all bounded Qdrant discovery channels were unavailable"
+            )
+
+        return channel_points, successful_channels, all_short, read_ids
+
+    @staticmethod
+    def _merge_discovery_channels(
+        channel_points: list[list[tuple[_EligibleRepositoryPoint, str]]],
+        target: int,
+        exclude_repo_ids: set[str] | None = None,
+    ) -> list[tuple[_EligibleRepositoryPoint, str]]:
+        # Round-robin prevents one discovery signal from monopolizing the
+        # ranker pool before cross-channel deduplication.
+        combined: list[tuple[_EligibleRepositoryPoint, str]] = []
+        seen_repo_ids: set[str] = set()
+        excluded = exclude_repo_ids or set()
+        for index in range(max((len(points) for points in channel_points), default=0)):
+            for points in channel_points:
+                if index < len(points):
+                    point, source = points[index]
+                    repo_id = point.repo_id
+                    if repo_id in seen_repo_ids or repo_id in excluded:
+                        continue
+                    seen_repo_ids.add(repo_id)
+                    combined.append((point, source))
+                    if len(combined) >= target:
+                        return combined
+        return combined
+
     def _collect_discovery(
         self,
         work: RetrievalWork,
@@ -825,10 +1004,11 @@ class QdrantV2Retriever:
         cache: dict[tuple[str, bool], _EligibleRepositoryPoint | None] | None = None,
         *,
         include_vectors: bool = True,
-        exclude_repo_ids: set[str] | None = None,
+        exclude_repo_ids: set[str | int] | None = None,
         minimum_candidates: int | None = None,
         existing_repo_ids: set[str] | None = None,
         budget: _CandidateReadBudget | None = None,
+        max_rounds: int = _MAX_RETRIEVAL_ROUNDS,
     ) -> list[tuple[_EligibleRepositoryPoint, str]]:
         target = min(limit, self.max_candidates)
         minimum = min(
@@ -842,7 +1022,7 @@ class QdrantV2Retriever:
         read_limits: dict[str, int] = {}
         combined: dict[str, tuple[_EligibleRepositoryPoint, str]] = {}
         successful_channels = 0
-        for round_index in range(_MAX_RETRIEVAL_ROUNDS):
+        for round_index in range(max_rounds):
             channel_points: list[list[tuple[_EligibleRepositoryPoint, str]]] = []
             next_channels: list[str] = []
             round_records: list = []
@@ -895,7 +1075,7 @@ class QdrantV2Retriever:
                 len(existing | combined.keys()) >= minimum
                 or len(combined) >= target
                 or not next_channels
-                or round_index + 1 == _MAX_RETRIEVAL_ROUNDS
+                or round_index + 1 == max_rounds
             ):
                 break
             new_ids = _read_point_ids(round_records) - excluded
@@ -922,25 +1102,264 @@ class QdrantV2Retriever:
             )
         return list(combined.values())
 
+    def _discovery_revision(self) -> DiscoveryRevision | None:
+        check_deadline()
+        provider = self._discovery_revision_provider
+        if provider is None:
+            return None
+        try:
+            revision = provider()
+        except CooperativeDeadlineExceeded:
+            raise
+        except Exception:
+            return None  # A missing authority is a bypass, never a stale hit.
+        check_deadline()
+        return revision if isinstance(revision, DiscoveryRevision) else None
+
+    def _prepare_discovery(
+        self, work: RetrievalWork, plan: _DiscoveryPlan, limit: int, *,
+        include_vectors: bool, exclude_repo_ids: set[str] | None,
+    ) -> None:
+        plan.budget = plan.budget or self._candidate_read_budget()
+        revision = None if include_vectors else self._discovery_revision()
+        if revision is not None:
+            per_channel = min(self.max_candidates, max(
+                25, math.ceil((min(limit, self.max_candidates) * 2) / len(_DISCOVERY_SOURCES)),
+            ))
+            # Exclusions, profiles, social context, users and generation seeds
+            # are deliberately absent. Cache scope is one retriever/client.
+            namespace = (
+                self._discovery_cache_scope, self.repository_collection, QDRANT_VECTOR_NAME,
+                revision.corpus, revision.eligibility,
+                REPOSITORY_SERVING_ELIGIBILITY_FIELD, REPOSITORY_SERVING_ELIGIBILITY_VERSION,
+                self.required_content_version, self.embedding_dim, self.embedding_model,
+                self.embedding_model_revision, self.allow_missing_embedding_revision,
+                tuple(sorted(self.compatible_embedding_versions)),
+                self.required_feature_spec_version, self.hybrid_model_version,
+                tuple((channel, REPOSITORY_DISCOVERY_CHANNELS[channel])
+                      for channel in _DISCOVERY_SOURCES),
+                per_channel,
+            )
+            plan.lease = self._discovery_cache.reserve(namespace)
+            plan.revision = revision
+            if plan.lease is not None and not plan.lease.owner:
+                return
+        plan.futures = self._start_discovery(
+            work, limit, include_vectors=include_vectors,
+            exclude_repo_ids=None if plan.lease is not None else exclude_repo_ids,
+            budget=plan.budget,
+        )
+
+    def _release_discovery(self, plan: _DiscoveryPlan) -> None:
+        # Called outside RetrievalWork, after its actual child-worker drain.
+        if plan.lease is not None:
+            self._discovery_cache.fail(plan.lease)
+            self._discovery_cache.release(plan.lease)
+
+    def _encode_discovery_pool(
+        self, channels: list[list[tuple[_EligibleRepositoryPoint, str]]], *,
+        all_short: bool,
+    ) -> bytes:
+        rows: list[list[list[Any]]] = []
+        for channel in channels:
+            encoded_channel: list[list[Any]] = []
+            for point, _source in channel:
+                payload: dict[str, Any] = {}
+                for name in _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS:
+                    if name not in point.payload:
+                        continue
+                    value = point.payload[name]
+                    # The public retrieval projection is scalar. Refuse odd or
+                    # enormous optional payloads rather than retaining them.
+                    if not isinstance(value, (str, int, float, bool, type(None))):
+                        raise ValueError("non-scalar discovery payload is not cacheable")
+                    if isinstance(value, str) and len(value) > 4096:
+                        raise ValueError("discovery payload field is too large")
+                    payload[name] = value
+                encoded_channel.append([point.repo_id, payload])
+            rows.append(encoded_channel)
+        chunks: list[bytes] = []
+        size = 0
+        encoder = json.JSONEncoder(allow_nan=False, separators=(",", ":"))
+        for chunk in encoder.iterencode({"channels": rows, "all_short": all_short}):
+            encoded = chunk.encode()
+            size += len(encoded)
+            if size > self._discovery_cache.max_bytes:
+                raise ValueError("discovery pool exceeds its byte bound")
+            chunks.append(encoded)
+        return b"".join(chunks)
+
+    def _checked_discovery_pool_current(
+        self, plan: _DiscoveryPlan, *, cached_pool: bool,
+    ) -> bool:
+        # Refill I/O may outlive the authority snapshot or the original TTL.
+        # Reusing a checked pool must never silently renew either guarantee.
+        if self._discovery_revision() != plan.revision:
+            return False
+        if plan.lease is None or not self._discovery_cache.lease_fresh(plan.lease):
+            return False
+        if cached_pool:
+            try:
+                self._discovery_cache.result(plan.lease)
+            except CooperativeDeadlineExceeded:
+                raise
+            except Exception:
+                return False
+        return True
+
+    def _complete_discovery(
+        self, work: RetrievalWork, plan: _DiscoveryPlan, limit: int,
+        cache: dict[tuple[str, bool], _EligibleRepositoryPoint | None] | None, *,
+        include_vectors: bool, exclude_repo_ids: set[str] | None,
+        minimum_candidates: int | None = None,
+        existing_repo_ids: set[str] | None = None,
+    ) -> list[tuple[_EligibleRepositoryPoint, str]]:
+        target = min(limit, self.max_candidates)
+        minimum = min(target, minimum_candidates if minimum_candidates is not None else target)
+        existing = set(existing_repo_ids or ())
+        budget = plan.budget or self._candidate_read_budget()
+        lease = plan.lease
+        if lease is None:
+            return self._collect_discovery(
+                work, plan.futures, limit, cache, include_vectors=include_vectors,
+                exclude_repo_ids=exclude_repo_ids,
+                minimum_candidates=minimum, existing_repo_ids=existing, budget=budget,
+            )
+        partial: list[tuple[_EligibleRepositoryPoint, str]] | None = None
+        partial_is_cached = False
+        try:
+            if lease.owner:
+                per_channel = min(self.max_candidates, max(25, math.ceil(target / 2)))
+                channels, succeeded, all_short, plan.read_ids = self._collect_discovery_channels(
+                    work, plan.futures, None, include_vectors=False,
+                    requested_per_channel=per_channel,
+                    exclude_repo_ids=exclude_repo_ids,
+                    existing_repo_ids=existing,
+                )
+                if succeeded != len(_DISCOVERY_SOURCES):
+                    self._discovery_cache.fail(lease)
+                    partial = self._merge_discovery_channels(
+                        channels, min(limit, self.max_candidates), exclude_repo_ids,
+                    )
+                    if len(existing | {point.repo_id for point, _ in partial}) >= minimum:
+                        return partial
+                    raise RuntimeError("partial discovery refresh is not cacheable")
+                # Explicit public projection only: no raw point payload or
+                # per-request eligibility cache enters shared storage.
+                data = self._encode_discovery_pool(channels, all_short=all_short)
+            else:
+                data = self._discovery_cache.result(lease)
+            # A refresh or a hit cannot cross a corpus/eligibility transition.
+            # Authorities must use monotonic/non-reused tokens (no ABA).
+            if self._discovery_revision() != plan.revision:
+                raise RuntimeError("discovery revision changed during lookup")
+            if lease.owner:
+                self._discovery_cache.publish(lease, data)
+                data = self._discovery_cache.result(lease)
+            decoded = json.loads(data)
+            local_channels: list[list[tuple[_EligibleRepositoryPoint, str]]] = []
+            for channel, rows in zip(_DISCOVERY_SOURCES, decoded["channels"]):
+                local_points: list[tuple[_EligibleRepositoryPoint, str]] = []
+                for repo_id, payload in rows:
+                    point = self._eligible_repository_point(
+                        SimpleNamespace(id=repo_id, payload=payload, vector=None),
+                        require_vector=False,
+                    )
+                    if point is not None:
+                        local_points.append((point, _DISCOVERY_SOURCES[channel]))
+                local_channels.append(local_points)
+            result = self._merge_discovery_channels(
+                local_channels, min(limit, self.max_candidates), exclude_repo_ids,
+            )
+            if (
+                len(existing | {point.repo_id for point, _ in result}) >= minimum
+                or (not exclude_repo_ids and decoded["all_short"])
+            ):
+                return result
+            # Preserve this already-checked pool across refill. It is still a
+            # historical snapshot, not a newly refreshed result; recheck its
+            # authority and original TTL immediately before any later reuse.
+            partial = result
+            partial_is_cached = True
+            # Refill is per-request, server-filtered BEFORE channel limits and
+            # never written back into the shared unfiltered pool.
+        except CooperativeDeadlineExceeded:
+            raise
+        except RetrievalDependencyError:
+            # Every channel already settled. Do not repeat a wholly failed
+            # owner's refresh; semantic fallback may still serve this request.
+            self._discovery_cache.fail(lease)
+            raise
+        except Exception:
+            if lease.owner:
+                # Do not clear a flight while any admitted refresh I/O runs.
+                for _channel, future in plan.futures:
+                    try:
+                        future.result()
+                    except BaseException:
+                        pass
+                self._discovery_cache.fail(lease)
+        refill_exclusions: set[str | int] = set(exclude_repo_ids or ()) | plan.read_ids
+        futures = self._start_discovery(
+            work, limit, include_vectors=include_vectors, exclude_repo_ids=refill_exclusions,
+            budget=budget,
+        )
+        try:
+            refill = self._collect_discovery(
+                work, futures, limit, cache, include_vectors=include_vectors,
+                exclude_repo_ids=refill_exclusions,
+                minimum_candidates=minimum,
+                existing_repo_ids=existing | {point.repo_id for point, _ in (partial or [])},
+                budget=budget,
+                max_rounds=2 if lease.owner else _MAX_RETRIEVAL_ROUNDS,
+            )
+        except RetrievalDependencyError:
+            if partial and self._checked_discovery_pool_current(
+                plan, cached_pool=partial_is_cached,
+            ):
+                return partial  # Still-valid checked points, not fabricated fresh data.
+            raise
+        combined = self._merge_discovery_channels(
+            [partial or [], refill], min(limit, self.max_candidates), exclude_repo_ids,
+        )
+        if partial and self._checked_discovery_pool_current(
+            plan, cached_pool=partial_is_cached,
+        ):
+            return combined
+        return refill
+
+    def discovery_cache_status(self) -> dict[str, Any]:
+        return {
+            "revision_provider_configured": self._discovery_revision_provider is not None,
+            **self._discovery_cache.snapshot(),
+        }
+
     def _discovery(
-        self, limit: int,
+        self,
+        limit: int,
         cache: dict[tuple[str, bool], _EligibleRepositoryPoint | None] | None = None,
-        *, include_vectors: bool = True, exclude_repo_ids: set[str] | None = None,
+        *,
+        include_vectors: bool = True,
+        exclude_repo_ids: set[str] | None = None,
         minimum_candidates: int | None = None,
         existing_repo_ids: set[str] | None = None,
         budget: _CandidateReadBudget | None = None,
     ) -> list[tuple[_EligibleRepositoryPoint, str]]:
-        budget = budget or self._candidate_read_budget()
-        with RetrievalWork() as work:
-            futures = self._start_discovery(
-                work, limit, include_vectors=include_vectors,
-                exclude_repo_ids=exclude_repo_ids, budget=budget,
-            )
-            return self._collect_discovery(
-                work, futures, limit, cache, include_vectors=include_vectors,
-                exclude_repo_ids=exclude_repo_ids, minimum_candidates=minimum_candidates,
-                existing_repo_ids=existing_repo_ids, budget=budget,
-            )
+        plan = _DiscoveryPlan(budget=budget)
+        try:
+            with RetrievalWork() as work:
+                self._prepare_discovery(
+                    work, plan, limit, include_vectors=include_vectors,
+                    exclude_repo_ids=exclude_repo_ids,
+                )
+                return self._complete_discovery(
+                    work, plan, limit, cache, include_vectors=include_vectors,
+                    exclude_repo_ids=exclude_repo_ids,
+                    minimum_candidates=minimum_candidates,
+                    existing_repo_ids=existing_repo_ids,
+                )
+        finally:
+            self._release_discovery(plan)
 
     @staticmethod
     def _number(value: Any, *, default: float = 0.0) -> float:
@@ -1181,74 +1600,77 @@ class QdrantV2Retriever:
         ] = {}
         budget = self._candidate_read_budget()
         heavy_selected = self._heavy_ranker_selected(user_id)
-        with RetrievalWork() as work:
-            profile_future = work.submit("profile", self._fetch_user_profile, user_id)
-            discovery_futures = self._start_discovery(
-                work, max(limit * 8, 200),
-                # We cannot know profile validity yet. Fetch the heavy projection
-                # speculatively, but preserve post-profile vector eligibility.
-                include_vectors=bool(heavy_selected and self.ranker is not None),
-                exclude_repo_ids=excluded, budget=budget,
-            )
-            user_vector, user_profile = self._profile_from_points(
-                user_id, work.result(profile_future),
-            )
-            if self.heavy_ranker_required and not heavy_selected:
-                raise RetrievalDependencyError(
-                    "the required V2 heavy ranker was not selected"
+        discovery_plan = _DiscoveryPlan(budget=budget)
+        try:
+            with RetrievalWork() as work:
+                profile_future = work.submit("profile", self._fetch_user_profile, user_id)
+                self._prepare_discovery(
+                    work, discovery_plan, max(limit * 8, 200),
+                    # Payload-first retrieval avoids transferring overlapping or
+                    # ultimately dropped repository vectors on every channel.
+                    include_vectors=False,
+                    exclude_repo_ids=excluded,
                 )
-            include_candidate_vectors = bool(
-                heavy_selected and self.ranker is not None and user_vector is not None
-            )
-            retrieval_mode = (
-                "cold_start_profile"
-                if cold_start and user_vector is not None
-                else "cold_start_discovery"
-                if cold_start
-                else "personalized"
-                if user_vector is not None
-                else "profile_missing_discovery"
-            )
-            if user_vector:
-                try:
-                    semantic = self._semantic(
-                        user_vector, max(limit * 5, 100), eligibility_cache,
-                        include_vectors=include_candidate_vectors,
-                        exclude_repo_ids=excluded, minimum_candidates=limit,
-                        budget=budget,
+                user_vector, user_profile = self._profile_from_points(
+                    user_id, work.result(profile_future),
+                )
+                if self.heavy_ranker_required and not heavy_selected:
+                    raise RetrievalDependencyError(
+                        "the required V2 heavy ranker was not selected"
                     )
-                except CooperativeDeadlineExceeded:
-                    raise
-                except Exception as exc:
-                    logger.error(
-                        "V2 semantic retrieval failed; continuing with discovery",
-                        extra={
-                            "retrieval_context": {
-                                "channel": "semantic",
-                                "error_type": type(exc).__name__,
-                            }
-                        },
-                    )
-                    semantic = []
-                for point, score in semantic:
-                    repo_id = point.repo_id
-                    if repo_id not in excluded and math.isfinite(score):
-                        candidates[repo_id] = RankedRepository(repo_id, score, "semantic")
-                        metadata[repo_id] = point.payload
-                        vectors[repo_id] = point.vector
+                include_candidate_vectors = bool(
+                    heavy_selected and self.ranker is not None and user_vector is not None
+                )
+                retrieval_mode = (
+                    "cold_start_profile"
+                    if cold_start and user_vector is not None
+                    else "cold_start_discovery"
+                    if cold_start
+                    else "personalized"
+                    if user_vector is not None
+                    else "profile_missing_discovery"
+                )
+                if user_vector:
+                    try:
+                        semantic = self._semantic(
+                            user_vector, max(limit * 5, 100), eligibility_cache,
+                            include_vectors=False, exclude_repo_ids=excluded,
+                            minimum_candidates=limit, budget=budget,
+                            work=work,
+                        )
+                    except CooperativeDeadlineExceeded:
+                        raise
+                    except Exception as exc:
+                        logger.error(
+                            "V2 semantic retrieval failed; continuing with discovery",
+                            extra={
+                                "retrieval_context": {
+                                    "channel": "semantic",
+                                    "error_type": type(exc).__name__,
+                                }
+                            },
+                        )
+                        semantic = []
+                    for point, score in semantic:
+                        repo_id = point.repo_id
+                        if repo_id not in excluded and math.isfinite(score):
+                            candidates[repo_id] = RankedRepository(repo_id, score, "semantic")
+                            metadata[repo_id] = point.payload
+                            vectors[repo_id] = point.vector
 
-            discovery: list[tuple[str, float, str, dict[str, Any], list[float] | None]] = []
-            try:
-                discovery_points = self._collect_discovery(
-                    work, discovery_futures, max(limit * 8, 200), eligibility_cache,
-                    include_vectors=include_candidate_vectors,
-                    exclude_repo_ids=excluded, minimum_candidates=limit,
-                    existing_repo_ids=set(candidates), budget=budget,
-                )
-            except RetrievalDependencyError:
-                if not candidates:
-                    raise
-                discovery_points = []
+                discovery: list[tuple[str, float, str, dict[str, Any], list[float] | None]] = []
+                try:
+                    discovery_points = self._complete_discovery(
+                        work, discovery_plan, max(limit * 8, 200), eligibility_cache,
+                        include_vectors=False, exclude_repo_ids=excluded,
+                        minimum_candidates=limit, existing_repo_ids=set(candidates),
+                    )
+                except RetrievalDependencyError:
+                    if not candidates:
+                        raise
+                    discovery_points = []
+        finally:
+            self._release_discovery(discovery_plan)
         for point, channel_source in discovery_points:
             repo_id = point.repo_id
             if repo_id in excluded:
@@ -1290,7 +1712,23 @@ class QdrantV2Retriever:
         heavy_ranked: list[RankedRepository] | None = None
         fallback_code: str | None = None
         fallback_reason: str | None = None
-        if heavy_selected:
+        if include_candidate_vectors:
+            try:
+                hybrid_ranked, vectors = self._hydrate_retained_candidates(
+                    hybrid_ranked, metadata,
+                )
+            except CooperativeDeadlineExceeded:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "V2 retained vector retrieval failed",
+                    extra={"retrieval_context": {
+                        "channel": "vectors", "error_type": type(exc).__name__,
+                    }},
+                )
+                fallback_code = "CANDIDATE_VECTORS_UNAVAILABLE"
+                fallback_reason = _FALLBACK_MESSAGES[fallback_code]
+        if heavy_selected and fallback_code is None:
             heavy_ranked, fallback_code, fallback_reason = self._heavy_rank(
                 user_vector=user_vector,
                 user_profile=user_profile,
