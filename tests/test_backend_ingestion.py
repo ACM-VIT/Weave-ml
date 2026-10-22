@@ -9,6 +9,7 @@ import uuid
 
 import pytest
 
+from acquisition.models import AcquisitionFailure, AcquisitionRunResult
 from acquisition import backend_client
 from acquisition.backend_client import BackendIngestionClient, repository_upsert_record
 from trending.backend_storage import BackendTrendingStorage
@@ -323,9 +324,8 @@ def test_backend_empty_delivery_does_not_publish_an_empty_batch():
 
 def test_trending_snapshot_is_enriched_and_published_atomically():
     backend = SimpleNamespace(publish_trending_snapshot=lambda payload: captured.append(payload))
-    storage = BackendTrendingStorage.__new__(BackendTrendingStorage)
-    storage.backend = backend
-    storage.enricher = SimpleNamespace(get_repositories_batch=lambda _repos: [_source()])
+    storage = BackendTrendingStorage(backend=backend, github_token="fixture-token")
+    storage._enrich_candidates = lambda _repos: AcquisitionRunResult(repositories=[_source()])
     storage._last_refresh = None
     captured = []
 
@@ -346,10 +346,9 @@ def test_trending_snapshot_preserves_the_complete_canonical_readme():
     backend = SimpleNamespace(
         publish_trending_snapshot=lambda payload: captured.append(payload)
     )
-    storage = BackendTrendingStorage.__new__(BackendTrendingStorage)
-    storage.backend = backend
-    storage.enricher = SimpleNamespace(
-        get_repositories_batch=lambda _repos: [_source(readme=canonical_readme)]
+    storage = BackendTrendingStorage(backend=backend, github_token="fixture-token")
+    storage._enrich_candidates = lambda _repos: AcquisitionRunResult(
+        repositories=[_source(readme=canonical_readme)]
     )
     storage._last_refresh = None
 
@@ -365,12 +364,9 @@ def test_trending_snapshot_never_publishes_a_warning_result():
     backend = SimpleNamespace(
         publish_trending_snapshot=lambda payload: captured.append(payload)
     )
-    storage = BackendTrendingStorage.__new__(BackendTrendingStorage)
-    storage.backend = backend
-    storage.enricher = SimpleNamespace(
-        get_repositories_batch=lambda _repos: [
-            _source(warnings=["README fetch failed: TimeoutError"])
-        ]
+    storage = BackendTrendingStorage(backend=backend, github_token="fixture-token")
+    storage._enrich_candidates = lambda _repos: AcquisitionRunResult(
+        repositories=[_source(warnings=["README fetch failed: TimeoutError"])]
     )
     storage._last_refresh = None
 
@@ -394,9 +390,8 @@ def test_trending_snapshot_fails_atomically_when_full_readmes_exceed_transport()
         )
         for index in range(9)
     ]
-    storage = BackendTrendingStorage.__new__(BackendTrendingStorage)
-    storage.backend = backend
-    storage.enricher = SimpleNamespace(get_repositories_batch=lambda _repos: sources)
+    storage = BackendTrendingStorage(backend=backend, github_token="fixture-token")
+    storage._enrich_candidates = lambda _repos: AcquisitionRunResult(repositories=sources)
     storage._last_refresh = None
 
     with pytest.raises(ValueError, match="8 MiB"):
@@ -421,3 +416,31 @@ def test_trending_cli_rejects_retired_direct_qdrant_flags():
         parse_args(["--once", "--sync-qdrant"])
     with pytest.raises(SystemExit):
         parse_args(["--once", "--no-sync-qdrant"])
+
+
+def test_trending_retry_reuses_successes_and_restores_original_rank_order():
+    captured, calls = [], []
+    backend = SimpleNamespace(publish_trending_snapshot=captured.append)
+    storage = BackendTrendingStorage(backend=backend, github_token="fixture-token")
+    first = _source(full_name="owner/first", github_id="101")
+    second = _source(full_name="owner/second", github_id="102")
+    def enrich(candidates):
+        calls.append([candidate["full_name"] for candidate in candidates])
+        if len(calls) == 1:
+            return AcquisitionRunResult(repositories=[second], failures=[
+                AcquisitionFailure("owner/first", "readme_enrichment", "transient")
+            ])
+        return AcquisitionRunResult(repositories=[first])
+    storage._enrich_candidates = enrich
+    candidates = [{"full_name": "owner/first", "daily_stars": 9}, {"full_name": "owner/second", "daily_stars": 4}]
+    with pytest.raises(RuntimeError, match="incomplete trending snapshot"):
+        storage.upsert_repositories(candidates)
+    assert captured == []
+    assert storage.get_last_refresh_time() is None
+    assert storage.upsert_repositories(candidates) == 2
+    assert calls == [["owner/first", "owner/second"], ["owner/first"]]
+    assert [(r["full_name"], r["rank"], r["score"], r["description"]) for r in captured[0]["repositories"]] == [
+        ("owner/first", 1, 9.0, "demo"), ("owner/second", 2, 4.0, "demo")
+    ]
+    assert storage.last_enrichment_counts == {"fetched": 1, "reused": 1, "failed": 0, "fallback": 0}
+    assert storage._retry_records == {}
