@@ -417,7 +417,7 @@ def _validate_vector_and_model(v: _Validator) -> None:
             "QDRANT_COLLECTION_NAME",
             "must target the frozen strict-V2 repository corpus",
         )
-    v.number("QDRANT_TIMEOUT_SECONDS", minimum=0.1, maximum=120)
+    v.number("QDRANT_TIMEOUT_SECONDS", minimum=1, maximum=120)
     distance = v.raw("QDRANT_DISTANCE", required=True)
     if distance is not None and distance.casefold() != "cosine":
         v.issue("QDRANT_DISTANCE", "must be Cosine for the frozen V2 contract")

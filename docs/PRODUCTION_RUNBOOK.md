@@ -94,6 +94,26 @@ purpose and production rule.
 `SUPABASE_DATABASE_URL`, `GITHUB_TOKEN`, legacy `OPENROUTER_API_KEY`, and
 `GROQ_API_KEY` are rejected in the online env file.
 
+### Read-only budgets and runtime retirement
+
+`QDRANT_TIMEOUT_SECONDS` must be finite and between 1 and 120 seconds in
+both startup construction and production preflight. Fractional caps such as
+1.5 remain valid: online Qdrant RPCs receive the floor of the minimum of that
+cap and the remaining request budget, never a rounded-up timeout. A positive
+remaining budget below one second cannot start another integer-second RPC.
+This does not change the independent feedback-write timeout setting.
+
+The existing V2 cleanup plan first freezes submission and pool replacement,
+then waits for captured service, recommendation, and embedding workers to
+actually settle before capturing or closing lazy clients/providers and caches.
+Diagnostic retirement still owns its real worker; cleanup never joins the
+current health worker. Queued cancellation does not count as an actual worker
+exit. An uninterruptible worker keeps retirement draining, and a failed drain
+blocks client/cache cleanup and runtime reuse. Failed close actions retain
+their captured resources for retry; startup resumes admission only after the
+entire cleanup plan completes. No running durable apply or summary completion
+reserve is shortened by a read-only request budget or the admission freeze.
+
 ## Model cache and collection migration
 
 Before enabling these binaries against an existing persistent Qdrant cluster,

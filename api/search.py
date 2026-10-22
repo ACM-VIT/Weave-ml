@@ -8,6 +8,7 @@ from qdrant_client import models
 from api.contracts import RepositorySearchRequest
 from config import QDRANT_VECTOR_NAME
 from embedding.vector_contract import validate_embedding_vector
+from utils.deadline import check_deadline, qdrant_timeout
 from retrieval.v2_retriever import _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS
 
 
@@ -15,11 +16,13 @@ _COSINE_ROUNDOFF_TOLERANCE = 1e-6
 
 
 def search_repositories(request: RepositorySearchRequest, retriever: Any, embedder: Any) -> dict:
+    check_deadline()
     vector = validate_embedding_vector(
         embedder.embed_text(request.query),
         expected_size=retriever.embedding_dim,
         field_name="search query embedding",
     )
+    check_deadline()
     eligibility = retriever._eligible_filter()
     must = list(eligibility.must or [])
     # One current embedding version per search response. No mixed vector spaces.
@@ -36,6 +39,7 @@ def search_repositories(request: RepositorySearchRequest, retriever: Any, embedd
         collection_name=retriever.repository_collection,
         query=vector, using=QDRANT_VECTOR_NAME, query_filter=query_filter,
         limit=request.limit, with_payload=_REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS, with_vectors=False,
+        **qdrant_timeout(getattr(retriever, "qdrant_timeout_seconds", 10.0)),
     )
     unique: dict[str, float] = {}
     for point in response.points:

@@ -27,6 +27,8 @@ from scripts.user_onboarding import UserOnboardingPipeline
 from summarization.runtime import (
     card_summary_cleanup_actions, card_summary_pipeline, shutdown_card_summary_runtime,
 )
+from utils.deadline import check_deadline, remaining_seconds
+from utils.runtime_lifecycle import runtime_admission
 
 
 T = TypeVar("T")
@@ -158,10 +160,11 @@ class BoundedEmbeddingModel:
         with self._condition:
             self._waiting.append(ticket)
             try:
-                self._condition.wait_for(
-                    lambda: self._waiting[0] is ticket
-                    and self._active < self._max_concurrency
-                )
+                while self._waiting[0] is not ticket or self._active >= self._max_concurrency:
+                    # Preserve FIFO fairness while bounding queue waits. Polling
+                    # observes this job's cancellation without stealing a turn.
+                    self._condition.wait(timeout=remaining_seconds(0.05))
+                check_deadline()
             except BaseException:
                 self._waiting.remove(ticket)
                 self._condition.notify_all()
@@ -238,22 +241,24 @@ def user_onboarding_pipeline() -> UserOnboardingPipeline:
 
 @lru_cache(maxsize=1)
 def embedding_executor() -> ThreadPoolExecutor:
-    workers = _positive_int("EMBEDDING_EXECUTOR_WORKERS", 1, maximum=8)
-    return ThreadPoolExecutor(
-        max_workers=workers,
-        thread_name_prefix="ml-embedding",
-    )
+    with runtime_admission():
+        workers = _positive_int("EMBEDDING_EXECUTOR_WORKERS", 1, maximum=8)
+        return ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="ml-embedding",
+        )
 
 
 @lru_cache(maxsize=1)
 def onboarding_executor() -> ThreadPoolExecutor:
     # Separate pipeline execution, not separate model capacity. Each queue is
     # bounded by the same process-wide admission semaphore below.
-    workers = _positive_int("EMBEDDING_EXECUTOR_WORKERS", 1, maximum=8)
-    return ThreadPoolExecutor(
-        max_workers=workers,
-        thread_name_prefix="ml-onboarding",
-    )
+    with runtime_admission():
+        workers = _positive_int("EMBEDDING_EXECUTOR_WORKERS", 1, maximum=8)
+        return ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="ml-onboarding",
+        )
 
 
 @lru_cache(maxsize=1)
@@ -280,17 +285,17 @@ async def _run_embedding_job(
     *args: Any,
     **kwargs: Any,
 ) -> T:
-    admission = embedding_admission()
-    if not admission.acquire(blocking=False):
-        raise EmbeddingCapacityError(
-            "the bounded embedding executor is at capacity"
-        )
-    try:
-        future = executor_factory().submit(function, *args, **kwargs)
-    except BaseException:
-        admission.release()
-        raise
-
+    with runtime_admission():
+        admission = embedding_admission()
+        if not admission.acquire(blocking=False):
+            raise EmbeddingCapacityError(
+                "the bounded embedding executor is at capacity"
+            )
+        try:
+            future = executor_factory().submit(function, *args, **kwargs)
+        except BaseException:
+            admission.release()
+            raise
     # A cancelled HTTP request does not stop a function that is already running
     # in a ThreadPoolExecutor.  Tie admission to the worker future rather than
     # the awaiting coroutine so cancellation cannot free a slot prematurely and
@@ -333,6 +338,19 @@ def embedding_runtime_status() -> dict[str, Any]:
         ),
         "embedding_max_outstanding_jobs": embedding_max_outstanding_jobs(),
     }
+
+
+def embedding_runtime_drain_actions():
+    """Retain real executor completion before providers/model caches can close."""
+    actions = []
+    for name, factory in (("embedding", embedding_executor), ("onboarding", onboarding_executor)):
+        if factory.cache_info().currsize:
+            executor = factory()
+            actions.append((
+                f"{name}.executor.drain",
+                lambda executor=executor: executor.shutdown(wait=True, cancel_futures=True),
+            ))
+    return actions
 
 
 def embedding_runtime_cleanup_actions():

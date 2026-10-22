@@ -42,6 +42,7 @@ from inference.feed_assembly import FeedAssemblySystem
 from inference.feature_spec import FEATURE_ORDER
 from inference.ranker_service import RankerService
 from retrieval.config import TOTAL_CANDIDATE_POOL
+from utils.deadline import CooperativeDeadlineExceeded, check_deadline, qdrant_timeout
 from scripts.user_onboarding import TARGET_VECTOR_NAME, USER_PROFILES_COLLECTION
 
 logger = logging.getLogger("pipeline.v2_retrieval")
@@ -160,10 +161,13 @@ class QdrantV2Retriever:
         minimum_eligible_repositories: int | None = None,
         allow_unqualified_ranker: bool | None = None,
     ) -> None:
+        self.qdrant_timeout_seconds = self._float_env(
+            "QDRANT_TIMEOUT_SECONDS", default=10.0, minimum=1.0, maximum=120.0,
+        )
         self.client = client or QdrantClient(
             url=QDRANT_URL,
             api_key=QDRANT_API_KEY,
-            timeout=float(os.getenv("QDRANT_TIMEOUT_SECONDS", "10")),
+            timeout=self.qdrant_timeout_seconds,
         )
         self.repository_collection = repository_collection
         self.user_collection = user_collection
@@ -573,6 +577,7 @@ class QdrantV2Retriever:
             ids=[canonical],
             with_vectors=True,
             with_payload=_USER_RETRIEVAL_PAYLOAD_FIELDS,
+            **qdrant_timeout(self.qdrant_timeout_seconds),
         )
         if not points:
             return None, {}
@@ -642,6 +647,7 @@ class QdrantV2Retriever:
                 + (_HEAVY_RANKER_PAYLOAD_FIELDS if include_vectors else [])
             ),
             with_vectors=[QDRANT_VECTOR_NAME] if include_vectors else False,
+            **qdrant_timeout(self.qdrant_timeout_seconds),
         )
         eligible: list[tuple[_EligibleRepositoryPoint, float]] = []
         for point in response.points:
@@ -687,7 +693,10 @@ class QdrantV2Retriever:
                         + (_HEAVY_RANKER_PAYLOAD_FIELDS if include_vectors else [])
                     ),
                     with_vectors=[QDRANT_VECTOR_NAME] if include_vectors else False,
+                    **qdrant_timeout(self.qdrant_timeout_seconds),
                 )
+            except CooperativeDeadlineExceeded:
+                raise
             except Exception as exc:
                 logger.error(
                     "V2 discovery channel failed",
@@ -816,6 +825,7 @@ class QdrantV2Retriever:
             score_batch = getattr(self.ranker, "score_batch_compact", None)
             if not callable(score_batch):
                 score_batch = self.ranker.score_batch
+            check_deadline()
             results = score_batch(
                 user_vector,
                 self._profile_terms(user_profile),
@@ -847,6 +857,8 @@ class QdrantV2Retriever:
                 None,
                 None,
             )
+        except CooperativeDeadlineExceeded:
+            raise
         except Exception as exc:
             logger.error(
                 "V2 heavy ranking failed for one request",
@@ -960,6 +972,7 @@ class QdrantV2Retriever:
         cold_start: bool = False,
         social_repo_ids: list[str] | None = None,
     ) -> RecommendationBatch:
+        check_deadline()
         excluded = {str(uuid.UUID(item)) for item in exclude_repo_ids}
         candidates: dict[str, RankedRepository] = {}
         metadata: dict[str, dict[str, Any]] = {}
@@ -994,6 +1007,8 @@ class QdrantV2Retriever:
                     include_vectors=include_candidate_vectors,
                     exclude_repo_ids=excluded,
                 )
+            except CooperativeDeadlineExceeded:
+                raise
             except Exception as exc:
                 logger.error(
                     "V2 semantic retrieval failed; continuing with discovery",
@@ -1058,6 +1073,7 @@ class QdrantV2Retriever:
                 metadata[repo_id] = payload
                 vectors[repo_id] = vector or vectors.get(repo_id)
 
+        check_deadline()
         hybrid_ranked = sorted(
             candidates.values(), key=lambda item: (-item.score, item.repo_id)
         )[: self.max_candidates]
@@ -1109,6 +1125,7 @@ class QdrantV2Retriever:
             }
             for item in ranked
         ]
+        check_deadline()
         shaped = self.assembler.shape_batch(
             assembly_input,
             seen_repo_ids=excluded,
