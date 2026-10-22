@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from collections import Counter
+from dataclasses import dataclass
 from difflib import SequenceMatcher
+from itertools import chain
 import json
 import re
 from typing import Iterable
@@ -83,46 +86,76 @@ def _words(value: str) -> list[str]:
     return [match.group(0).casefold().replace("’", "'") for match in _WORD.finditer(value)]
 
 
-def _near_copy(summary: str, source: str) -> bool:
-    summary_words = _words(summary)
-    source_words = _words(source)
+@dataclass(frozen=True, slots=True)
+class SourceAnalysis:
+    """Complete source tokens and an eight-word index shared by all outputs."""
+
+    words: tuple[str, ...]
+    joined: str
+    eightgrams: frozenset[tuple[str, ...]]
+
+
+def analyze_comparison_texts(texts: Iterable[str]) -> tuple[SourceAnalysis, ...]:
+    sources = tuple(source for source in texts if source)
+    if any(len(source) > MAX_PREPROCESS_CHARS for source in sources):
+        raise SummaryValidationError(("source comparison exceeds the preprocessing bound",))
+    analyses = []
+    for source in dict.fromkeys(sources):
+        words = tuple(_words(source))
+        analyses.append(SourceAnalysis(
+            words, " " + " ".join(words) + " ",
+            frozenset(words[index:index + 8] for index in range(len(words) - 7)),
+        ))
+    return tuple(analyses)
+
+
+def _near_copy(summary: str, source: str | SourceAnalysis) -> bool:
+    if isinstance(source, str):
+        if not source:
+            return False
+        analysis = analyze_comparison_texts((source,))[0]
+    else:
+        analysis = source
+    return _near_copy_words(tuple(_words(summary)), analysis)
+
+
+def _near_copy_words(summary_words: tuple[str, ...], source: SourceAnalysis) -> bool:
+    source_words = source.words
     joined_summary = " ".join(summary_words)
-    joined_source = " ".join(source_words)
-    if len(joined_summary) >= 80 and joined_summary in joined_source:
+    if len(joined_summary) >= 80 and joined_summary in source.joined:
         return True
     if len(summary_words) < 8 or len(source_words) < 8:
         return False
 
     contiguous = min(12, len(summary_words))
-    if contiguous >= 8:
-        summary_ngrams = {
-            tuple(summary_words[index : index + contiguous])
-            for index in range(len(summary_words) - contiguous + 1)
-        }
-        if any(
-            tuple(source_words[index : index + contiguous]) in summary_ngrams
-            for index in range(len(source_words) - contiguous + 1)
+    for index in range(len(summary_words) - contiguous + 1):
+        if summary_words[index:index + 8] in source.eightgrams and (
+            contiguous == 8
+            or " " + " ".join(summary_words[index:index + contiguous]) + " " in source.joined
         ):
             return True
 
     window_size = len(summary_words)
+    summary_counts = Counter(summary_words)
     if len(source_words) < window_size:
+        overlap = sum((summary_counts & Counter(source_words)).values())
+        if 200 * overlap < 84 * (window_size + len(source_words)):
+            return False
         return SequenceMatcher(None, summary_words, source_words, autojunk=False).ratio() >= 0.84
     step = max(1, window_size // 4)
     last_start = len(source_words) - window_size
-    starts = list(range(0, last_start + 1, step))
-    if not starts or starts[-1] != last_start:
-        starts.append(last_start)
-    return any(
-        SequenceMatcher(
-            None,
-            summary_words,
-            source_words[start : start + window_size],
-            autojunk=False,
-        ).ratio()
-        >= 0.84
-        for start in starts
-    )
+    starts = range(0, last_start + 1, step)
+    # Preserve every original window, including the off-grid tail. The multiset
+    # intersection is an upper bound on matching tokens, so it cannot discard a
+    # window whose SequenceMatcher ratio reaches the existing 0.84 threshold.
+    for start in chain(starts, () if last_start % step == 0 else (last_start,)):
+        window = source_words[start:start + window_size]
+        overlap = sum((summary_counts & Counter(window)).values())
+        if 100 * overlap < 84 * window_size:
+            continue
+        if SequenceMatcher(None, summary_words, window, autojunk=False).ratio() >= 0.84:
+            return True
+    return False
 
 
 def _contains_inline_formatting(value: str) -> bool:
@@ -186,15 +219,14 @@ def _unsafe_text(value: str) -> list[str]:
 def validate_generated_summary(
     content: CardSummaryContent,
     *,
-    comparison_texts: Iterable[str],
+    comparison_texts: Iterable[str] = (),
+    source_analysis: tuple[SourceAnalysis, ...] | None = None,
 ) -> CardSummaryContent:
     """Return normalized safe content or raise deterministic validation errors."""
 
-    sources = tuple(source for source in comparison_texts if source)
-    if any(len(source) > MAX_PREPROCESS_CHARS for source in sources):
-        # The source builder fails closed at this bound. Keep direct validation
-        # callers equally strict instead of silently omitting a source suffix.
-        raise SummaryValidationError(("source comparison exceeds the preprocessing bound",))
+    # Internal callers pass complete precomputed analysis across highlights and
+    # repairs; direct callers retain the same fail-closed input bound.
+    sources = source_analysis if source_analysis is not None else analyze_comparison_texts(comparison_texts)
     reasons = _unsafe_text(content.summary)
     normalized = normalize_summary(content.summary)
     if len(normalized) > CARD_SUMMARY_MAX_CHARS:
@@ -209,10 +241,12 @@ def validate_generated_summary(
         reasons.extend(_unsafe_text(highlight))
         normalized_highlight = normalize_summary(highlight)
         normalized_highlights.append(normalized_highlight)
-        if any(_near_copy(normalized_highlight, source) for source in sources):
+        highlight_words = tuple(_words(normalized_highlight))
+        if any(_near_copy_words(highlight_words, source) for source in sources):
             reasons.append("highlight copies a long contiguous source passage")
 
-    if any(_near_copy(normalized, source) for source in sources):
+    summary_words = tuple(_words(normalized))
+    if any(_near_copy_words(summary_words, source) for source in sources):
         reasons.append("summary copies a long contiguous source passage")
     if reasons:
         raise SummaryValidationError(reasons)

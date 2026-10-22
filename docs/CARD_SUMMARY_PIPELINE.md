@@ -40,13 +40,14 @@ This pipeline keeps three artifacts separate:
 ```
 
 The artifact is written into the repository's Qdrant payload in the same CAS as
-new content. Duplicate/current deliveries replay that durable artifact. If a
+new content. Duplicate/current deliveries replay that durable artifact only when
+its internal source/version provenance matches. If a
 same-content legacy point has no current artifact, a summary-only CAS backfills
 it without replacing its vector or independently refreshed feature state.
-The fallback has a distinct deterministic model identity and is considered
-current only while no provider is configured. When a provider is enabled, a
-later delivery or summary-backfill retries generation and can activate the
-provider-backed tuple without pretending the fallback came from that model.
+The fallback has a distinct deterministic model identity and stays safe to
+replay during provider outages. A later current-content delivery or explicit
+summary-backfill can retry generation when a provider and deadline budget are
+available. Exact duplicate jobs retain their durable response.
 
 ## Historical comparison
 
@@ -85,7 +86,7 @@ npm run reindex:ml -- --summary-backfill --campaign=phase3-card-summary-v1 --exe
 Do not run this command against production as part of Phase 3.
 
 Processing unchanged content is idempotent: the ML endpoint replays an existing
-generated artifact with matching prompt/model/format versions, while the backend
+generated artifact with matching source/model/prompt/format/validation versions, while the backend
 persists and activates it before completing the outbox delivery. A
 `description_fallback` remains eligible for a later provider-backed backfill.
 
@@ -124,15 +125,62 @@ budget; it must take the normal regeneration/fallback path. Existing generated
 replay still performs safety/copy revalidation even if no provider is enabled.
 Durable fallback replay does not parse the README.
 
-These are structural bounds, not measured speedup claims. Preprocessing CPU,
-allocation scaling, golden/adversarial execution, and the limit-exceeded fallback
-still require the deferred application-wide validation; they were not executed
-as part of this implementation-only change.
+## Reusable validation and artifacts
+
+Each pipeline owns an LRU capped at 32 entries and 16 MiB of accounted retained
+Python objects, including tokens, ngram tuples/sets, prompt evidence and artifacts.
+Entries larger than the byte limit are not retained. No reuse crosses processes;
+normal runtime cleanup releases the pipeline and its cache. The separate flight
+map admits at most 32 distinct generation jobs. Saturation uses the same safe
+metadata fallback. Duplicate callers share active work without new provider calls;
+a wait ends before the caller's completion reserve or after one configured
+request timeout when no deadline was supplied. Wait expiry does not cancel the
+owner. Exceptions always release the flight slot.
+
+A SHA-256 key covers exact bounded source fields (including full evidence beyond
+the prompt and object README variants), repository identity/content hash, model,
+provider endpoint, prompt, format, input/output settings, source-analysis version
+and validation version. Oversized/unsupported key inputs bypass reuse. Bump
+`SOURCE_ANALYSIS_VERSION` or `SUMMARY_VALIDATION_VERSION` in
+`summarization/reuse.py` whenever the corresponding policy changes.
+
+Complete comparison variants are tokenized once and retain an eight-word index.
+Highlights, the summary and a repair all share that immutable analysis. Every
+original SequenceMatcher window, including the final off-grid window, remains
+eligible. A multiset token-intersection bound skips only windows that cannot
+reach the unchanged 0.84 ratio. No source suffix or excluded section is omitted.
+
+Only successful generated artifacts are retained; callers receive independent
+copies. Transient fallbacks share an active flight but are not saved as generated
+cache results, so the next call can regenerate. Qdrant additionally persists
+`card_summary_reuse_key`, covered by the existing artifact fingerprint/CAS. This
+internal provenance is absent from the public backend artifact JSON. A restarted
+pipeline rechecks both the key and safety against complete evidence. A legacy
+generated artifact without provenance takes summary-only regeneration/backfill;
+fallback replay remains independent of README parsing. API replay uses the same
+derived paragraph projection as generation and computes it once per job.
+
+Run the network-free local profile with:
+
+```bash
+python3 -m scripts.profile_summary_reuse --baseline-ref 1e11fd507133f15ceea4f34d91701f0ebf587e11 --repeats 20
+```
+
+On local Python 3.14, a 62,061-character synthetic README took 0.234 CPU seconds
+for 20 original validations versus 0.063 seconds using prepared analysis (3.7x).
+Preparing analysis 20 times separately took 0.050 seconds. Twenty unchanged
+inputs made one stub-provider call and 19 artifact hits (95%); twenty changed
+inputs made 20 calls and no artifact hits. With the profile's four-entry limit,
+unchanged inputs retained about 0.6 MiB of accounted objects and changed inputs
+retained about 2.4 MiB. Tracemalloc peak allocations were about 1.4 and 3.8 MiB,
+respectively. These are local synthetic measurements, not production throughput
+or provider latency claims; the script reports CPU, calls, hits and memory anew.
 
 ## Timeout budget
 
-With the production bounds, one provider generation can use three attempts at
-up to 30 seconds each plus one- and two-second backoffs. One invalid-output
+The existing default provider timeout remains five seconds and the shared job
+deadline reserves ten seconds for completion. At the configurable upper bound,
+one provider generation can use three attempts at up to 30 seconds each plus one- and two-second backoffs. One invalid-output
 repair may repeat that budget, for a conservative worst case of about 186
 seconds plus local request waits capped at two seconds. A longer local rate-limit
 wait or provider `Retry-After` fails to the safe description artifact instead of

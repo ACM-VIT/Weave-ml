@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from concurrent.futures import TimeoutError
+from dataclasses import replace
+import hashlib
+import json
 import re
 import time
 from typing import Any
@@ -16,7 +20,9 @@ from .contracts import (
     CARD_SUMMARY_PROMPT_VERSION,
     CardSummaryArtifact,
 )
-from .provider import SummaryProvider, SummaryProviderError
+from .provider import SUMMARY_COMPLETION_RESERVE_SECONDS, SummaryProvider, SummaryProviderError
+from . import reuse
+from .reuse import SummaryReuseCache, SummaryWork, source_identity
 from .settings import SummarySettings
 from .source import build_summary_source
 from .sentences import (
@@ -26,6 +32,7 @@ from .sentences import (
     split_summary_sentences,
 )
 from .validation import (
+    analyze_comparison_texts,
     _LICENSE_BOILERPLATE,
     _unsafe_text,
     SummaryValidationError,
@@ -165,9 +172,11 @@ class CardSummaryPipeline:
         *,
         settings: SummarySettings | None = None,
         provider: SummaryProvider | None = None,
+        reuse_cache: SummaryReuseCache | None = None,
     ) -> None:
         self.settings = settings or SummarySettings()
         self.provider = provider
+        self.reuse_cache = reuse_cache or SummaryReuseCache()
 
     def is_current(self, artifact: CardSummaryArtifact, *, repo: Mapping[str, Any] | None = None) -> bool:
         if (
@@ -184,7 +193,11 @@ class CardSummaryPipeline:
         if artifact.source == "generated":
             if artifact.model_version != self.settings.model_id:
                 return False
-            material = build_summary_source(repo, repo, max_chars=self.settings.input_max_chars) if repo is not None else None
+            key = self._reuse_key(repo, repo) if repo is not None else None
+            if repo is not None and (key is None or artifact._reuse_key != key.hex()):
+                return False
+            work = self._analysis(repo, repo, key) if repo is not None else None
+            material = work.material if work is not None else None
             if material is not None and material.analysis_limit is not None:
                 # Do not replay generated content against only a prefix of its
                 # source. A later attempt can still persist the safe fallback.
@@ -192,7 +205,7 @@ class CardSummaryPipeline:
             try:
                 validate_generated_summary(
                     artifact,
-                    comparison_texts=material.comparison_texts if material is not None else (),
+                    source_analysis=work.analysis if work is not None else (),
                 )
             except SummaryValidationError:
                 return False
@@ -203,34 +216,85 @@ class CardSummaryPipeline:
         """Keep durable fallback replay independent from provider availability."""
         return artifact.source == "description_fallback" and self.provider is not None
 
+    def _reuse_key(self, source: Any, repo: Mapping[str, Any]) -> bytes | None:
+        identity = source_identity(source, repo)
+        if identity is None:
+            return None
+        versions = (
+            self.settings.provider, self.settings.api_url, self.settings.model_id,
+            self.settings.prompt_version, self.settings.format_version,
+            reuse.SUMMARY_VALIDATION_VERSION, reuse.SOURCE_ANALYSIS_VERSION,
+            self.settings.input_max_chars, self.settings.temperature,
+            self.settings.max_output_tokens,
+        )
+        return hashlib.sha256(identity + json.dumps(versions).encode("utf-8")).digest()
+
+    def _analysis(self, source: Any, repo: Mapping[str, Any], key: bytes | None) -> SummaryWork:
+        work = self.reuse_cache.get(key)
+        if work is None:
+            material = build_summary_source(source, repo, max_chars=self.settings.input_max_chars)
+            work = SummaryWork(material, analyze_comparison_texts(material.comparison_texts))
+            self.reuse_cache.put(key, work)
+        return work
+
+    def _fallback(self, repo: Mapping[str, Any]) -> CardSummaryArtifact:
+        return description_fallback_artifact(
+            repo, prompt_version=self.settings.prompt_version,
+            format_version=self.settings.format_version,
+        )
+
     def summarize(self, source: Any, repo: Mapping[str, Any], *, deadline: float | None = None) -> CardSummaryArtifact:
         if self.provider is None:
-            # Provider-disabled jobs need no Markdown variants, parsing, or copy
-            # checks. Keep the exact same metadata-only fallback and identities.
-            return description_fallback_artifact(
-                repo,
-                prompt_version=self.settings.prompt_version,
-                format_version=self.settings.format_version,
+            return self._fallback(repo)
+        key = self._reuse_key(source, repo)
+        if key is None:
+            return self._generate(self._analysis(source, repo, None), repo, deadline)
+        future, leader = self.reuse_cache.start(key)
+        if future is None:
+            return self._fallback(repo)
+        if not leader:
+            # A wait must leave the same completion reserve as a provider call.
+            # Without a caller deadline, use one configured request timeout.
+            timeout = self.settings.request_timeout_seconds if deadline is None else max(
+                0.0, deadline - time.monotonic() - SUMMARY_COMPLETION_RESERVE_SECONDS,
             )
-        material = build_summary_source(
-            source,
-            repo,
-            max_chars=self.settings.input_max_chars,
-        )
+            try:
+                artifact = future.result(timeout=timeout)
+                return artifact.model_copy(deep=True)
+            except TimeoutError:
+                return self._fallback(repo)
+        try:
+            work = self._analysis(source, repo, key)
+            if work.artifact is not None:
+                self.reuse_cache.count("artifact_hits")
+                artifact = work.artifact.model_copy(deep=True)
+            else:
+                artifact = self._generate(work, repo, deadline)
+                if artifact.source == "generated":
+                    artifact._reuse_key = key.hex()
+                    self.reuse_cache.put(key, replace(work, artifact=artifact.model_copy(deep=True)))
+            self.reuse_cache.finish(key, future, artifact=artifact.model_copy(deep=True))
+            return artifact
+        except BaseException as exc:
+            self.reuse_cache.finish(key, future, error=exc)
+            raise
+
+    def _generate(self, work: SummaryWork, repo: Mapping[str, Any], deadline: float | None) -> CardSummaryArtifact:
+        material = work.material
         if material.analysis_limit is None and material.prompt_input:
             repair_feedback: str | None = None
             for _attempt in range(2):
                 if deadline is not None and time.monotonic() > deadline:
                     break
                 try:
+                    self.reuse_cache.count("provider_calls")
                     raw = self.provider.generate(
                         material.prompt_input,
                         repair_feedback=repair_feedback,
                         deadline=deadline,
                     )
                     content = validate_generated_summary(
-                        parse_summary_response(raw),
-                        comparison_texts=material.comparison_texts,
+                        parse_summary_response(raw), source_analysis=work.analysis,
                     )
                     return CardSummaryArtifact(
                         **content.model_dump(),
@@ -243,8 +307,4 @@ class CardSummaryPipeline:
                     repair_feedback = str(exc)
                 except (SummaryProviderError, ValueError, TypeError):
                     break
-        return description_fallback_artifact(
-            repo,
-            prompt_version=self.settings.prompt_version,
-            format_version=self.settings.format_version,
-        )
+        return self._fallback(repo)

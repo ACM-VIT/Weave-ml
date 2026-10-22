@@ -674,6 +674,18 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
         job_id=job_id,
     )
     pipeline = repository_embedding_pipeline()
+    payload: dict[str, Any] | None = None
+
+    def summary_context(artifact: CardSummaryArtifact) -> dict[str, Any]:
+        nonlocal payload
+        if artifact.source == "generated":
+            # Match the exact derived evidence used during generation. Cache
+            # this projection within the job; fallback replay stays README-free.
+            if payload is None:
+                payload = _repository_embedding_payload(request)
+            return payload
+        return request.repository.model_dump(mode="json")
+
     if job_status != "apply":
         if expected_point is None:
             raise V2ServiceHTTPException(
@@ -699,13 +711,13 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
             )
         artifact = card_summary_from_payload(stored_payload)
         if artifact is None or not pipeline.card_summarizer.is_current(
-            artifact, repo=request.repository.model_dump(mode="json")
+            artifact, repo=summary_context(artifact)
         ) or (
             job_status != "duplicate"
             and pipeline.card_summarizer.should_upgrade(artifact)
             and _summary_upgrade_has_time(deadline)
         ):
-            payload = _repository_embedding_payload(request)
+            payload = payload if payload is not None else _repository_embedding_payload(request)
             artifact = pipeline.summarize_repository(payload, deadline=deadline)
             lock.assert_owned()
             stored = repository_store().compare_and_set_card_summary(
@@ -731,7 +743,7 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
             artifact = card_summary_from_payload(stored_payload)
             job_status = final_status
         if artifact is None or not pipeline.card_summarizer.is_current(
-            artifact, repo=request.repository.model_dump(mode="json")
+            artifact, repo=summary_context(artifact)
         ):
             raise V2ServiceHTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -748,7 +760,7 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
             ),
             artifact=artifact,
         )
-    payload = _repository_embedding_payload(request)
+    payload = payload if payload is not None else _repository_embedding_payload(request)
     result = pipeline.embed_repository(payload, deadline=deadline)
     result.payload["content_job_id"] = job_id
 
@@ -779,7 +791,7 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
     )
     stored_artifact = card_summary_from_payload(dict(stored.payload or {})) if stored else None
     if stored_artifact is None or not pipeline.card_summarizer.is_current(
-        stored_artifact, repo=request.repository.model_dump(mode="json")
+        stored_artifact, repo=summary_context(stored_artifact)
     ):
         raise V2ServiceHTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
