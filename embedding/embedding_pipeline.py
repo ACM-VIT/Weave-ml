@@ -73,12 +73,19 @@ class RepositoryEmbeddingPipeline:
             max_chars=self.config.readme_chunk_chars,
             overlap_chars=self.config.readme_chunk_overlap_chars,
         )
-        readme_vectors = self.embedder.embed_texts([chunk.text for chunk in readme_chunks])
+        # Keep tower order/empty-string behavior while filling bounded encoder
+        # groups across towers instead of dispatching metadata/topics alone.
+        tower_vectors = self.embedder.embed_texts(
+            [chunk.text for chunk in readme_chunks] + [metadata_text, topic_text]
+        )
+        if len(tower_vectors) != len(readme_chunks) + 2:
+            raise ValueError("encoder must return exactly one vector per tower input")
+        readme_vectors = tower_vectors[:len(readme_chunks)]
         # The below aggregation is for making each repository contribute one
         # README vector regardless of README length.
         readme_embedding = aggregate_vectors(readme_vectors)
-        metadata_embedding = self.embedder.embed_text(metadata_text)
-        topic_embedding = self.embedder.embed_text(topic_text)
+        metadata_embedding = tower_vectors[len(readme_chunks)]
+        topic_embedding = tower_vectors[len(readme_chunks) + 1]
         final_embedding = combine_repo_tower(
             readme_embedding=readme_embedding,
             metadata_embedding=metadata_embedding,

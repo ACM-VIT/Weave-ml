@@ -13,6 +13,7 @@ import atexit
 import math
 import os
 import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache, wraps
 from typing import Any, Callable, TypeVar
@@ -128,18 +129,46 @@ def _load_sentence_transformer() -> Any:
 
 
 class BoundedEmbeddingModel:
-    """Serialize or narrowly parallelize calls into one shared encoder."""
+    """FIFO admission into one shared, concurrency-bounded encoder."""
 
     def __init__(self, model: Any, *, max_concurrency: int) -> None:
         self._model = model
         # Cache lifetime follows this exact loaded encoder, not a reusable ID.
         self.query_embedding_cache = QueryEmbeddingCache()
         self.query_embedding_revision = embedding_model_revision()
-        self._slots = threading.BoundedSemaphore(max_concurrency)
+        if max_concurrency < 1:
+            raise ValueError("max_concurrency must be positive")
+        self._max_concurrency = max_concurrency
+        self._condition = threading.Condition()
+        self._waiting: deque[object] = deque()
+        self._active = 0
+
+    @property
+    def max_seq_length(self) -> int:
+        return getattr(self._model, "max_seq_length", 256)
 
     def encode(self, *args: Any, **kwargs: Any) -> Any:
-        with self._slots:
+        ticket = object()
+        with self._condition:
+            self._waiting.append(ticket)
+            try:
+                self._condition.wait_for(
+                    lambda: self._waiting[0] is ticket
+                    and self._active < self._max_concurrency
+                )
+            except BaseException:
+                self._waiting.remove(ticket)
+                self._condition.notify_all()
+                raise
+            self._waiting.popleft()
+            self._active += 1
+            self._condition.notify_all()
+        try:
             return self._model.encode(*args, **kwargs)
+        finally:
+            with self._condition:
+                self._active -= 1
+                self._condition.notify_all()
 
     def identity(self) -> dict[str, Any]:
         return {
