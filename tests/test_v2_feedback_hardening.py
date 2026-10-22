@@ -93,11 +93,13 @@ class FakeQdrant:
             },
         )
         self.upserts = 0
+        self.repository_reads = 0
 
     def retrieve(self, *, collection_name, ids, with_payload, with_vectors):
         if collection_name == "user_profiles":
             return [self.user] if self.user is not None and str(self.user.id) in ids else []
-        return [self.repo] if str(self.repo.id) in ids else []
+        self.repository_reads += 1
+        return [self.repo] if self.repo is not None and str(self.repo.id) in ids else []
 
     def upsert(self, *, collection_name, points, wait, **_kwargs):
         self.user = points[0]
@@ -1002,3 +1004,93 @@ def test_feedback_worker_logging_writes_structured_json_to_stdout(capsys):
         package_logger.handlers = previous_handlers
         package_logger.setLevel(previous_level)
         package_logger.propagate = previous_propagate
+
+
+def test_consumer_read_batch_reuses_repository_snapshot_without_reusing_user_state():
+    user_id, repo_id = str(uuid.uuid4()), str(uuid.uuid4())
+    settings = _settings()
+    events = [_event(user_id, repo_id, i, action) for i, action in enumerate(
+        ["like", "readme_open", "save", "unlike", "like"], start=1,
+    )]
+    baseline = FakeQdrant(user_id, repo_id)
+    baseline_applier = OrderedFeedbackApplier(baseline, settings)
+    for payload in events:
+        baseline_applier.apply(payload)
+
+    qdrant, redis = FakeQdrant(user_id, repo_id), FakeRedis()
+    redis.xautoclaim = lambda *args, **kwargs: ("0-0", [])
+    redis.xreadgroup = lambda *args, **kwargs: [
+        (settings.stream_name, [(f"{i}-0", payload) for i, payload in enumerate(events, start=1)])
+    ]
+    consumer = OrderedFeedbackConsumer(redis, OrderedFeedbackApplier(qdrant, settings), settings)
+
+    assert consumer.run_once() == len(events)
+    assert qdrant.repository_reads == 1
+    assert baseline.repository_reads == 4
+    assert qdrant.user.vector == baseline.user.vector
+    assert qdrant.user.payload == baseline.user.payload
+    assert qdrant.upserts == len(events)
+    assert len(redis.acks) == len(events)
+
+
+@pytest.mark.parametrize("change", ["update", "removed", "ineligible", "model_revision", "content_revision"])
+def test_repository_read_batch_refetches_revision_and_eligibility_at_each_boundary(change):
+    user_id, repo_id = str(uuid.uuid4()), str(uuid.uuid4())
+    qdrant = FakeQdrant(user_id, repo_id)
+    applier = OrderedFeedbackApplier(qdrant, _settings())
+    first = _event(user_id, repo_id, 1, "like")
+    second = _event(user_id, repo_id, 2, "readme_open")
+    with applier.repository_read_batch([first]):
+        assert applier.apply(first).status == "applied"
+
+    previous_payload = json.loads(json.dumps(qdrant.user.payload))
+    if change == "update":
+        qdrant.repo.payload["content_version"] = 2
+        qdrant.repo.vector = {"repo_embedding": [1.0, 0.0]}
+    elif change == "removed":
+        qdrant.repo = None
+    elif change == "ineligible":
+        qdrant.repo.payload.pop(REPOSITORY_SERVING_ELIGIBILITY_FIELD)
+    elif change == "model_revision":
+        qdrant.repo.payload["embedding_model_revision"] = "stale-model-revision"
+    else:
+        qdrant.repo.payload["content_version"] = 0
+
+    with applier.repository_read_batch([second]):
+        if change == "update":
+            assert applier.apply(second).status == "applied"
+            assert qdrant.user.payload[LATENT_KEY] == pytest.approx([0.8575, 0.1425])
+        else:
+            with pytest.raises(MissingVectorError):
+                applier.apply(second)
+            assert qdrant.user.payload == previous_payload
+    assert qdrant.repository_reads == 2
+
+
+@pytest.mark.parametrize("prefetch_fails", [False, True])
+def test_repository_read_batch_partial_failure_does_not_poison_future_batches(prefetch_fails):
+    user_id, repo_id, missing_id = (str(uuid.uuid4()) for _ in range(3))
+    qdrant = FakeQdrant(user_id, repo_id)
+    retrieve = qdrant.retrieve
+
+    def maybe_fail(**kwargs):
+        if prefetch_fails and kwargs["collection_name"] != "user_profiles" and len(kwargs["ids"]) > 1:
+            qdrant.repository_reads += 1
+            raise RuntimeError("batch transport fixture")
+        return retrieve(**kwargs)
+
+    qdrant.retrieve = maybe_fail
+    applier = OrderedFeedbackApplier(qdrant, _settings())
+    first, second = _event(user_id, repo_id, 1), _event(user_id, missing_id, 2)
+    with applier.repository_read_batch([first, second]):
+        assert applier.apply(first).status == "applied"
+        with pytest.raises(MissingVectorError):
+            applier.apply(second)
+    assert qdrant.user.payload["last_feedback_version"] == 1
+    # Missing results and failed prefetches are discarded at the batch boundary.
+    qdrant.repo.id = missing_id
+    qdrant.repo.payload["repo_id"] = missing_id
+    with applier.repository_read_batch([second]):
+        assert applier.apply(second).status == "applied"
+    assert qdrant.user.payload["last_feedback_version"] == 2
+    assert qdrant.repository_reads == (4 if prefetch_fails else 2)
