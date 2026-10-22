@@ -1597,6 +1597,30 @@ def test_revision_change_retries_without_stale_owner_exclusions():
     assert retriever.discovery_cache_status()["entries"] == 0
 
 
+def test_owner_pool_expiry_retries_without_stale_read_exclusions(monkeypatch):
+    client = HeavyRankerQdrant()
+    now = [0.0]
+    retriever = QdrantV2Retriever(
+        client=client, heavy_ranker_enabled=False,
+        discovery_revision_provider=lambda: DiscoveryRevision("corpus", "eligible"),
+        discovery_cache=SharedDiscoveryCache(ttl_seconds=5, clock=lambda: now[0]),
+    )
+    encode = retriever._encode_discovery_pool
+
+    def expire_before_publish(*args, **kwargs):
+        now[0] = 5.0
+        return encode(*args, **kwargs)
+
+    monkeypatch.setattr(retriever, "_encode_discovery_pool", expire_before_publish)
+
+    points = retriever._discovery(3, include_vectors=False)
+
+    assert {point.repo_id for point, _source in points} == set(client.repo_ids)
+    assert len(client.scroll_calls) == 8
+    assert all(call["scroll_filter"].must_not is None for call in client.scroll_calls[4:])
+    assert retriever.discovery_cache_status()["entries"] == 0
+
+
 def test_successful_discovery_refill_merges_without_losing_checked_candidates():
     client = HeavyRankerQdrant()
     retriever = QdrantV2Retriever(

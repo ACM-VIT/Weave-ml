@@ -1301,9 +1301,9 @@ class QdrantV2Retriever:
                     except BaseException:
                         pass
                 self._discovery_cache.fail(lease)
-                # A changed authority invalidates the owner's initial points
-                # and their exclusions. The fallback must read the new corpus.
-                if self._discovery_revision() != plan.revision:
+                # A changed authority or expired lease invalidates the owner's
+                # initial points and exclusions before fresh retrieval.
+                if not self._checked_discovery_pool_current(plan, cached_pool=False):
                     partial = None
                     plan.read_ids.clear()
         refill_exclusions: set[str | int] = set(exclude_repo_ids or ()) | plan.read_ids
