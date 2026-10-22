@@ -256,17 +256,17 @@ def test_v2_health_requires_internal_auth(monkeypatch):
     assert response.status_code == 503
 
 
-def test_v2_auth_uses_configured_internal_header(monkeypatch):
+def test_v2_auth_uses_configured_internal_header(monkeypatch, health_probe_cache):
     app = FastAPI()
     app.include_router(router)
     client = TestClient(app)
     monkeypatch.setenv("INTERNAL_API_SECRET", "test-internal-secret")
     monkeypatch.setenv("INTERNAL_API_HEADER", "x-ml-service-secret")
-    healthy = SimpleNamespace(health=lambda: {"qdrant": "healthy"})
-    producer = SimpleNamespace(health=lambda: {
+    healthy = SimpleNamespace(health=MagicMock(return_value={"qdrant": "healthy"}))
+    producer = SimpleNamespace(health=MagicMock(return_value={
         "redis": "healthy",
         "feedback_consumer_active": True,
-    })
+    }))
 
     with patch("api.v2.retriever", return_value=healthy), patch(
         "api.v2.producer", return_value=producer
@@ -275,10 +275,20 @@ def test_v2_auth_uses_configured_internal_header(monkeypatch):
             "/api/v2/health",
             headers={"x-internal-secret": "test-internal-secret"},
         ).status_code == 401
-        assert client.get(
-            "/api/v2/health",
-            headers={"x-ml-service-secret": "test-internal-secret"},
-        ).status_code == 200
+        headers = {"x-ml-service-secret": "test-internal-secret"}
+        # A router-only application has no lifespan/background cache population.
+        assert client.get("/api/v2/health", headers=headers).status_code == 503
+        assert client.get("/api/v2/health/deep", headers=headers).status_code == 200
+        assert client.get("/api/v2/health", headers=headers).status_code == 200
+        assert client.get("/api/v2/health/ready", headers=headers).status_code == 200
+        # Age the observation deterministically without another dependency call.
+        with health_probe_cache._lock:
+            assert health_probe_cache._observed is not None
+            health_probe_cache._observed -= health_probe_cache.settings.max_age_seconds + 1
+        assert client.get("/api/v2/health/ready", headers=headers).status_code == 503
+
+    healthy.health.assert_called_once()
+    producer.health.assert_called_once()
 
 
 def test_recommendation_response_reports_the_model_that_served_the_request(monkeypatch):

@@ -288,6 +288,32 @@ def test_search_preflight_and_runtime_accept_defaults_and_bounds(workers, capaci
     assert validate_production_config(environment) == []
 
 
+@pytest.mark.parametrize("timeout", ["0", "0.5", "0.999", "120.1", "nan", "inf"])
+def test_qdrant_preflight_and_retriever_reject_unsupported_timeout(timeout, monkeypatch):
+    from retrieval.v2_retriever import QdrantV2Retriever
+
+    environment = valid_production_env()
+    environment["QDRANT_TIMEOUT_SECONDS"] = timeout
+    monkeypatch.setenv("QDRANT_TIMEOUT_SECONDS", timeout)
+
+    with pytest.raises(ValueError, match="QDRANT_TIMEOUT_SECONDS"):
+        QdrantV2Retriever(client=object(), heavy_ranker_enabled=False)
+    assert "QDRANT_TIMEOUT_SECONDS" in issue_names(environment)
+
+
+@pytest.mark.parametrize("timeout", ["1", "1.5", "10", "120"])
+def test_qdrant_preflight_and_retriever_accept_supported_timeout(timeout, monkeypatch):
+    from retrieval.v2_retriever import QdrantV2Retriever
+
+    environment = valid_production_env()
+    environment["QDRANT_TIMEOUT_SECONDS"] = timeout
+    monkeypatch.setenv("QDRANT_TIMEOUT_SECONDS", timeout)
+
+    retriever = QdrantV2Retriever(client=object(), heavy_ranker_enabled=False)
+    assert retriever.qdrant_timeout_seconds == float(timeout)
+    assert "QDRANT_TIMEOUT_SECONDS" not in issue_names(environment)
+
+
 def test_online_env_rejects_database_and_acquisition_credentials() -> None:
     environment = valid_production_env()
     environment["DATABASE_URL"] = "postgresql://sensitive.example/db"

@@ -16,6 +16,7 @@ import time
 from typing import Any, Callable, TypeVar
 
 from utils.deadline import check_deadline, remaining_seconds
+from utils.runtime_lifecycle import check_runtime_admission, runtime_admission
 
 
 T = TypeVar("T")
@@ -69,6 +70,7 @@ class _RetrievalIO:
             try:
                 while True:
                     check_deadline()
+                    check_runtime_admission()
                     if self.closed:
                         raise RuntimeError("retrieval I/O executor is closed")
                     if self.waiting[0] is ticket and self.outstanding < self.capacity:
@@ -104,8 +106,9 @@ class _RetrievalIO:
 
         try:
             # Never enter one Context concurrently from independent channels.
-            context = copy_context()
-            future = self.executor.submit(context.run, invoke)
+            with runtime_admission():
+                context = copy_context()
+                future = self.executor.submit(context.run, invoke)
         except BaseException:
             self._release()
             raise
@@ -132,19 +135,30 @@ class _RetrievalIO:
             self.condition.notify_all()
         self.executor.shutdown(wait=False, cancel_futures=True)
 
+    def drain(self) -> None:
+        """Called only by V2's cleanup plan, after outer workers have settled."""
+        with self.condition:
+            self.closed = True
+            self.condition.notify_all()
+        self.executor.shutdown(wait=True, cancel_futures=True)
+        with self.condition:
+            while self.outstanding:
+                self.condition.wait(timeout=0.05)
+
 
 def _runtime() -> _RetrievalIO:
     global _pool
-    with _pool_lock:
-        if _pool is not None:
-            with _pool.condition:
-                if _pool.closed:
-                    if _pool.outstanding:
-                        raise RuntimeError("previous retrieval I/O workers are still settling")
-                    _pool = None
-        if _pool is None:
-            _pool = _RetrievalIO()
-        return _pool
+    with runtime_admission():
+        with _pool_lock:
+            if _pool is not None:
+                with _pool.condition:
+                    if _pool.closed:
+                        if _pool.outstanding:
+                            raise RuntimeError("previous retrieval I/O workers are still settling")
+                        _pool = None
+            if _pool is None:
+                _pool = _RetrievalIO()
+            return _pool
 
 
 class RetrievalWork:
@@ -198,6 +212,32 @@ def retrieval_runtime_status() -> dict[str, Any]:
     workers, capacity = _settings()
     return {"workers": workers, "capacity": capacity, "outstanding": 0, "running": 0,
             "peak_running": 0, "waiting_submitters": 0, "stages": {name: {} for name in _STAGES}}
+
+
+def retrieval_runtime_drain_actions():
+    """Capture existing children for the single cleanup plan's second phase."""
+    with _pool_lock:
+        pool = _pool
+    return [("retrieval.executor.drain", pool.drain)] if pool is not None else []
+
+
+def retrieval_runtime_cleanup_actions():
+    """Retain captured I/O resources across independently retryable closes."""
+    with _pool_lock:
+        pool = _pool
+    if pool is None:
+        return []
+
+    def forget_pool() -> None:
+        global _pool
+        with _pool_lock:
+            if _pool is pool:
+                _pool = None
+
+    return [
+        ("retrieval.executor.close", pool.close),
+        ("retrieval.cache.clear", forget_pool),
+    ]
 
 
 def shutdown_retrieval_runtime() -> None:
