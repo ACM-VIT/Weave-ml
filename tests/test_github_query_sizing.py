@@ -143,6 +143,26 @@ def test_unusable_rate_limit_metadata_does_not_drop_search_results():
     assert GitHubDiscoveryEngine(client)._search_graphql("test", 1)[0]["full_name"] == "owner/repo"
 
 
+@pytest.mark.parametrize(
+    "remaining,delay", [("10", 60.0), ("0", 2400.0), (None, 60.0)],
+)
+def test_retry_after_uses_primary_reset_only_when_primary_quota_is_exhausted(
+    monkeypatch, remaining, delay,
+):
+    from acquisition import github_rate_limit as rate_limit
+
+    monkeypatch.setattr(rate_limit.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(rate_limit.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(rate_limit.random, "uniform", lambda *_args: 0.1)
+    coordinator = rate_limit.GitHubRateLimitCoordinator()
+    headers = {"X-RateLimit-Reset": "3400", "Retry-After": "60"}
+    if remaining is not None:
+        headers["X-RateLimit-Remaining"] = remaining
+    coordinator.observe(headers)
+
+    assert coordinator.throttle(headers) == pytest.approx(100.0 + delay + 0.1)
+
+
 class MetadataFixture(GitHubGraphQLClient):
     def __init__(self):
         super().__init__(token="test-token")
@@ -253,7 +273,7 @@ def test_metadata_fallback_fetches_readme_only_in_second_pass(projection, readme
                 return response
             if query.count(": repository(") > 1:
                 self.metadata_queries.append(query)
-                raise GitHubGraphQLClientError("batch too large", category="server", status_code=502)
+                raise GitHubGraphQLClientError("batch rows unresolved", category="response")
             # MetadataFixture marks only the failed identity unresolved, so the
             # healthy singleton must survive and receive exactly one README.
             return super().execute(query, variables)
@@ -277,3 +297,22 @@ def test_metadata_fallback_fetches_readme_only_in_second_pass(projection, readme
     else:
         assert result.readme.raw_markdown == ""
     assert bool(result.warnings) == (readme_state == "failed")
+
+
+@pytest.mark.parametrize("projection", ["legacy", "delivery"])
+def test_exhausted_metadata_server_failure_does_not_retry_singletons(projection):
+    class ExhaustedFixture(MetadataFixture):
+        def execute(self, query, variables=None):
+            self.metadata_queries.append(query)
+            raise GitHubGraphQLClientError(
+                "server retries exhausted", category="server", status_code=502,
+            )
+
+    client = ExhaustedFixture()
+    results = RepositoryEnricher(client, metadata_projection=projection).get_repositories_batch(
+        ["owner/failed", "owner/healthy"]
+    )
+
+    assert results == []
+    assert len(client.metadata_queries) == 1
+    assert client.metadata_queries[0].count(": repository(") == 2
