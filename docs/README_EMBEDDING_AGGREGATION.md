@@ -22,6 +22,15 @@ lists. Emoji and punctuation decorations are stripped only for classification;
 meaningful text such as `License compatibility checker` and literal symbols such
 as `C#` are retained. Inline backtick spans do not open fenced blocks.
 
+Thematic breaks (including compact `***` and `___`) end the pending paragraph;
+dashed Setext underlines retain precedence when a heading paragraph exists.
+Valid leading link reference definitions are scanned before Setext recognition,
+so their labels, destinations and optional multiline titles cannot become heading
+text. Escaped delimiters, balanced destinations and indentation are respected.
+Malformed reference-like text and definitions inside existing prose remain text.
+These boundary scans have bounded linear work and introduce no Markdown runtime
+dependency.
+
 It omits fenced code and entire License, Sponsors,
 Changelog, Contributors, Contributing, Acknowledgements, table-of-contents and
 API/generated-reference subtrees. This is a deterministic English-heading

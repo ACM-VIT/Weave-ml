@@ -6,8 +6,10 @@ merely by producing more chunks or headings.
 """
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
 import re
+from string import punctuation
 from typing import Any
 
 from utils.deadline import check_deadline
@@ -23,7 +25,7 @@ SECTION_CHUNK_LIMITS = {"purpose": 32, "neutral": 24, "setup": 8}
 _ATX_PREFIX = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+|$)")
 _SETEXT = re.compile(r"^ {0,3}(=+|-+)\s*$")
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-_BLOCK_START = re.compile(r"^(?: {4}|\t| {0,3}(?:>|[-+*][ \t]|[0-9]{1,9}[.)][ \t]|\|))")
+_BLOCK_START = re.compile(r"^ {0,3}(?:>|[-+*][ \t]|[0-9]{1,9}[.)][ \t]|\|)")
 _OMIT = re.compile(
     r"(?:licen[cs]es?(?: information)?|copyright(?: notice)?|sponsors?|sponsorship|"
     r"changelog|change log|release notes?|contributors?|contributing|"
@@ -67,9 +69,163 @@ def readme_source(source: Any, payload: dict[str, Any]) -> str:
     return paragraphs[:MAX_PREPROCESS_CHARS] if isinstance(paragraphs, str) else ""
 
 
+def _is_thematic_break(line: str) -> bool:
+    """Recognize a homogeneous run of at least three markers in linear work."""
+    start = len(line) - len(line.lstrip(" "))
+    if start > 3 or start == len(line) or line[start] not in "-_*":
+        return False
+    marker, count = line[start], 0
+    for character in line[start:]:
+        if character == marker:
+            count += 1
+        elif character not in " \t":
+            return False
+    return count >= 3
+
+
+def _reference_space_end(text: str, position: int, limit: int) -> int:
+    """Skip horizontal whitespace and at most one line ending."""
+    while position < limit and text[position] in " \t":
+        position += 1
+    if position < limit and text[position] == "\n":
+        position += 1
+        while position < limit and text[position] in " \t":
+            position += 1
+    return position
+
+
+def _reference_destination_end(text: str, position: int, limit: int) -> int | None:
+    if position == limit:
+        return None
+    angle = text[position] == "<"
+    start = position
+    position += int(angle)
+    depth = 0
+    while position < limit:
+        character = text[position]
+        if character == "\\" and position + 1 < limit and text[position + 1] in punctuation:
+            position += 2
+            continue
+        if angle:
+            if character == ">":
+                return position + 1
+            if character in "\n<":
+                return None
+        else:
+            if ord(character) <= 32 or ord(character) == 127:
+                break
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+        position += 1
+    return position if not angle and position > start and depth == 0 else None
+
+
+def _reference_definition_end(text: str, start: int, limit: int | None = None) -> int | None:
+    """Scan one leading GFM reference definition without regex backtracking.
+
+    The caller bounds the source interval at blank lines and interrupting
+    blocks. References are resolved before ambiguous Setext underlines. A
+    failed next-line optional title leaves the destination-only definition.
+    """
+    limit = len(text) if limit is None else limit
+    position = start
+    while position < limit and position - start < 3 and text[position] == " ":
+        position += 1
+    if position == limit or text[position] != "[":
+        return None
+    position += 1
+    label_start, nonspace = position, False
+    while position < limit and position - label_start <= 999:
+        character = text[position]
+        if character == "\\" and position + 1 < limit and text[position + 1] in punctuation:
+            nonspace = True
+            position += 2
+            continue
+        if character == "]":
+            break
+        if character == "[":
+            return None
+        nonspace |= not character.isspace()
+        position += 1
+    if (position + 1 >= limit or position - label_start > 999 or not nonspace
+            or text[position:position + 2] != "]:"):
+        return None
+    destination_end = _reference_destination_end(
+        text, _reference_space_end(text, position + 2, limit), limit,
+    )
+    if destination_end is None:
+        return None
+    position = destination_end
+    while position < limit and text[position] in " \t":
+        position += 1
+    fallback = (
+        position if position == limit else
+        position + 1 if text[position] == "\n" else None
+    )
+    title_start = _reference_space_end(text, destination_end, limit)
+    if title_start == destination_end or title_start == limit or text[title_start] not in "\"'(":
+        return fallback
+    opener = text[title_start]
+    closer = ")" if opener == "(" else opener
+    position = title_start + 1
+    while position < limit:
+        character = text[position]
+        if character == "\\" and position + 1 < limit and text[position + 1] in punctuation:
+            position += 2
+            continue
+        if character == closer:
+            position += 1
+            while position < limit and text[position] in " \t":
+                position += 1
+            if position == limit:
+                return position
+            return position + 1 if text[position] == "\n" else fallback
+        if opener == "(" and character == "(":
+            return fallback
+        position += 1
+    return fallback
+
+
+def _reference_prefix_end(text: str, start: int, limit: int) -> int:
+    # Advance over all leading definitions in one scan. Malformed syntax
+    # stops the scan, preserving it and all later reference-like prose.
+    while start < limit:
+        end = _reference_definition_end(text, start, limit)
+        if end is None:
+            break
+        start = end
+    return start
+
+
+def _reference_block_boundary(line: str) -> bool:
+    fence = _FENCE.match(line)
+    valid_fence = fence and not (fence[1][0] == "`" and "`" in line[fence.end():])
+    return bool(not line.strip() or _ATX_PREFIX.match(line) or valid_fence
+                or _is_thematic_break(line) or _BLOCK_START.match(line))
+
+
 def _sections(markdown: str) -> list[tuple[str, str]]:
     """Recognize ATX/Setext headings, inheritance and fenced code boundaries."""
     lines = markdown[:MAX_PREPROCESS_CHARS].splitlines()
+    # Keep one source string and indexed block boundaries. Repeated malformed
+    # reference-like Setext headings must not rescan/copy the remaining suffix.
+    text = "\n".join(lines)
+    line_starts: list[int] = []
+    position = 0
+    for line in lines:
+        line_starts.append(position)
+        position += len(line) + 1
+    reference_limits = [len(text)] * len(lines)
+    next_boundary = len(text)
+    for index in range(len(lines) - 1, -1, -1):
+        check_deadline()
+        reference_limits[index] = next_boundary
+        if _reference_block_boundary(lines[index]):
+            next_boundary = line_starts[index]
     sections: list[tuple[str, str]] = []
     stack: list[tuple[int, str]] = []
     body: list[str] = []
@@ -99,7 +255,9 @@ def _sections(markdown: str) -> list[tuple[str, str]]:
             start += 1
         while end > start and not (title[end - 1].isalnum() or title[end - 1] == "_"):
             end -= 1
-        label = title[start:end]
+        # Failed reference-like syntax must remain meaningful title text; do
+        # not strip its brackets/colon as if they were emoji decorations.
+        label = title[:end] if "[" in title[:start] else title[start:end]
         while stack and stack[-1][0] >= depth:
             stack.pop()
         inherited = stack[-1][1] if stack else "neutral"
@@ -115,8 +273,11 @@ def _sections(markdown: str) -> list[tuple[str, str]]:
         if category != "omit" and title:
             body.append(title)
 
-    for line in lines:
+    skip_until = 0
+    for index, line in enumerate(lines):
         check_deadline()
+        if index < skip_until:
+            continue
         opening = _FENCE.match(line)
         if fence is not None:
             if opening and opening[1][0] == fence[0] and len(opening[1]) >= fence[1] and not line[opening.end():].strip():
@@ -141,6 +302,14 @@ def _sections(markdown: str) -> list[tuple[str, str]]:
                 title = without_hashes.rstrip(" \t")
             begin_section(len(heading[1]), title)
             continue
+        if not paragraph and line.lstrip(" ").startswith("[") and not line.startswith("    "):
+            # Resolve leading definitions before Setext: '=' can occur inside
+            # a multiline label/title or be a destination itself. Source and
+            # interrupting-block offsets are shared across all attempts.
+            consumed = _reference_prefix_end(text, line_starts[index], reference_limits[index])
+            if consumed > line_starts[index]:
+                skip_until = bisect_left(line_starts, consumed)
+                continue
         setext = _SETEXT.fullmatch(line)
         if setext and paragraph:
             # A Setext heading contains the complete preceding paragraph,
@@ -149,7 +318,16 @@ def _sections(markdown: str) -> list[tuple[str, str]]:
             paragraph.clear()
             begin_section(1 if setext[1][0] == "=" else 2, title)
             continue
-        if not line.strip() or setext or _BLOCK_START.match(line):
+        # Setext underlines take precedence over dashed thematic breaks when
+        # a real paragraph remains after removing leading definitions.
+        if _is_thematic_break(line):
+            commit_paragraph()
+            body.append("")
+            continue
+        # Indentation cannot interrupt an existing paragraph, including the
+        # destination/title continuation of a leading reference definition.
+        indented_block = not paragraph and line.startswith(("    ", "\t"))
+        if not line.strip() or _BLOCK_START.match(line) or indented_block:
             commit_paragraph()
             body.append(line)
             continue

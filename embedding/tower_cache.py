@@ -20,7 +20,7 @@ from .vector_contract import validate_embedding_vector
 
 
 # Bump when text projection, chunking, normalization or aggregation changes.
-TOWER_PREPROCESSING_VERSION = "repository-tower-token-sections-l2-v3"
+TOWER_PREPROCESSING_VERSION = "repository-tower-token-sections-l2-v4"
 
 
 @dataclass(frozen=True, slots=True)

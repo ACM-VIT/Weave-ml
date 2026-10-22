@@ -95,6 +95,13 @@ for size in (1600, MAX_PREPROCESS_CHARS - 32):
                     '# Overview' + ' ' * size + '#'):
         sections = _sections(heading + '\\nUseful details.')
         assert any('Useful details.' in text for _, text in sections)
+for text in ('[' + 'x' * 62000,
+             '[ref]: /url\\n\"' + 'title\\n' * 9000,
+             ('[ref]: /url\\n' * 4000),
+             ('[bad]\\n===\\n' * 5000),
+             ('[bad]: /url \"unclosed\\n===\\n' * 2500),
+             '*' + ' \\t*' * 20000):
+    _sections(text)
 """
     subprocess.run([sys.executable, "-c", script], check=True, timeout=5,
                    cwd=Path(__file__).resolve().parents[1])
@@ -154,6 +161,85 @@ def test_setext_title_stops_at_block_boundaries(boundary):
     text = " ".join(text for _, text in sections)
     assert "Useful introduction." in text
     assert "Excluded boilerplate." not in text
+
+
+@pytest.mark.parametrize("definition", [
+    "[home]: https://example.com",
+    "   [home]: <https://example.com/a b> 'Project homepage'",
+    r'[ho\]me]: /some_(nested_(url)) "An escaped \"title\""',
+    r'[ho\[me]: /escaped\(destination\) (Title with escaped \(parentheses\))',
+    "[home]: <>",
+    "[home]:\n    /url\n    'Title'",
+    "[multi\nline label]: /url 'A title\nwith more text'",
+    '[home]: /url "Title\n===\nmore text"',
+    '[home]: /url\n"Title\n===\nmore text"',
+    "[multi\n===\nline label]: /url",
+    "[home]:\n===",
+    "[first]: /url\n[second]: /other-url",
+])
+def test_leading_reference_definitions_do_not_enter_setext_titles(definition):
+    sections = _sections("# Overview\n" + definition + "\nLicense\n-------\nLegal boilerplate.")
+    assert sections == [("purpose", "Overview")]
+
+
+@pytest.mark.parametrize("marker", ["***", "___", "* * *", "  _\t_ _  ", "   - - -"])
+def test_thematic_breaks_separate_setext_titles_from_prior_prose(marker):
+    sections = _sections("# Overview\nUseful intro.\n" + marker + "\nLicense\n-------\nLegal boilerplate.")
+    text = " ".join(text for _, text in sections)
+    assert "Useful intro." in text and "Legal boilerplate." not in text
+
+
+def test_dashed_setext_keeps_precedence_over_thematic_break():
+    assert _sections("License\n---\nLegal boilerplate.") == []
+    sections = _sections("A guide to checking\nLicense\n---\nDependency analysis.")
+    assert sections == [("neutral", "A guide to checking License Dependency analysis.")]
+
+
+def test_reference_definitions_cannot_interrupt_an_existing_paragraph():
+    markdown = "# Overview\nUseful intro.\n[home]: /url\nLicense\n-------\nDependency analysis."
+    text = " ".join(text for _, text in _sections(markdown))
+    assert "[home]: /url License" in text and "Dependency analysis." in text
+
+
+@pytest.mark.parametrize("prose", [
+    "[home] missing colon: /url",
+    r"[ho\]me: /url",
+    "[nested[label]]: /url",
+    "[]: /url", "[ ]: /url", "[" + "x" * 1000 + "]: /url",
+    "[ ]: <>", "[ ]: <url with space>",
+    "[home]:", "[home]: <unterminated", "[home]: /unbalanced(url",
+    '[home]: /url "title" extra prose',
+    "[home]: /url (nested(title))",
+    "[home]: <url>(title without separator)",
+])
+def test_malformed_reference_like_prose_is_retained(prose):
+    # A malformed definition is part of the multiline title; treating it as a
+    # block boundary would incorrectly classify the final line as legal text.
+    text = " ".join(text for _, text in _sections(prose + "\nLicense\n-------\nDependency analysis."))
+    assert "Dependency analysis." in text
+
+
+def test_next_line_invalid_reference_title_is_retained_as_prose():
+    markdown = '[home]: /url\n"title" extra prose\nLicense\n-------\nDependency analysis.'
+    text = " ".join(text for _, text in _sections(markdown))
+    assert '"title" extra prose License' in text
+    assert "[home]:" not in text and "Dependency analysis." in text
+
+
+def test_indented_reference_like_code_is_not_removed():
+    text = " ".join(text for _, text in _sections("    [home]: /url\n\nUseful prose."))
+    assert "[home]: /url" in text and "Useful prose." in text
+
+
+def test_definitions_without_real_heading_text_do_not_create_an_empty_setext_heading():
+    sections = _sections("[ref]: /url\n===\nUseful prose.")
+    assert sections == [("neutral", "=== Useful prose.")]
+
+
+@pytest.mark.parametrize("marker", ["    ***", "\t___", "**", "__", "-_-", "+++"])
+def test_non_thematic_markers_remain_in_multiline_titles(marker):
+    text = " ".join(text for _, text in _sections("Useful intro.\n" + marker + "\nLicense\n---\nDependency analysis."))
+    assert "Useful intro." in text and "Dependency analysis." in text
 
 
 def test_heading_free_and_paragraph_only_inputs_have_neutral_fallback(tokenizer):
