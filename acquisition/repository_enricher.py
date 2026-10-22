@@ -106,9 +106,16 @@ class RepositoryEnricher:
                 # Retry the batch one repo at a time
                 for owner, name in batch:
                     try:
-                        data = self.graphql_client.get_repository(owner, name)
-                        if data:
-                            batch_res[f"{owner}/{name}"] = data
+                        # Reuse the lean query for singleton retries too. The
+                        # full repository query includes README blobs, which
+                        # Pass 2 would immediately fetch a second time.
+                        if self.metadata_projection == "legacy":
+                            retry_res = self.graphql_client.get_repositories_batch([(owner, name)])
+                        else:
+                            retry_res = self.graphql_client.get_repositories_batch(
+                                [(owner, name)], projection=self.metadata_projection
+                            )
+                        batch_res.update(retry_res)
                     except Exception as e2:
                         logger.warning(f"Individual fetch failed for {owner}/{name}: {e2}")
 
