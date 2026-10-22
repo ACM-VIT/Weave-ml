@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 import re
 from typing import Any
@@ -34,12 +34,37 @@ _HIGH_SIGNAL_HEADING = re.compile(
     r"use cases?|who is|audience|benefits?|key concepts?|motivation)\b",
     re.IGNORECASE,
 )
+_LINE_BREAK = re.compile(r"\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
+
+# These analysis limits are independent of the provider's prompt-length cap.
+# Seven evidence variants (six Markdown/cleaned fields and joined paragraphs)
+# plus one Markdown scan fit within the aggregate character-work allowance.
+MAX_SOURCE_VARIANT_BYTES = 4 * MAX_PREPROCESS_CHARS
+MAX_SOURCE_ANALYSIS_LINES = 4_096
+MAX_SOURCE_ANALYSIS_WORK = 8 * MAX_PREPROCESS_CHARS
+MAX_SOURCE_PARAGRAPHS = 80
+
+
+class _SourceLimitExceeded(ValueError):
+    pass
+
+
+@dataclass(slots=True)
+class _AnalysisBudget:
+    work: int = 0
+
+    def spend(self, characters: int) -> None:
+        self.work += characters
+        if self.work > MAX_SOURCE_ANALYSIS_WORK:
+            raise _SourceLimitExceeded("source work budget exceeded")
 
 
 @dataclass(frozen=True, slots=True)
 class SummarySource:
     prompt_input: str
     comparison_texts: tuple[str, ...]
+    analysis_truncated: bool = False
+    analysis_limit: str | None = None
 
 
 def _string_list(value: Any) -> list[str]:
@@ -49,40 +74,51 @@ def _string_list(value: Any) -> list[str]:
     return [item for item in cleaned if item and not _COMMAND.search(item)]
 
 
-def _source_variants(source: Any, repo: Mapping[str, Any]) -> tuple[str, ...]:
+def _source_variants(
+    source: Any, repo: Mapping[str, Any], budget: _AnalysisBudget,
+) -> tuple[str, ...]:
+    """Retain complete bounded evidence, never a silently truncated prefix."""
+
     variants: list[str] = []
-    raw = repo.get("readme")
-    if isinstance(raw, str) and raw.strip():
-        variants.append(raw[:MAX_PREPROCESS_CHARS])
-    for key in ("clean_text", "readme_md"):
-        value = repo.get(key)
-        if isinstance(value, str) and value.strip():
-            variants.append(value[:MAX_PREPROCESS_CHARS])
+
+    def add(value: Any) -> None:
+        if not isinstance(value, str) or not value:
+            return
+        # len is constant-time, so oversized and all-whitespace inputs do not
+        # trigger a full-file whitespace scan, encoding, or normalization first.
+        if len(value) > MAX_PREPROCESS_CHARS:
+            raise _SourceLimitExceeded("source character budget exceeded")
+        budget.spend(len(value))
+        if len(value.encode("utf-8", errors="surrogatepass")) > MAX_SOURCE_VARIANT_BYTES:
+            raise _SourceLimitExceeded("source byte budget exceeded")
+        if not value.isspace() and value not in variants:
+            variants.append(value)
+
+    for key in ("readme", "clean_text", "readme_md"):
+        add(repo.get(key))
     readme = getattr(source, "readme", None)
     for key in ("raw_markdown", "clean_text", "readme_md"):
-        value = getattr(readme, key, None)
-        if isinstance(value, str) and value.strip():
-            variants.append(value[:MAX_PREPROCESS_CHARS])
+        add(getattr(readme, key, None))
 
     # Prefer Markdown when available so excluded section boundaries survive.
     # Paragraph-only jobs still supply both prompt context and copy-check text.
     paragraphs = repo.get("extracted_paragraphs")
     if isinstance(paragraphs, list):
-        joined = "\n\n".join(
-            value[:MAX_PREPROCESS_CHARS // 80] for value in paragraphs[:80]
-            if isinstance(value, str) and value.strip()
-        )
-        if joined:
-            variants.append(joined[:MAX_PREPROCESS_CHARS])
-
-    distinct: list[str] = []
-    seen: set[str] = set()
-    for value in variants:
-        fingerprint = value.strip()
-        if fingerprint and fingerprint not in seen:
-            seen.add(fingerprint)
-            distinct.append(value)
-    return tuple(distinct)
+        if len(paragraphs) > MAX_SOURCE_PARAGRAPHS:
+            raise _SourceLimitExceeded("source paragraph budget exceeded")
+        complete: list[str] = []
+        used = 0
+        for value in paragraphs:
+            if not isinstance(value, str) or not value:
+                continue
+            used += len(value) + (2 if complete else 0)
+            if used > MAX_PREPROCESS_CHARS:
+                raise _SourceLimitExceeded("source paragraph character budget exceeded")
+            # Do not scan a paragraph until its complete length is bounded.
+            if not value.isspace():
+                complete.append(value)
+        add("\n\n".join(complete))
+    return tuple(variants)
 
 
 def _clean_line(line: str) -> str:
@@ -93,7 +129,28 @@ def _clean_line(line: str) -> str:
     return re.sub(r"\s+", " ", line).strip()
 
 
-def _readme_sections(markdown: str) -> tuple[list[str], list[str]]:
+def _analysis_lines(markdown: str, budget: _AnalysisBudget) -> Iterator[str]:
+    """Iterate splitlines-compatible boundaries with one line of lookahead."""
+
+    start = 0
+    count = 0
+    for match in _LINE_BREAK.finditer(markdown):
+        count += 1
+        if count > MAX_SOURCE_ANALYSIS_LINES:
+            raise _SourceLimitExceeded("source line budget exceeded")
+        budget.spend(match.end() - start)
+        yield markdown[start:match.start()]
+        start = match.end()
+    if start < len(markdown):
+        if count >= MAX_SOURCE_ANALYSIS_LINES:
+            raise _SourceLimitExceeded("source line budget exceeded")
+        budget.spend(len(markdown) - start)
+        yield markdown[start:]
+
+
+def _readme_sections(
+    markdown: str, *, max_chars: int, budget: _AnalysisBudget,
+) -> tuple[list[str], list[str], bool]:
     """Return high-signal and neutral lines from a Markdown copy."""
 
     high: list[str] = []
@@ -102,27 +159,33 @@ def _readme_sections(markdown: str) -> tuple[list[str], list[str]]:
     blocked_depth: int | None = None
     in_fence = False
     previous_was_heading = False
-    lines = markdown.splitlines()
-    for index, raw_line in enumerate(lines):
-        if _FENCE.match(raw_line):
+    retained = {True: 0, False: 0}
+    excerpts_truncated = False
+    lines = iter(_analysis_lines(markdown, budget))
+    raw_line = next(lines, None)
+    while raw_line is not None:
+        next_line = next(lines, None)
+        line, raw_line = raw_line, next_line
+        if _FENCE.match(line):
             in_fence = not in_fence
             continue
         if in_fence:
             continue
-        heading_match = _HEADING.match(raw_line)
+        heading_match = _HEADING.match(line)
         setext = (
-            index + 1 < len(lines)
-            and _SETEXT_TEXT.match(raw_line)
-            and not _LIST_MARKER.match(raw_line)
-            and _SETEXT.match(lines[index + 1])
+            next_line is not None
+            and _SETEXT_TEXT.match(line)
+            and not _LIST_MARKER.match(line)
+            and _SETEXT.match(next_line)
         )
         if heading_match or setext:
             if heading_match:
                 depth = len(heading_match.group(1))
                 heading = heading_match.group(2).rstrip()
             else:
-                depth = 1 if lines[index + 1].lstrip().startswith("=") else 2
-                heading = raw_line.strip()
+                assert next_line is not None  # A setext heading has an underline.
+                depth = 1 if next_line.lstrip().startswith("=") else 2
+                heading = line.strip()
             if blocked_depth is not None and depth > blocked_depth:
                 continue
             excluded = (
@@ -133,23 +196,40 @@ def _readme_sections(markdown: str) -> tuple[list[str], list[str]]:
             current = high if _HIGH_SIGNAL_HEADING.search(heading) else neutral
             previous_was_heading = True
             continue
-        if previous_was_heading and _SETEXT.match(raw_line):
+        if previous_was_heading and _SETEXT.match(line):
             previous_was_heading = False
             continue
         previous_was_heading = False
-        cells = raw_line.strip().strip("|").split("|")
-        table_rule = "|" in raw_line and all(_TABLE_CELL.fullmatch(cell.strip()) for cell in cells)
-        if blocked_depth is not None or table_rule or raw_line.count("|") >= 3:
+        if blocked_depth is not None:
             continue
-        cleaned = _clean_line(raw_line)
+        # Once a bucket can fill the provider input, keep reading only its
+        # structural boundaries. Later high-signal sections still take priority
+        # over earlier neutral material; discarded lines are not cleaned again.
+        high_signal = current is high
+        if retained[high_signal] >= max_chars:
+            excerpts_truncated = True
+            continue
+        if line.count("|") >= 3:
+            continue
+        if "|" in line:
+            cells = line.strip().strip("|").split("|")
+            if all(_TABLE_CELL.fullmatch(cell.strip()) for cell in cells):
+                continue
+        cleaned = _clean_line(line)
         if (
             len(cleaned) < 24
             or _COMMAND.search(cleaned)
             or _BLOCKED_HEADING.fullmatch(cleaned.rstrip(":"))
         ):
             continue
-        current.append(cleaned)
-    return high, neutral
+        # One boundary character preserves the existing word-boundary prompt
+        # clipping without retaining a potentially much longer cleaned line.
+        remaining = max_chars - retained[high_signal]
+        excerpt = cleaned[:remaining + 1]
+        excerpts_truncated |= len(excerpt) < len(cleaned)
+        current.append(excerpt)
+        retained[high_signal] += len(excerpt) + 2
+    return high, neutral, excerpts_truncated
 
 
 def build_summary_source(
@@ -162,9 +242,17 @@ def build_summary_source(
 
     if max_chars < 1_000:
         raise ValueError("max_chars must be at least 1000")
-    variants = _source_variants(source, repo)
-    raw_markdown = variants[0] if variants else ""
-    high, neutral = _readme_sections(raw_markdown)
+    budget = _AnalysisBudget()
+    try:
+        variants = _source_variants(source, repo, budget)
+        raw_markdown = variants[0] if variants else ""
+        high, neutral, excerpts_truncated = _readme_sections(
+            raw_markdown, max_chars=max_chars, budget=budget,
+        )
+    except _SourceLimitExceeded as exc:
+        # A shortened prompt is fine; shortened validation evidence is not.
+        # Without complete copy-check coverage, use only metadata fallback.
+        return SummarySource("", (), analysis_truncated=True, analysis_limit=str(exc))
 
     full_name = _clean_line(str(repo.get("full_name") or "")[:512])
     metadata: list[str] = [f"Repository: {full_name}"]
@@ -184,20 +272,25 @@ def build_summary_source(
     selected: list[str] = []
     used = 0
     for chunk in chunks:
-        normalized = re.sub(r"\s+", " ", chunk).strip()
+        # Metadata and retained README lines were already normalized once.
+        normalized = chunk.strip()
         if not normalized:
             continue
         remaining = max_chars - used - (2 if selected else 0)
         if remaining <= 0:
+            excerpts_truncated = True
             break
         if len(normalized) > remaining:
+            excerpts_truncated = True
             normalized = normalized[:remaining].rsplit(" ", 1)[0].rstrip(" ,;:-")
         if normalized:
             selected.append(normalized)
             used += len(normalized) + (2 if len(selected) > 1 else 0)
-        if used >= max_chars:
-            break
 
     prompt_input = "\n\n".join(selected) if has_summary_evidence else ""
     comparisons = tuple(dict.fromkeys((*variants, prompt_input)))
-    return SummarySource(prompt_input=prompt_input, comparison_texts=comparisons)
+    return SummarySource(
+        prompt_input=prompt_input,
+        comparison_texts=comparisons,
+        analysis_truncated=excerpts_truncated,
+    )

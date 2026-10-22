@@ -185,6 +185,10 @@ class CardSummaryPipeline:
             if artifact.model_version != self.settings.model_id:
                 return False
             material = build_summary_source(repo, repo, max_chars=self.settings.input_max_chars) if repo is not None else None
+            if material is not None and material.analysis_limit is not None:
+                # Do not replay generated content against only a prefix of its
+                # source. A later attempt can still persist the safe fallback.
+                return False
             try:
                 validate_generated_summary(
                     artifact,
@@ -200,12 +204,20 @@ class CardSummaryPipeline:
         return artifact.source == "description_fallback" and self.provider is not None
 
     def summarize(self, source: Any, repo: Mapping[str, Any], *, deadline: float | None = None) -> CardSummaryArtifact:
+        if self.provider is None:
+            # Provider-disabled jobs need no Markdown variants, parsing, or copy
+            # checks. Keep the exact same metadata-only fallback and identities.
+            return description_fallback_artifact(
+                repo,
+                prompt_version=self.settings.prompt_version,
+                format_version=self.settings.format_version,
+            )
         material = build_summary_source(
             source,
             repo,
             max_chars=self.settings.input_max_chars,
         )
-        if self.provider is not None and material.prompt_input:
+        if material.analysis_limit is None and material.prompt_input:
             repair_feedback: str | None = None
             for _attempt in range(2):
                 if deadline is not None and time.monotonic() > deadline:

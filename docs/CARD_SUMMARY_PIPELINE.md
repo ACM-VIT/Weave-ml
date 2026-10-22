@@ -89,6 +89,44 @@ generated artifact with matching prompt/model/format versions, while the backend
 persists and activates it before completing the outbox delivery. A
 `description_fallback` remains eligible for a later provider-backed backfill.
 
+## Bounded source analysis
+
+Without a configured provider, generation returns the same description-only
+fallback before reading or parsing any README source. Canonical Markdown and
+the fallback's content/version rules are unchanged.
+
+Provider input has an independent preprocessing budget, not just the
+`SUMMARY_INPUT_MAX_CHARS` transport limit:
+
+- Each complete evidence variant is at most 64,000 Unicode codepoints and
+  256,000 UTF-8 bytes. Length is checked before encoding or stripping input.
+- At most 80 extracted paragraphs are joined, with a combined 64,000-codepoint
+  bound, including separators. Individual paragraphs are not prefix-truncated.
+- Source collection and the Markdown scan share a 512,000-character work budget.
+  The scan visits at most 4,096 lines, using one-line lookahead rather than a
+  full-file split. Metadata cleanup retains its existing independent bounds.
+- High-signal and neutral excerpts are cleaned once and each retain only enough
+  text to fill the prompt, plus one word-boundary character per bucket. Heading,
+  setext, nested excluded-section, and fenced-code handling are preserved;
+  later high-signal sections still outrank earlier neutral prose.
+
+Prompt clipping never clips the copy-check evidence. Complete, in-budget
+variants, including excluded sections and text beyond the prompt, remain in
+copy detection. `SummarySource.analysis_truncated` explicitly reports excerpt
+clipping or a limit-exceeded analysis; `analysis_limit` distinguishes the latter.
+An exceeded evidence/analysis budget skips the provider and uses the metadata
+fallback, rather than generating or validating against only a source prefix.
+Direct validation also rejects oversized comparison strings. Generated replay
+with repository context is not current when its source analysis exceeds a
+budget; it must take the normal regeneration/fallback path. Existing generated
+replay still performs safety/copy revalidation even if no provider is enabled.
+Durable fallback replay does not parse the README.
+
+These are structural bounds, not measured speedup claims. Preprocessing CPU,
+allocation scaling, golden/adversarial execution, and the limit-exceeded fallback
+still require the deferred application-wide validation; they were not executed
+as part of this implementation-only change.
+
 ## Timeout budget
 
 With the production bounds, one provider generation can use three attempts at
