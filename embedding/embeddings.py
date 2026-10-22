@@ -6,7 +6,7 @@ import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from numbers import Real
+from numbers import Integral, Real
 
 import numpy as np
 
@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 
 Vector = list[float]
+MAX_ENCODER_BATCH_TEXTS = 8
+MAX_ENCODER_BATCH_TOKENS = 2048
 
 
 @dataclass(slots=True)
@@ -58,16 +60,38 @@ class SentenceTransformerEmbedder:
         return self._model
 
     def embed_texts(self, texts: Sequence[str], *, normalize: bool = True) -> list[Vector]:
-        """Embed a sequence of texts and return JSON-serializable vectors."""
+        """Encode ordered, token-bounded groups, releasing the model between them.
+
+        The encoder retains its existing per-input truncation. Bound padded
+        tensor tokens by the loaded sequence limit, not a word-count estimate.
+        Lightweight encoders without tokenizer metadata use MiniLM's 256 cap.
+        """
         if not texts:
             return []
-        vectors = self.model.encode(
-            list(texts),
-            convert_to_numpy=True,
-            normalize_embeddings=normalize,
-            show_progress_bar=False,
+        model = self.model
+        sequence_limit = getattr(model, "max_seq_length", 256)
+        if (
+            isinstance(sequence_limit, bool)
+            or not isinstance(sequence_limit, Integral)
+            or not 1 <= sequence_limit <= MAX_ENCODER_BATCH_TOKENS
+        ):
+            raise ValueError("encoder max_seq_length exceeds the bounded token budget")
+        group_size = min(
+            MAX_ENCODER_BATCH_TEXTS, MAX_ENCODER_BATCH_TOKENS // sequence_limit
         )
-        return [np.asarray(vector, dtype=np.float32).tolist() for vector in vectors]
+        result: list[Vector] = []
+        for start in range(0, len(texts), group_size):
+            group = list(texts[start:start + group_size])
+            vectors = model.encode(
+                group,
+                convert_to_numpy=True,
+                normalize_embeddings=normalize,
+                show_progress_bar=False,
+            )
+            if len(vectors) != len(group):
+                raise ValueError("encoder must return exactly one vector per input")
+            result.extend(np.asarray(vector, dtype=np.float32).tolist() for vector in vectors)
+        return result
 
     def embed_text(self, text: str, *, normalize: bool = True) -> Vector:
         """Embed one text value."""
