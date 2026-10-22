@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import math
@@ -51,6 +52,10 @@ class RepositoryEnricher:
         self.readme_scheduler = readme_scheduler
         self.graphql_client = graphql_client or GitHubGraphQLClient()
 
+    def _check_cancelled(self) -> None:
+        if self.readme_scheduler is not None and self.readme_scheduler.cancelled:
+            raise CancelledError("Acquisition cancelled")
+
     def enrich(self, repository: dict[str, Any] | str) -> EnrichmentResult | None:
         full_name = normalize_repository_name(
             repository if isinstance(repository, str) else repository.get("full_name")
@@ -99,6 +104,7 @@ class RepositoryEnricher:
         results = []
         # Pass 1: batch metadata (no readme — avoids 502 on large repos)
         for i in range(0, len(targets), self.metadata_batch_size):
+            self._check_cancelled()
             batch = targets[i:i+self.metadata_batch_size]
             batch_res = {}
             try:
@@ -106,10 +112,13 @@ class RepositoryEnricher:
                     batch_res = self.graphql_client.get_repositories_batch(batch)
                 else:
                     batch_res = self.graphql_client.get_repositories_batch(batch, projection=self.metadata_projection)
+            except CancelledError:
+                raise
             except Exception as e:
                 logger.warning(f"Batch {i//self.metadata_batch_size + 1} failed, retrying one-by-one: {e}")
                 # Retry the batch one repo at a time
                 for owner, name in batch:
+                    self._check_cancelled()
                     try:
                         # Reuse the lean query for singleton retries too. The
                         # full repository query includes README blobs, which
@@ -121,6 +130,8 @@ class RepositoryEnricher:
                                 [(owner, name)], projection=self.metadata_projection
                             )
                         batch_res.update(retry_res)
+                    except CancelledError:
+                        raise
                     except Exception as e2:
                         logger.warning(f"Individual fetch failed for {owner}/{name}: {e2}")
 
@@ -161,6 +172,8 @@ class RepositoryEnricher:
                         if readme_futures is not None
                         else self.graphql_client.get_readme(owner, name)
                     )
+                except CancelledError:
+                    raise
                 except Exception as exc:
                     warning = f"README fetch failed: {type(exc).__name__}: {exc}"
                     result.warnings.append(warning[:500])
