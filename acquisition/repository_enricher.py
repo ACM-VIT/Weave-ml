@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
+from copy import deepcopy
+import hashlib
 from datetime import datetime, timezone
 import math
 import re
@@ -13,10 +15,14 @@ import logging
 from .github_graphql_client import (
     FetchedReadme,
     GitHubGraphQLClient,
+    GitHubGraphQLClientError,
     build_readme_base_url,
 )
 from .graphql_queries import README_CANDIDATES
-from utils.readme_processor import ReadmeDocument, process_markdown
+from .models import AcquisitionFailure
+from utils.readme_processor import README_PROCESSING_VERSION, ReadmeDocument, process_markdown
+from .github_rate_limit import GitHubRequestBudget
+from .readme_cache import README_DOCUMENT_CACHE
 from .identity import normalize_repository_name, repository_identity_key
 from .config import metadata_batch_size as validated_metadata_batch_size
 
@@ -36,6 +42,14 @@ class EnrichmentResult:
     warnings: list[str] = field(default_factory=list)
 
 
+class EnrichmentBatch(list[EnrichmentResult]):
+    """List-compatible successful results with explicit failed identities."""
+
+    def __init__(self, *, failures: list[AcquisitionFailure]) -> None:
+        super().__init__()
+        self.failures = failures
+
+
 class RepositoryEnricher:
     def __init__(
         self,
@@ -51,6 +65,52 @@ class RepositoryEnricher:
         self.metadata_projection = metadata_projection
         self.readme_scheduler = readme_scheduler
         self.graphql_client = graphql_client or GitHubGraphQLClient()
+
+    def _process_readme(
+        self, value: str, *, source_path: str | None,
+        default_branch: str | None, base_url: str | None,
+    ) -> ReadmeDocument:
+        source_commit = getattr(value, "source_commit", None)
+        blob_oid = getattr(value, "blob_oid", None)
+        scope = getattr(value, "authorization_scope", None)
+        repository = getattr(value, "source_repository", None)
+
+        def process() -> ReadmeDocument:
+            document = process_markdown(
+                str(value), source_path=source_path,
+                default_branch=default_branch, base_url=base_url,
+            )
+            document.source_commit = source_commit
+            document.blob_oid = blob_oid
+            return document
+
+        if not (scope and repository and source_path and blob_oid):
+            return process()
+        # Include media resolution context and processing version; the same
+        # blob can appear on a renamed branch/path or under a different parser.
+        key = (
+            scope, repository, source_path, blob_oid, README_PROCESSING_VERSION,
+            source_commit, default_branch, base_url,
+            hashlib.sha256(str(value).encode("utf-8")).hexdigest(),
+        )
+        deadline = getattr(self.graphql_client, "deadline", None)
+        deadline = deadline if type(deadline) in {int, float} else None
+        budget = GitHubRequestBudget(
+            deadline=deadline, defer_retries=False,
+            cancelled=lambda: bool(self.readme_scheduler is not None and self.readme_scheduler.cancelled),
+        )
+        try:
+            document = README_DOCUMENT_CACHE.get_or_load(
+                key, process, budget,
+                size=lambda result: len(result.raw_markdown.encode("utf-8"))
+                + len(result.clean_text.encode("utf-8"))
+                + sum(len(paragraph.encode("utf-8")) for paragraph in result.extracted_paragraphs),
+            )
+            # Downstream summary stages may mutate ReadmeDocument. They must
+            # never modify a canonical/shared artifact seen by another caller.
+            return deepcopy(document)
+        finally:
+            budget.finish()
 
     def _check_cancelled(self) -> None:
         if self.readme_scheduler is not None and self.readme_scheduler.cancelled:
@@ -76,6 +136,8 @@ class RepositoryEnricher:
                 result = self._enrich_graphql(owner, name, discovery_category, discovery_band)
                 if result:
                     return result
+            except (CancelledError, TimeoutError):
+                raise
             except Exception as e:
                 logger.warning(f"GraphQL enrichment failed for {full_name}: {e}.")
 
@@ -102,6 +164,15 @@ class RepositoryEnricher:
                     }
         
         results = []
+        metadata_failures: list[AcquisitionFailure] = []
+
+        def failed_rows(rows: list[tuple[str, str]], error: GitHubGraphQLClientError) -> None:
+            metadata_failures.extend(
+                AcquisitionFailure(f"{owner}/{name}", "metadata_enrichment", error.safe_diagnostic)
+                for owner, name in rows
+            )
+            logger.warning("Metadata chunk failed: %s", error.safe_diagnostic)
+
         # Pass 1: batch metadata (no readme — avoids 502 on large repos)
         for i in range(0, len(targets), self.metadata_batch_size):
             self._check_cancelled()
@@ -114,26 +185,30 @@ class RepositoryEnricher:
                     batch_res = self.graphql_client.get_repositories_batch(batch, projection=self.metadata_projection)
             except CancelledError:
                 raise
-            except Exception as e:
-                logger.warning(f"Batch {i//self.metadata_batch_size + 1} failed, retrying one-by-one: {e}")
-                # Retry the batch one repo at a time
-                for owner, name in batch:
+            except GitHubGraphQLClientError as exc:
+                # The client already exhausted/classified this request. Keep
+                # prior chunks and record only the failed identities; never
+                # fan out a transport/auth/rate failure into new retry loops.
+                if exc.category != "response" or len(batch) == 1:
+                    failed_rows(batch, exc)
+                    continue
+                logger.warning("Metadata response failed; isolating repository rows")
+                for position, (owner, name) in enumerate(batch):
                     self._check_cancelled()
                     try:
-                        # Reuse the lean query for singleton retries too. The
-                        # full repository query includes README blobs, which
-                        # Pass 2 would immediately fetch a second time.
-                        if self.metadata_projection == "legacy":
-                            retry_res = self.graphql_client.get_repositories_batch([(owner, name)])
-                        else:
-                            retry_res = self.graphql_client.get_repositories_batch(
-                                [(owner, name)], projection=self.metadata_projection
-                            )
+                        retry_res = self.graphql_client.get_repositories_batch(
+                            [(owner, name)], projection=self.metadata_projection,
+                        )
                         batch_res.update(retry_res)
                     except CancelledError:
                         raise
-                    except Exception as e2:
-                        logger.warning(f"Individual fetch failed for {owner}/{name}: {e2}")
+                    except GitHubGraphQLClientError as retry_exc:
+                        if retry_exc.category != "response":
+                            # Preserve already resolved singleton rows too;
+                            # unqueried siblings stay retryable, not amplified.
+                            failed_rows(batch[position:], retry_exc)
+                            break
+                        failed_rows([(owner, name)], retry_exc)
 
             for full_name, data in batch_res.items():
                 if not data:
@@ -156,7 +231,7 @@ class RepositoryEnricher:
             r.repo_id: tuple(r.repo_id.split("/", 1))
             for r in results
         }
-        enriched = []
+        enriched = EnrichmentBatch(failures=metadata_failures)
         readme_futures = (
             self.readme_scheduler.ordered(owner_name_map[result.repo_id] for result in results)
             if self.readme_scheduler is not None else None
@@ -175,11 +250,12 @@ class RepositoryEnricher:
                 except CancelledError:
                     raise
                 except Exception as exc:
-                    warning = f"README fetch failed: {type(exc).__name__}: {exc}"
+                    diagnostic = exc.safe_diagnostic if isinstance(exc, GitHubGraphQLClientError) else str(exc)
+                    warning = f"README fetch failed: {type(exc).__name__}: {diagnostic}"
                     result.warnings.append(warning[:500])
-                    logger.warning("README fetch failed for %s: %s", repo_id, exc)
+                    logger.warning("README fetch failed for %s: %s", repo_id, diagnostic)
 
-            if readme_text:
+            if readme_text or isinstance(readme_text, FetchedReadme):
                 source_path = getattr(readme_text, "source_path", None)
                 default_branch = (
                     getattr(readme_text, "default_branch", None)
@@ -190,8 +266,8 @@ class RepositoryEnricher:
                     base_url = build_readme_base_url(
                         owner, name, default_branch, source_path
                     )
-                readme = process_markdown(
-                    str(readme_text),
+                readme = self._process_readme(
+                    readme_text,
                     source_path=source_path,
                     default_branch=default_branch,
                     base_url=base_url,
@@ -271,8 +347,8 @@ class RepositoryEnricher:
             readme_base_url = build_readme_base_url(
                 owner, name, readme_default_branch, source_path
             )
-        readme = process_markdown(
-            str(readme_text or ""),
+        readme = self._process_readme(
+            readme_text or "",
             source_path=source_path,
             default_branch=readme_default_branch,
             base_url=readme_base_url,

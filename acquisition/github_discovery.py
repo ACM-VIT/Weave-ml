@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import random
 from dataclasses import dataclass
+from concurrent.futures import CancelledError
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -150,6 +151,8 @@ class GitHubDiscoveryEngine:
                 per_page = min(self.config.per_query, max(per_category * 2, 10))
                 try:
                     repos = self._search_graphql(query, per_page)
+                except (CancelledError, TimeoutError):
+                    raise
                 except Exception as exc:
                     logger.warning(f"Discovery query failed for {category}/{band}: {exc}")
                     continue

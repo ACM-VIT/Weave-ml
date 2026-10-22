@@ -1315,3 +1315,118 @@ def test_discovery_waiter_deadline_does_not_cancel_shared_owner():
     cache.publish(owner, b"valid")
     assert cache.result(owner) == b"valid"
     assert cache.snapshot()["waiters"] == 0
+
+
+def test_cached_discovery_refill_failure_keeps_checked_missing_profile_results():
+    client = HeavyRankerQdrant()
+    retriever = QdrantV2Retriever(
+        client=client, heavy_ranker_enabled=False,
+        discovery_revision_provider=lambda: DiscoveryRevision("corpus", "eligible"),
+    )
+    retriever.recommend_batch(client.user_id, 2, [])
+    # No semantic candidates can hide a dropped discovery fallback.
+    client.retrieve = Mock(return_value=[])
+    client.scroll = Mock(side_effect=TimeoutError("refill unavailable"))
+
+    batch = retriever.recommend_batch(client.user_id, 2, [client.repo_ids[0]])
+
+    assert batch.retrieval_mode == "profile_missing_discovery"
+    assert [item.repo_id for item in batch.items] == [client.repo_ids[1]]
+    assert len(client.query_calls) == 1  # Only the warm request was personalized.
+    assert client.scroll.call_count == 4
+    assert retriever.discovery_cache_status()["entries"] == 1
+
+
+def test_successful_discovery_refill_merges_without_losing_checked_candidates():
+    client = HeavyRankerQdrant()
+    retriever = QdrantV2Retriever(
+        client=client, heavy_ranker_enabled=False,
+        discovery_revision_provider=lambda: DiscoveryRevision("corpus", "eligible"),
+    )
+    retriever._discovery(3, include_vectors=False)
+    new_id = str(uuid.uuid4())
+    client.scroll = Mock(side_effect=lambda **_kwargs: ([
+        client._point(client.repo_ids[1], stars=10),
+        client._point(new_id, stars=20),
+    ], None))
+
+    points = retriever._discovery(
+        3, include_vectors=False, exclude_repo_ids={client.repo_ids[0]},
+    )
+
+    ids = [point.repo_id for point, _source in points]
+    assert len(ids) == len(set(ids)) == 2
+    assert ids == [client.repo_ids[1], new_id]
+    assert client.scroll.call_count == 4
+    # Personalized refill must not replace or augment shared pool contents.
+    shared_again = retriever._discovery(3, include_vectors=False)
+    assert {point.repo_id for point, _source in shared_again} == set(client.repo_ids)
+    assert client.scroll.call_count == 4
+
+
+@pytest.mark.parametrize("invalidation", ["revision", "ttl"])
+@pytest.mark.parametrize("refill_succeeds", [False, True])
+def test_refill_never_reuses_a_pool_that_expires_or_changes_during_reads(
+    invalidation, refill_succeeds,
+):
+    client = HeavyRankerQdrant()
+    now = [0.0]
+    revision = [DiscoveryRevision("before", "eligible")]
+    retriever = QdrantV2Retriever(
+        client=client, heavy_ranker_enabled=False,
+        discovery_revision_provider=lambda: revision[0],
+        discovery_cache=SharedDiscoveryCache(ttl_seconds=5, clock=lambda: now[0]),
+    )
+    retriever._discovery(3, include_vectors=False)
+    new_id = str(uuid.uuid4())
+
+    def refill(**_kwargs):
+        if invalidation == "revision":
+            revision[0] = DiscoveryRevision("after", "eligible")
+        else:
+            now[0] = 5.0
+        if not refill_succeeds:
+            raise TimeoutError("refill unavailable")
+        return [client._point(new_id, stars=20)], None
+
+    client.scroll = refill
+    if refill_succeeds:
+        points = retriever._discovery(
+            3, include_vectors=False, exclude_repo_ids={client.repo_ids[0]},
+        )
+        assert [point.repo_id for point, _source in points] == [new_id]
+    else:
+        with pytest.raises(RetrievalDependencyError):
+            retriever._discovery(
+                3, include_vectors=False, exclude_repo_ids={client.repo_ids[0]},
+            )
+
+
+def test_partial_owner_refill_cannot_extend_its_original_pool_ttl():
+    client = HeavyRankerQdrant()
+    now = [0.0]
+    calls = [0]
+    lock = threading.Lock()
+
+    def scroll(**_kwargs):
+        with lock:
+            calls[0] += 1
+            call = calls[0]
+        if call == 1:
+            return [client._point(repo_id, stars=10) for repo_id in client.repo_ids], None
+        if call > 4:
+            now[0] = 5.0  # The uncached partial owner's original lease expires.
+        raise TimeoutError("remaining discovery/refill channels unavailable")
+
+    client.scroll = scroll
+    retriever = QdrantV2Retriever(
+        client=client, heavy_ranker_enabled=False,
+        discovery_revision_provider=lambda: DiscoveryRevision("corpus", "eligible"),
+        discovery_cache=SharedDiscoveryCache(ttl_seconds=5, clock=lambda: now[0]),
+    )
+    with pytest.raises(RetrievalDependencyError):
+        retriever._discovery(
+            3, include_vectors=False, exclude_repo_ids={client.repo_ids[0]},
+        )
+    assert calls[0] == 8
+    assert retriever.discovery_cache_status()["entries"] == 0

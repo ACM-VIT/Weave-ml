@@ -182,9 +182,9 @@ class QdrantV2Retriever:
         discovery_cache: SharedDiscoveryCache | None = None,
     ) -> None:
         validate_retrieval_runtime()
-        self.qdrant_timeout_seconds = float(os.getenv("QDRANT_TIMEOUT_SECONDS", "10"))
-        if not math.isfinite(self.qdrant_timeout_seconds) or self.qdrant_timeout_seconds <= 0:
-            raise ValueError("QDRANT_TIMEOUT_SECONDS must be finite and positive")
+        self.qdrant_timeout_seconds = self._float_env(
+            "QDRANT_TIMEOUT_SECONDS", default=10.0, minimum=1.0, maximum=120.0,
+        )
         self.client = client or QdrantClient(
             url=QDRANT_URL,
             api_key=QDRANT_API_KEY,
@@ -992,6 +992,24 @@ class QdrantV2Retriever:
             chunks.append(encoded)
         return b"".join(chunks)
 
+    def _checked_discovery_pool_current(
+        self, plan: _DiscoveryPlan, *, cached_pool: bool,
+    ) -> bool:
+        # Refill I/O may outlive the authority snapshot or the original TTL.
+        # Reusing a checked pool must never silently renew either guarantee.
+        if self._discovery_revision() != plan.revision:
+            return False
+        if plan.lease is None or not self._discovery_cache.lease_fresh(plan.lease):
+            return False
+        if cached_pool:
+            try:
+                self._discovery_cache.result(plan.lease)
+            except CooperativeDeadlineExceeded:
+                raise
+            except Exception:
+                return False
+        return True
+
     def _complete_discovery(
         self, work: RetrievalWork, plan: _DiscoveryPlan, limit: int,
         cache: dict[tuple[str, bool], _EligibleRepositoryPoint | None] | None, *,
@@ -1004,6 +1022,7 @@ class QdrantV2Retriever:
                 exclude_repo_ids=exclude_repo_ids,
             )
         partial: list[tuple[_EligibleRepositoryPoint, str]] | None = None
+        partial_is_cached = False
         try:
             if lease.owner:
                 channels, succeeded = self._collect_discovery_channels(
@@ -1046,6 +1065,11 @@ class QdrantV2Retriever:
             )
             if not exclude_repo_ids or len(result) >= min(limit, self.max_candidates):
                 return result
+            # Preserve this already-checked pool across refill. It is still a
+            # historical snapshot, not a newly refreshed result; recheck its
+            # authority and original TTL immediately before any later reuse.
+            partial = result
+            partial_is_cached = True
             # Refill is per-request, server-filtered BEFORE channel limits and
             # never written back into the shared unfiltered pool.
         except CooperativeDeadlineExceeded:
@@ -1068,14 +1092,24 @@ class QdrantV2Retriever:
             work, limit, include_vectors=include_vectors, exclude_repo_ids=exclude_repo_ids,
         )
         try:
-            return self._collect_discovery(
+            refill = self._collect_discovery(
                 work, futures, limit, cache, include_vectors=include_vectors,
                 exclude_repo_ids=exclude_repo_ids,
             )
         except RetrievalDependencyError:
-            if partial:
-                return partial  # Preserve completed channels if refill is unavailable.
+            if partial and self._checked_discovery_pool_current(
+                plan, cached_pool=partial_is_cached,
+            ):
+                return partial  # Still-valid checked points, not fabricated fresh data.
             raise
+        combined = self._merge_discovery_channels(
+            [partial or [], refill], min(limit, self.max_candidates), exclude_repo_ids,
+        )
+        if partial and self._checked_discovery_pool_current(
+            plan, cached_pool=partial_is_cached,
+        ):
+            return combined
+        return refill
 
     def discovery_cache_status(self) -> dict[str, Any]:
         return {

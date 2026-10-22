@@ -152,6 +152,11 @@ class SharedDiscoveryCache:
                 lease.waiting = False
                 self._waiters -= 1
 
+    def lease_fresh(self, lease: PoolLease) -> bool:
+        # A partial refresh can fail before publishing a pool Future. Its
+        # per-request fallback still cannot extend the original refresh TTL.
+        return self._clock() < lease.started_at + self.ttl_seconds
+
     def snapshot(self) -> dict[str, int | float]:
         with self._lock:
             self._expire()

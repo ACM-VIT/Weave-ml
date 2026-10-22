@@ -85,7 +85,7 @@ def _words(value: str) -> list[str]:
 
 def _near_copy(summary: str, source: str) -> bool:
     summary_words = _words(summary)
-    source_words = _words(source[:MAX_PREPROCESS_CHARS])
+    source_words = _words(source)
     joined_summary = " ".join(summary_words)
     joined_source = " ".join(source_words)
     if len(joined_summary) >= 80 and joined_summary in joined_source:
@@ -191,6 +191,10 @@ def validate_generated_summary(
     """Return normalized safe content or raise deterministic validation errors."""
 
     sources = tuple(source for source in comparison_texts if source)
+    if any(len(source) > MAX_PREPROCESS_CHARS for source in sources):
+        # The source builder fails closed at this bound. Keep direct validation
+        # callers equally strict instead of silently omitting a source suffix.
+        raise SummaryValidationError(("source comparison exceeds the preprocessing bound",))
     reasons = _unsafe_text(content.summary)
     normalized = normalize_summary(content.summary)
     if len(normalized) > CARD_SUMMARY_MAX_CHARS:

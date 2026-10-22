@@ -10,6 +10,10 @@ from dataclasses import dataclass
 from typing import Any
 
 
+# Bump whenever parser rules or derived-view limits change. Immutable blobs
+# do not need invalidation, but their transformed artifacts do.
+README_PROCESSING_VERSION = "markdown-v1"
+
 # Derived views are bounded before any decoding/cleanup; canonical Markdown is
 # retained separately in ReadmeDocument and in backend ingestion payloads.
 MAX_PREPROCESS_CHARS = 64_000
@@ -40,6 +44,8 @@ class ReadmeDocument:
     source_path: str | None = None
     default_branch: str | None = None
     base_url: str | None = None
+    source_commit: str | None = None
+    blob_oid: str | None = None
 
 
 def decode_readme_payload(payload: dict[str, Any] | None) -> str:
