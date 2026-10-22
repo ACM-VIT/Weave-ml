@@ -20,6 +20,7 @@ from typing import Any, Callable, TypeVar
 
 from config import EMBEDDING_MODEL_REVISION, REPOSITORY_EMBEDDING_MODEL
 from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
+from embedding.tower_cache import TowerEmbeddingCache
 from embedding.embeddings import SentenceTransformerEmbedder
 from embedding.query_cache import QueryEmbeddingCache
 from scripts.user_onboarding import UserOnboardingPipeline
@@ -138,6 +139,9 @@ class BoundedEmbeddingModel:
         # Cache lifetime follows this exact loaded encoder, not a reusable ID.
         self.query_embedding_cache = QueryEmbeddingCache()
         self.query_embedding_revision = embedding_model_revision()
+        self.tower_embedding_cache = TowerEmbeddingCache(
+            model=self, model_revision=self.query_embedding_revision,
+        )
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be positive")
         self._max_concurrency = max_concurrency
@@ -180,6 +184,7 @@ class BoundedEmbeddingModel:
                 "EMBEDDING_MAX_CONCURRENCY", 1, maximum=8
             ),
             "embedding_runtime_ready": True,
+            "tower_embedding_cache": self.tower_embedding_cache.snapshot(),
             "embedding_cpu_threads": _positive_int(
                 "EMBEDDING_CPU_THREADS", 1, maximum=64
             ),
@@ -222,6 +227,7 @@ def repository_embedding_pipeline() -> RepositoryEmbeddingPipeline:
             model=model,
         ),
         card_summarizer=card_summary_pipeline(),
+        tower_cache=model.tower_embedding_cache,
     )
 
 
