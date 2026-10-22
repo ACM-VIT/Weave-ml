@@ -438,7 +438,9 @@ def test_exclusion_filter_keeps_defensive_validation_and_deduplication(
 
 def test_qdrant_only_retrieval_deduplicates_and_rejects_legacy_identity():
     client = FakeQdrant()
-    retriever = QdrantV2Retriever(client=client)
+    # Isolate hybrid retrieval identity/deduplication; required-heavy repository
+    # hydration is covered with HeavyRankerQdrant below.
+    retriever = QdrantV2Retriever(client=client, heavy_ranker_enabled=False)
     items = retriever.recommend(client.user_id, 10, [])
     assert {item.repo_id for item in items} == set(client.repo_ids)
     assert len(items) == 2
