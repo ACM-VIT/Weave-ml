@@ -201,6 +201,9 @@ def enrich_repositories(
                     batch_index, batch = futures[future]
                     try:
                         results = future.result()
+                        metadata_failures = list(getattr(results, "failures", ()) or ())
+                        failures.extend(metadata_failures)
+                        failed_names = {repository_identity_key(failure.repository) for failure in metadata_failures}
                         clean_results = []
                         for result in results:
                             warnings = list(getattr(result, "warnings", []))
@@ -218,7 +221,7 @@ def enrich_repositories(
                         returned = {repository_identity_key(result.repo_id) for result in results}
                         for candidate in batch:
                             name = repository_name_from_candidate(candidate)
-                            if repository_identity_key(name) not in returned:
+                            if repository_identity_key(name) not in returned and repository_identity_key(name) not in failed_names:
                                 failures.append(
                                     AcquisitionFailure(name, "enrichment", "repository was not returned by enrichment")
                                 )
@@ -232,10 +235,12 @@ def enrich_repositories(
                     except CancelledError:
                         raise
                     except Exception as exc:
-                        logger.warning("  Batch %d/%d failed: %s", batch_index + 1, len(batches), exc)
+                        from acquisition.github_graphql_client import GitHubGraphQLClientError
+                        diagnostic = exc.safe_diagnostic if isinstance(exc, GitHubGraphQLClientError) else str(exc)
+                        logger.warning("  Batch %d/%d failed: %s", batch_index + 1, len(batches), diagnostic)
                         results_by_batch[batch_index] = []
                         failures.extend(
-                            AcquisitionFailure(repository_name_from_candidate(candidate), "batch_enrichment", str(exc))
+                            AcquisitionFailure(repository_name_from_candidate(candidate), "batch_enrichment", diagnostic)
                             for candidate in batch
                         )
             except BaseException:

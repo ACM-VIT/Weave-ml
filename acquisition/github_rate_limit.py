@@ -22,6 +22,9 @@ import time
 import weakref
 from typing import Any
 
+COORDINATOR_CAPACITY = 256
+COORDINATOR_IDLE_SECONDS = 300.0
+
 
 class GitHubRetryLater(Exception):
     """Resume this same logical operation after a monotonic admission time."""
@@ -75,6 +78,8 @@ class GitHubRateLimitCoordinator:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._scope_key: str | None = None
+        self._last_used = time.monotonic()
         self._remaining: int | None = None
         self._reset_at = 0.0
         self._blocked_until = 0.0
@@ -86,7 +91,8 @@ class GitHubRateLimitCoordinator:
     def admit(self) -> float | None:
         """Reserve known quota or return a delay; never wait in a worker."""
         now = time.monotonic()
-        with self._lock:
+        with _registry_lock, self._lock:
+            self._retain_locked(now)
             if self._reset_at and now >= self._reset_at:
                 self._remaining = None
                 self._reset_at = 0.0
@@ -121,7 +127,8 @@ class GitHubRateLimitCoordinator:
             if reset_wall is None:
                 reset_wall = _timestamp(rate_limit.get("resetAt"))
         reset_at = now + max(0.0, reset_wall - wall_now) if reset_wall is not None else 0.0
-        with self._lock:
+        with _registry_lock, self._lock:
+            self._retain_locked(now)
             if cost is not None:
                 self._cost = max(1, cost)
             if remaining is not None:
@@ -156,7 +163,8 @@ class GitHubRateLimitCoordinator:
                 pass
         # Honor the whole server delay, not a capped sleep followed by early IO.
         ready_at = now + max(delays or [60.0])
-        with self._lock:
+        with _registry_lock, self._lock:
+            self._retain_locked(now)
             self._counters["throttled"] += 1
             self._block_locked(ready_at)
             return self._blocked_until
@@ -165,6 +173,22 @@ class GitHubRateLimitCoordinator:
         # First admission after reset is jittered too, not just its followers.
         self._blocked_until = max(self._blocked_until, ready_at + random.uniform(0.05, 0.25))
         self._stagger_until = max(self._stagger_until, self._blocked_until + 5.0)
+
+    def _retain_locked(self, now: float) -> None:
+        # Registry pruning and quota updates acquire registry -> coordinator.
+        # Re-pin before changing a cooldown, including an idle live instance
+        # whose old retention horizon was already pruned.
+        self._last_used = now
+        if self._scope_key is not None:
+            _retained_scopes[self._scope_key] = self
+
+    @property
+    def retention_deadline(self) -> float:
+        with self._lock:
+            return max(
+                self._last_used + COORDINATOR_IDLE_SECONDS, self._reset_at,
+                self._blocked_until, self._next_admission, self._stagger_until,
+            )
 
     def count(self, name: str) -> None:
         with self._lock:
@@ -200,8 +224,9 @@ def _timestamp(value: Any) -> float | None:
         return None
 
 
-_registry_lock = threading.Lock()
+_registry_lock = threading.RLock()
 _registry: weakref.WeakValueDictionary[str, GitHubRateLimitCoordinator] = weakref.WeakValueDictionary()
+_retained_scopes: dict[str, GitHubRateLimitCoordinator] = {}
 _process_key = os.urandom(32)
 
 
@@ -212,8 +237,20 @@ def github_coordination_key(endpoint: str, credential: str | None) -> str:
 
 def shared_github_coordinator(key: str) -> GitHubRateLimitCoordinator:
     with _registry_lock:
+        now = time.monotonic()
+        # Only expired retention pins may leave. The weak live-instance index
+        # still preserves any caller-owned coordinator, so it cannot fork into
+        # two independent quota states while an older client remains alive.
+        for scope in tuple(_retained_scopes):
+            if _retained_scopes[scope].retention_deadline <= now:
+                _retained_scopes.pop(scope)
         coordinator = _registry.get(key)
         if coordinator is None:
+            if len(_registry) >= COORDINATOR_CAPACITY:
+                # Never forget a live/cooling scope to admit a new credential.
+                raise RuntimeError("GitHub quota coordinator capacity reached")
             coordinator = GitHubRateLimitCoordinator()
+            coordinator._scope_key = key
             _registry[key] = coordinator
+        _retained_scopes[key] = coordinator
         return coordinator

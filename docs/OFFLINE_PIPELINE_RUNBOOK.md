@@ -166,6 +166,23 @@ credential labels. These are admission/attempt counters, not measured throughput
 or proof of bytes saved. Fake-clock concurrency/cancellation and injected-throttle
 throughput measurements remain required before claiming runtime acceptance.
 
+Quota state survives client collection through its known reset/cooldown/stagger
+horizon and a five-minute idle retention period. At most 256 live or retained
+credential scopes are admitted. Expired idle pins can be removed, but live
+coordinators remain discoverable; a full registry rejects new scopes rather
+than dropping a live/cooling limit. Registry pruning and quota updates share a
+consistent lock order to avoid losing a concurrently extended cooldown.
+
+RATE_LIMITED replies retry when the selected operation's required result is
+unresolved: an unrelated repository name or rateLimit object is not usable
+README ref/blob content. Healthy resolved partial metadata rows are retained.
+Metadata chunk failures carry their exact repository identities and controlled
+GitHub category/status diagnostics while earlier successful chunks continue to
+README enrichment. Exhausted transport/auth/rate failures do not trigger new
+singleton retry loops. Response bodies and token-bearing messages are not used
+for these GitHub failure records. These paths still require deferred fake-clock,
+chunk-preservation and diagnostics acceptance coverage.
+
 ## Immutable README cache
 
 Every get_readme operation revalidates the current default-branch commit and

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import hashlib
 import json
 import math
@@ -50,6 +51,12 @@ class GitHubGraphQLClientError(RuntimeError):
         } else "response"
         self.status_code = status_code if type(status_code) is int and 100 <= status_code <= 599 else None
 
+    @property
+    def safe_diagnostic(self) -> str:
+        """Controlled fields only: safe to persist without response bodies."""
+        return f"GitHub request failed (category={self.category}, status={self.status_code or 'unknown'})"
+
+
 # Backwards-compatible alias so existing callers don't break
 GitHubClientError = GitHubGraphQLClientError
 
@@ -81,6 +88,89 @@ def _failed_repository_aliases(
             continue
         failed.add(path[0])
     return failed
+
+
+def _usable_throttled_data(query: str, variables: dict[str, Any] | None, data: Any, errors: list[dict[str, Any]]) -> bool:
+    """Require the selected operation's usable result, not arbitrary leaves."""
+    if not isinstance(data, dict):
+        return False
+    words = query.lstrip().split(None, 2)
+    operation = words[1].split("(", 1)[0] if len(words) > 1 and words[0] == "query" else ""
+    repo = data.get("repository")
+
+    def oid(value: Any) -> bool:
+        return isinstance(value, str) and len(value) in {40, 64} and all(c in "0123456789abcdef" for c in value)
+
+    def readme_text() -> bool:
+        return isinstance(repo, dict) and any(
+            isinstance(repo.get(alias), dict) and isinstance(repo[alias].get("text"), str) and bool(repo[alias]["text"])
+            for alias, _path in README_CANDIDATES
+        )
+
+    if operation == "GetBatchMetadata":
+        aliases = set(re.findall(r"\b(repo_\d+)\s*:\s*repository", query))
+        try:
+            failed = _failed_repository_aliases(errors, aliases)
+        except GitHubClientError:
+            return False
+        return any(
+            alias not in failed and isinstance(data.get(alias), dict)
+            and isinstance(data[alias].get("nameWithOwner"), str) and bool(data[alias]["nameWithOwner"])
+            and "description" in data[alias]
+            for alias in aliases
+        )
+    if operation == "SearchRepositories":
+        search = data.get("search")
+        nodes = search.get("nodes") if isinstance(search, dict) else None
+        return isinstance(nodes, list) and any(
+            isinstance(node, dict) and isinstance(node.get("nameWithOwner"), str) and bool(node["nameWithOwner"])
+            for node in nodes
+        )
+    if operation == "GetReadme":
+        return readme_text()
+    if operation == "GetRepository":
+        try:
+            failed = _failed_repository_aliases(errors, {"repository"}, ignored_child_fields={alias for alias, _ in README_CANDIDATES})
+            readme_failed = _failed_repository_aliases(errors, {"repository"})
+        except GitHubClientError:
+            return False
+        return not failed and isinstance(repo, dict) and isinstance(repo.get("nameWithOwner"), str) and bool(repo["nameWithOwner"]) and "description" in repo and (
+            readme_text() or (not readme_failed and all(
+                alias in repo and (repo[alias] is None or (
+                    isinstance(repo[alias], dict) and isinstance(repo[alias].get("text"), str)
+                )) for alias, _ in README_CANDIDATES
+            ))
+        )
+    if not isinstance(repo, dict):
+        return False
+    if operation == "GetReadmeRef":
+        ref = repo.get("defaultBranchRef")
+        target = ref.get("target") if isinstance(ref, dict) else None
+        return isinstance(target, dict) and oid(target.get("oid"))
+    if operation == "GetReadmeManifest":
+        return any(
+            isinstance(repo.get(alias), dict) and oid(repo[alias].get("oid"))
+            and type(repo[alias].get("byteSize")) is int and repo[alias]["byteSize"] > 0
+            and repo[alias].get("isBinary") is False
+            for alias, _path in README_CANDIDATES
+        )
+    if operation == "GetReadmeBlob":
+        blob = repo.get("object")
+        if not isinstance(blob, dict) or not oid(blob.get("oid")) or blob.get("oid") != (variables or {}).get("oid"):
+            return False
+        text = blob.get("text")
+        if not isinstance(text, str) or blob.get("isBinary") is not False:
+            return False
+        try:
+            raw = text.encode("utf-8")
+        except UnicodeError:
+            return False
+        digest = hashlib.sha1 if len(blob["oid"]) == 40 else hashlib.sha256
+        return type(blob.get("byteSize")) is int and len(raw) == blob["byteSize"] and digest(
+            b"blob " + str(len(raw)).encode() + b"\0" + raw
+        ).hexdigest() == blob["oid"]
+    # Unknown operations cannot prove that their required fields resolved.
+    return False
 
 
 class FetchedReadme(str):
@@ -639,7 +729,7 @@ class GitHubGraphQLClient:
             )
             if rate_limited:
                 ready_at = self.rate_limits.throttle(response.headers)
-                if not data_field:
+                if not _usable_throttled_data(query, variables, data_field, errors or []):
                     if attempt >= self.max_retries or not self.sleep_on_rate_limit:
                         raise GitHubClientError("GitHub GraphQL rate limit exceeded", category="rate_limit", status_code=response.status_code)
                     self._retry(identity, attempt, budget, deferred, ready_at=ready_at)
