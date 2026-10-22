@@ -114,6 +114,14 @@ class HeavyRankerQdrant:
 
     def retrieve(self, **kwargs):
         self.retrieve_calls.append(kwargs)
+        if kwargs["ids"] != [self.user_id]:
+            return [
+                self._project(
+                    self._point(repo_id, stars=100 if repo_id == self.repo_ids[0] else 10),
+                    kwargs.get("with_payload"),
+                )
+                for repo_id in kwargs["ids"]
+            ]
         return [
             SimpleNamespace(
                 id=self.user_id,
@@ -317,7 +325,7 @@ def test_history_exclusions_do_not_exhaust_a_bounded_candidate_pool(
     assert len(returned_ids) == len(set(returned_ids)) == 45
     assert set(returned_ids) <= set(corpus.repo_ids[excluded_count:])
     assert batch.ranker_applied is heavy
-    assert len(corpus.client.retrieve.call_args_list) == 1
+    assert len(corpus.client.retrieve.call_args_list) == (2 if heavy else 1)
     assert len(corpus.client.query_points.call_args_list) == 1
     assert len(corpus.client.scroll.call_args_list) == 4
     assert corpus.client.query_points.call_args.kwargs["limit"] == 150
@@ -414,6 +422,13 @@ def test_exclusion_filter_keeps_defensive_validation_and_deduplication(
     # existing in-process exclusion, canonical-ID, feature and vector checks.
     corpus.client.query_points.side_effect = lambda **kwargs: SimpleNamespace(points=points)
     corpus.client.scroll.side_effect = lambda **kwargs: (points, None)
+    original_retrieve = corpus.client.retrieve.side_effect or corpus.client.retrieve._mock_wraps
+    by_id = {point.id: point for point in points}
+    corpus.client.retrieve.side_effect = lambda **kwargs: (
+        original_retrieve(**kwargs)
+        if kwargs["collection_name"] == corpus.user_collection
+        else [by_id[repo_id] for repo_id in kwargs["ids"] if repo_id in by_id]
+    )
 
     batch = retriever.recommend_batch(corpus.user_id, 45, [excluded, excluded])
 
@@ -509,10 +524,14 @@ def test_v2_heavy_ranker_reranks_full_vector_candidates_and_reports_served_model
     ]
     assert ranker.calls[0][1] == ["Python", "recommendation"]
     assert all(len(candidate["embedding"]) == 384 for candidate in ranker.calls[0][2])
-    assert client.query_calls[0]["with_vectors"] == ["repo_embedding"]
-    assert all(
-        call["with_vectors"] == ["repo_embedding"] for call in client.scroll_calls
-    )
+    assert client.query_calls[0]["with_vectors"] is False
+    assert all(call["with_vectors"] is False for call in client.scroll_calls)
+    vector_calls = [call for call in client.retrieve_calls
+                    if call["collection_name"] == retriever.repository_collection]
+    assert len(vector_calls) == 1
+    assert vector_calls[0]["with_vectors"] == [QDRANT_VECTOR_NAME]
+    assert len(vector_calls[0]["ids"]) == len(set(vector_calls[0]["ids"])) == 2
+    assert set(vector_calls[0]["ids"]) == set(client.repo_ids)
 
 
 def test_followed_owner_repositories_receive_only_a_small_capped_boost():
@@ -598,7 +617,7 @@ def test_v2_filters_eligibility_before_limits_and_uses_ordered_discovery():
     retriever.recommend(client.user_id, 2, [])
 
     # Hybrid serving does not transfer repository vectors that it never uses;
-    # heavy-canary requests opt into vectors and validate them before scoring.
+    # Heavy requests retrieve only retained vectors in a separate batch.
     assert client.query_calls[0]["with_vectors"] is False
     assert "description" not in client.query_calls[0]["with_payload"]
     assert "topics" not in client.query_calls[0]["with_payload"]
@@ -963,3 +982,111 @@ def test_health_rejects_a_missing_required_payload_index():
 
     with pytest.raises(RuntimeError, match="embedding_version.*missing"):
         retriever.health()
+
+
+@pytest.mark.parametrize("change", ["deleted", "ineligible", "version", "embedding", "feature", "shape", "nonfinite"])
+def test_retained_vector_batch_rejects_changed_points_before_any_fallback(change):
+    client = HeavyRankerQdrant()
+    ranker = DeterministicHeavyRanker()
+    # An optional ranker failure must not reintroduce a rejected snapshot.
+    ranker.score_batch = lambda *_args: []
+    retriever = QdrantV2Retriever(
+        client=client, ranker=ranker, heavy_ranker_enabled=True,
+        heavy_ranker_required=False, heavy_ranker_traffic_percent=100,
+    )
+    original_retrieve = client.retrieve
+
+    def retrieve(**kwargs):
+        records = original_retrieve(**kwargs)
+        if kwargs["collection_name"] != retriever.repository_collection:
+            return records
+        bad = next(point for point in records if point.id == client.repo_ids[0])
+        if change == "deleted":
+            return [point for point in records if point is not bad]
+        if change == "ineligible":
+            bad.payload.pop(REPOSITORY_SERVING_ELIGIBILITY_FIELD)
+        elif change == "version":
+            bad.payload["content_version"] += 1
+        elif change == "embedding":
+            bad.payload["embedding_version"] = "incompatible-version"
+        elif change == "feature":
+            bad.payload["feature_version"] = 99
+        elif change == "shape":
+            bad.vector = {QDRANT_VECTOR_NAME: [1.0]}
+        elif change == "nonfinite":
+            bad.vector = {QDRANT_VECTOR_NAME: [float("nan")] * REPOSITORY_EMBEDDING_DIM}
+        return records
+
+    client.retrieve = retrieve
+    batch = retriever.recommend_batch(client.user_id, 2, [], "changed-point")
+
+    assert [item.repo_id for item in batch.items] == [client.repo_ids[1]]
+    assert batch.ranker_applied is False
+    vector_call = client.retrieve_calls[-1]
+    assert set(vector_call["ids"]) == set(client.repo_ids)
+    assert len(vector_call["ids"]) == 2
+
+
+def test_vector_batch_only_fetches_deduplicated_retained_ids():
+    client = HeavyRankerQdrant()
+    client.repo_ids = [str(uuid.UUID(int=index + 1)) for index in range(80)]
+    ranker = DeterministicHeavyRanker()
+    def score_batch(vector, skills, candidates):
+        ranker.calls.append((vector, skills, candidates))
+        return [
+            {"repo_id": item["id"], "final_score": 1 - index / 100}
+            for index, item in enumerate(candidates)
+        ]
+    ranker.score_batch = score_batch
+    original_query = client.query_points
+
+    def query(**kwargs):
+        response = original_query(**kwargs)
+        # Many dropped, overlapping semantic candidates, with stable tie order.
+        response.points = [client._project(
+            client._point(repo_id, score=0.5, stars=100 if index == 0 else 10),
+            kwargs.get("with_payload"),
+        ) for index, repo_id in enumerate(client.repo_ids)]
+        return response
+
+    client.query_points = query
+    retriever = QdrantV2Retriever(
+        client=client, ranker=ranker, max_candidates=50,
+        heavy_ranker_enabled=True, heavy_ranker_required=True,
+    )
+    retriever.recommend_batch(client.user_id, 2, [], "retained-only")
+
+    vector_calls = [call for call in client.retrieve_calls
+                    if call["collection_name"] == retriever.repository_collection]
+    assert len(vector_calls) == 1
+    ids = vector_calls[0]["ids"]
+    assert len(ids) == len(set(ids)) == 50
+    assert set(ids) == {item["id"] for item in ranker.calls[0][2]}
+    assert not set(ids) & set(client.repo_ids[50:])
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_retained_vector_dependency_failure_preserves_required_heavy_policy(required):
+    client = HeavyRankerQdrant()
+    ranker = DeterministicHeavyRanker()
+    retriever = QdrantV2Retriever(
+        client=client, ranker=ranker, heavy_ranker_enabled=True,
+        heavy_ranker_required=required, heavy_ranker_traffic_percent=100,
+    )
+    original_retrieve = client.retrieve
+
+    def retrieve(**kwargs):
+        if kwargs["collection_name"] == retriever.repository_collection:
+            raise TimeoutError("vector dependency unavailable")
+        return original_retrieve(**kwargs)
+
+    client.retrieve = retrieve
+    if required:
+        with pytest.raises(RetrievalDependencyError, match="required V2 heavy ranker"):
+            retriever.recommend_batch(client.user_id, 2, [])
+    else:
+        batch = retriever.recommend_batch(client.user_id, 2, [])
+        assert batch.ranker_applied is False
+        assert batch.fallback_code == "CANDIDATE_VECTORS_UNAVAILABLE"
+        assert {item.repo_id for item in batch.items} == set(client.repo_ids)
+    assert not ranker.calls

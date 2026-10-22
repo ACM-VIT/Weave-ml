@@ -19,7 +19,7 @@ from utils.deadline import check_deadline, remaining_seconds
 
 
 T = TypeVar("T")
-_STAGES = ("profile", "semantic", "trend", "activity", "popularity", "freshness", "search")
+_STAGES = ("profile", "semantic", "trend", "activity", "popularity", "freshness", "vectors", "search")
 _pool_lock = threading.Lock()
 _pool: _RetrievalIO | None = None
 
