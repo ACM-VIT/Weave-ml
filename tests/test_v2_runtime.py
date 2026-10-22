@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import threading
-import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -91,9 +91,21 @@ async def test_interrupted_recommendation_keeps_admission_until_worker_exits(
 async def test_recommendation_deadline_includes_queue_time_and_is_request_local(monkeypatch):
     executor = ThreadPoolExecutor(max_workers=1)
     admission = threading.BoundedSemaphore(2)
-    started, release = threading.Event(), threading.Event()
+    started, release, queued = (threading.Event() for _ in range(3))
+    clock = SimpleNamespace(now=100.0)
+    submissions = []
+
+    def submit(*args):
+        future = executor.submit(*args)
+        submissions.append(future)
+        if len(submissions) == 2:
+            queued.set()
+        return future
+
+    # Patch only the runtime's clock; asyncio retains its real event-loop clock.
+    monkeypatch.setattr(runtime, "time", SimpleNamespace(monotonic=lambda: clock.now))
     monkeypatch.setattr(runtime, "recommendation_admission", lambda: admission)
-    monkeypatch.setattr(runtime, "recommendation_executor", lambda: executor)
+    monkeypatch.setattr(runtime, "recommendation_executor", lambda: SimpleNamespace(submit=submit))
     monkeypatch.setattr(runtime, "recommendation_timeout_seconds", lambda: 2.0)
 
     def block():
@@ -104,15 +116,18 @@ async def test_recommendation_deadline_includes_queue_time_and_is_request_local(
     second = None
     try:
         assert await asyncio.to_thread(started.wait, 1)
-        submitted_at = time.monotonic()
         second = asyncio.create_task(runtime.run_recommendation_job(
-            lambda: (runtime.current_recommendation_deadline(), time.monotonic())
+            lambda: (runtime.current_recommendation_deadline(), clock.now)
         ))
-        await asyncio.sleep(0.05)
+        assert await asyncio.to_thread(queued.wait, 1)
+        # Advance time only after the second job is queued behind the blocker.
+        clock.now = 100.5
         release.set()
         deadline, worker_started = await second
         await first
-        assert submitted_at + 2 <= deadline < worker_started + 1.99
+        assert deadline == 102.0
+        assert worker_started == 100.5
+        assert deadline - worker_started == 1.5
         assert runtime.current_recommendation_deadline() is None
         assert executor.submit(runtime.current_recommendation_deadline).result(1) is None
     finally:
