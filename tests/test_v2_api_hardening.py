@@ -119,7 +119,7 @@ def test_onboarding_timeout_is_reported_as_retryable(monkeypatch) -> None:
     async def exhausted_deadline(*_args, **_kwargs):
         raise EmbeddingDeadlineExceeded("queued too long")
 
-    with patch("api.v2.run_embedding_job", side_effect=exhausted_deadline):
+    with patch("api.v2.run_onboarding_job", side_effect=exhausted_deadline):
         response = TestClient(api_main.app).post(
             "/api/v2/users/onboard",
             headers={"x-internal-secret": "test-internal-secret"},
@@ -394,9 +394,11 @@ def test_embedding_runtime_loads_one_shared_model_for_both_pipelines(monkeypatch
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("anyio_backend", ["asyncio"])
+@pytest.mark.parametrize("job_class", ["repository", "onboarding"])
 async def test_cancelled_embedding_keeps_capacity_until_worker_finishes(
     monkeypatch,
     anyio_backend,
+    job_class,
 ) -> None:
     class RecordingAdmission:
         def __init__(self) -> None:
@@ -429,7 +431,14 @@ async def test_cancelled_embedding_keeps_capacity_until_worker_finishes(
 
     monkeypatch.setattr(embedding_runtime, "embedding_admission", lambda: admission)
     monkeypatch.setattr(embedding_runtime, "embedding_executor", lambda: executor)
-    task = asyncio.create_task(embedding_runtime.run_embedding_job(blocking_job))
+    run_job = (
+        embedding_runtime.run_embedding_job
+        if job_class == "repository"
+        else embedding_runtime.run_onboarding_job
+    )
+    if job_class == "onboarding":
+        monkeypatch.setattr(embedding_runtime, "onboarding_executor", lambda: executor)
+    task = asyncio.create_task(run_job(blocking_job))
     try:
         assert await asyncio.to_thread(started.wait, 2)
         task.cancel()
@@ -447,7 +456,7 @@ async def test_cancelled_embedding_keeps_capacity_until_worker_finishes(
                 break
             await asyncio.sleep(0)
         assert admission.releases == 1
-        assert await embedding_runtime.run_embedding_job(lambda: "accepted") == "accepted"
+        assert await run_job(lambda: "accepted") == "accepted"
         assert admission.releases == 2
     finally:
         allow_finish.set()

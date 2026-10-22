@@ -44,6 +44,7 @@ from embedding.runtime import (
     repository_embedding_pipeline,
     shared_embedding_model,
     run_embedding_job,
+    run_onboarding_job,
     shutdown_embedding_runtime,
     user_onboarding_pipeline,
 )
@@ -992,7 +993,7 @@ async def refresh_repository(request: RepositoryRefreshJob, http_request: Reques
 @router.post("/users/onboard", dependencies=[Depends(require_internal_secret)])
 async def onboard_user(request: OnboardingJob, http_request: Request):
     try:
-        return await run_embedding_job(_onboard_user_job, request)
+        return await run_onboarding_job(_onboard_user_job, request)
     except HTTPException:
         raise
     except EmbeddingCapacityError as exc:

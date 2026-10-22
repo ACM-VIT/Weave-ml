@@ -1,9 +1,9 @@
 """Process-scoped, bounded runtime for online embedding work.
 
 Repository and user embeddings deliberately share one frozen encoder.  This
-module owns that encoder and a small executor so API request pools cannot create
-one transformer per job or allow embedding bursts to starve recommendation
-threads.
+module owns that encoder and bounded job-class executors so API request pools
+cannot create one transformer per job. Repository provider/storage waits do not
+occupy onboarding workers, while admission stays bounded across both classes.
 """
 
 from __future__ import annotations
@@ -209,18 +209,47 @@ def embedding_executor() -> ThreadPoolExecutor:
 
 
 @lru_cache(maxsize=1)
+def onboarding_executor() -> ThreadPoolExecutor:
+    # Separate pipeline execution, not separate model capacity. Each queue is
+    # bounded by the same process-wide admission semaphore below.
+    workers = _positive_int("EMBEDDING_EXECUTOR_WORKERS", 1, maximum=8)
+    return ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="ml-onboarding",
+    )
+
+
+@lru_cache(maxsize=1)
 def embedding_admission() -> threading.BoundedSemaphore:
     return threading.BoundedSemaphore(embedding_max_outstanding_jobs())
 
 
 async def run_embedding_job(function: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    return await _run_embedding_job(embedding_executor, function, *args, **kwargs)
+
+
+async def run_onboarding_job(function: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    """Run admitted onboarding independently of repository provider/storage waits.
+
+    Both classes retain the existing total admission ceiling. A saturated global
+    ceiling still rejects new work rather than reserving or overcommitting slots.
+    """
+    return await _run_embedding_job(onboarding_executor, function, *args, **kwargs)
+
+
+async def _run_embedding_job(
+    executor_factory: Callable[[], ThreadPoolExecutor],
+    function: Callable[..., T],
+    *args: Any,
+    **kwargs: Any,
+) -> T:
     admission = embedding_admission()
     if not admission.acquire(blocking=False):
         raise EmbeddingCapacityError(
             "the bounded embedding executor is at capacity"
         )
     try:
-        future = embedding_executor().submit(function, *args, **kwargs)
+        future = executor_factory().submit(function, *args, **kwargs)
     except BaseException:
         admission.release()
         raise
@@ -273,6 +302,9 @@ def shutdown_embedding_runtime() -> None:
     if embedding_executor.cache_info().currsize:
         embedding_executor().shutdown(wait=False, cancel_futures=True)
         embedding_executor.cache_clear()
+    if onboarding_executor.cache_info().currsize:
+        onboarding_executor().shutdown(wait=False, cancel_futures=True)
+        onboarding_executor.cache_clear()
     embedding_admission.cache_clear()
     repository_embedding_pipeline.cache_clear()
     user_onboarding_pipeline.cache_clear()
