@@ -207,16 +207,40 @@ jobs:
               "$image_ref" \
               python -m scripts.bootstrap_qdrant
 
+            # Total API startup ceiling, including restart/pre-start work and
+            # model loading before the separately validated <=300s warmup timer.
+            # This is a finite allowance, not a guarantee for arbitrary loading.
+            startup_budget_seconds=600
+
+            restart_api_with_deadline() {
+              local remaining=$(($1 - SECONDS))
+              if (( remaining <= 0 )); then return 1; fi
+              sudo /usr/bin/timeout --signal=KILL "${remaining}s" \
+                systemctl restart gh-social-ml
+            }
+
             run_smoke() {
-              sudo docker exec -i gh-social-ml python - "$@" < "$smoke_path"
+              local command_budget=$1
+              shift
+              sudo /usr/bin/timeout --signal=KILL "${command_budget}s" \
+                docker exec -i gh-social-ml python - "$@" < "$smoke_path"
             }
 
             wait_for_health() {
-              for attempt in $(seq 1 24); do
-                if run_smoke --health-only --timeout 8; then
-                  return 0
+              local deadline=$1
+              local remaining attempt_budget
+              while (( SECONDS < deadline )); do
+                remaining=$((deadline - SECONDS))
+                attempt_budget=$remaining
+                if (( attempt_budget > 15 )); then attempt_budget=15; fi
+                if run_smoke "$attempt_budget" --health-only --timeout 8; then
+                  if (( SECONDS < deadline )); then return 0; fi
+                  return 1
                 fi
-                sleep 5
+                remaining=$((deadline - SECONDS))
+                if (( remaining <= 0 )); then break; fi
+                if (( remaining > 5 )); then remaining=5; fi
+                sleep "$remaining"
               done
               return 1
             }
@@ -255,7 +279,11 @@ jobs:
               unit=$1
               was_active=$2
               if [ "$was_active" = "true" ]; then
-                sudo systemctl restart "$unit"
+                if [ "$unit" = "gh-social-ml" ]; then
+                  restart_api_with_deadline "$3" || return 1
+                else
+                  sudo systemctl restart "$unit" || return 1
+                fi
                 sudo systemctl is-active --quiet "$unit"
               else
                 sudo systemctl stop "$unit" >/dev/null 2>&1 || true
@@ -337,7 +365,8 @@ jobs:
                 restore_enablement gh-social-ml "$api_was_enabled" || rollback_restored=false
                 restore_enablement gh-social-ml-feedback "$feedback_was_enabled" || rollback_restored=false
                 restore_activity gh-social-ml-feedback "$feedback_was_active" || rollback_restored=false
-                restore_activity gh-social-ml "$api_was_active" || rollback_restored=false
+                rollback_deadline=$((SECONDS + startup_budget_seconds))
+                restore_activity gh-social-ml "$api_was_active" "$rollback_deadline" || rollback_restored=false
                 sudo unlink "$validator_path.new-$transaction_id" >/dev/null 2>&1 || true
                 sudo unlink "$smoke_path.new-$transaction_id" >/dev/null 2>&1 || true
                 sudo unlink "$api_unit.new-$transaction_id" >/dev/null 2>&1 || true
@@ -349,7 +378,7 @@ jobs:
 
                 rollback_verified=false
                 if [ "$rollback_restored" = "true" ] && [ "$had_current" = "true" ] && [ "$api_was_active" = "true" ]; then
-                  if wait_for_health && run_smoke --timeout 10; then
+                  if wait_for_health "$rollback_deadline" && run_smoke 30 --timeout 10; then
                     rollback_verified=true
                   fi
                 fi
@@ -393,9 +422,10 @@ jobs:
             sudo systemctl enable gh-social-ml
             sudo systemctl enable gh-social-ml-feedback
             sudo systemctl restart gh-social-ml-feedback
-            sudo systemctl restart gh-social-ml
+            startup_deadline=$((SECONDS + startup_budget_seconds))
+            restart_api_with_deadline "$startup_deadline"
 
-            if wait_for_health && run_smoke --timeout 10; then
+            if wait_for_health "$startup_deadline" && run_smoke 30 --timeout 10; then
               echo "Forward release passed smoke verification"
             else
               false
