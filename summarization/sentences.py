@@ -7,18 +7,20 @@ generated-output validation use exactly the same boundaries.
 import re
 import unicodedata
 
-_END = re.compile(r"[.!?](?:[\"')\]]+)?(?=\s|$)")
+_END = re.compile(r"[.!?](?:[\"'”’)\]]+)?(?=\s|$)")
 
 
-def _masked(value: str) -> str:
-    value = re.sub(r"\b(?:e\.g|i\.e)\.", lambda m: m[0].replace(".", "·"), value, flags=re.I)
+def mask_summary_abbreviations(value: str) -> str:
+    # Use explicit ASCII token boundaries, matching JavaScript even when a
+    # Latin abbreviation is adjacent to Chinese or other non-Latin text.
+    value = re.sub(r"(?<![A-Za-z0-9_])(?:e\.g|i\.e)\.", lambda m: m[0].replace(".", "·"), value, flags=re.I | re.A)
     value = re.sub(
-        r"\b(?:Mr|Mrs|Ms|Dr|Prof|Jr|Sr|vs)\.(?=\s+([^\W\d_]))",
+        r"(?<![A-Za-z0-9_])(?:Mr|Mrs|Ms|Dr|Prof|Jr|Sr|vs)\.(?=\s+(\S))",
         lambda m: m[0].replace(".", "·") if unicodedata.category(m[1]).startswith("L") else m[0],
         value,
     )
     return re.sub(
-        r"\b(?:etc\.|(?:[A-Z]\.){2,})(?=\s+([^\W\d_]))",
+        r"(?<![A-Za-z0-9_])(?:etc\.|(?:[A-Z]\.){2,})(?=\s+(\S))",
         lambda m: m[0].replace(".", "·") if unicodedata.category(m[1]) == "Ll" else m[0],
         value,
     )
@@ -27,7 +29,7 @@ def _masked(value: str) -> str:
 def split_summary_sentences(value: str) -> list[str]:
     result: list[str] = []
     start = 0
-    for match in _END.finditer(_masked(value)):
+    for match in _END.finditer(mask_summary_abbreviations(value)):
         result.append(value[start:match.end()].strip())
         start = match.end()
     if value[start:].strip():
@@ -36,4 +38,9 @@ def split_summary_sentences(value: str) -> list[str]:
 
 
 def has_two_or_three_complete_sentences(value: str) -> bool:
-    return len(_END.findall(_masked(value))) in {2, 3} and bool(_END.search(value[-4:]))
+    endings = list(_END.finditer(mask_summary_abbreviations(value)))
+    return len(endings) in {2, 3} and endings[-1].end() == len(value)
+
+
+def has_complete_sentence_ending(value: str) -> bool:
+    return any(match.end() == len(value) for match in _END.finditer(mask_summary_abbreviations(value)))

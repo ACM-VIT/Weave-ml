@@ -62,3 +62,16 @@ def test_generated_abbreviations_and_subject_matter_do_not_trigger_repair():
     assert artifact.source == 'generated'
     assert artifact.summary == summary
     assert provider.calls == 1
+
+
+@pytest.mark.parametrize('description', [
+    '它支持多种格式e.g. JSON and YAML. Developers can add custom parsers.',
+    '它支持多种格式i.e. JSON and YAML. Developers can add custom parsers.',
+    'It provides a review workspace. Teams call it "easy to follow."',
+    'It provides a review workspace. Teams call it “easy to follow.”',
+    'It compares policies, e.g. GPL. Teams can review package choices.',
+])
+def test_fallback_keeps_both_semantic_sentences_and_their_punctuation(description):
+    assert len(split_summary_sentences(description)) == 2
+    repo = {'full_name': 'weave/compatibility', 'description': description}
+    assert CardSummaryPipeline().summarize(repo, repo).summary == description

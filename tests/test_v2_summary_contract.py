@@ -69,7 +69,7 @@ def _job(*, job_id: str | None = None, content_hash: str = "content-hash") -> Re
     )
 
 
-def _artifact(summary: str = "A concise discovery summary explains the repository to developer-tool maintainers. Its focused review workflow helps teams coordinate changes before they affect shared users.") -> CardSummaryArtifact:
+def _artifact(summary: str = "A concise discovery summary explains the repository to developer-tool maintainers. Its focused review workflow helps distributed teams coordinate changes before they affect shared users and downstream integrations.") -> CardSummaryArtifact:
     return CardSummaryArtifact(
         summary=summary,
         highlights=["Review workflow"],
@@ -471,6 +471,59 @@ def test_previously_saved_abbreviation_fallback_is_repaired(same_job):
         response = _embed_repository_job_locked(request, OwnedLock())
     assert response['status'] == ('duplicate' if same_job else 'current')
     assert response['card_summary']['summary'] == request.repository.description
+
+
+@pytest.mark.parametrize('same_job', [True, False], ids=['duplicate', 'current'])
+@pytest.mark.parametrize('invalid_kind', ['GPL', 'highlight', 'unfinished', 'command', 'Markdown', 'copied'])
+def test_invalid_fingerprinted_artifact_is_repaired_in_real_qdrant(same_job, invalid_kind):
+    request = _job()
+    pipeline = RepositoryEmbeddingPipeline(embedder=FakeEmbedder())
+    repo = request.repository.model_dump(mode='json')
+    result = pipeline.embed_repository(repo)
+    old_artifact = pipeline.card_summarizer.summarize(repo, repo)
+    values = old_artifact.model_dump()
+    if invalid_kind == 'GPL':
+        values['summary'] = 'GPL. Teams can redistribute the software.'
+    elif invalid_kind == 'highlight':
+        values['highlights'] = ['GPL v3 or later']
+    elif invalid_kind == 'unfinished':
+        values['summary'] = 'It supports shared workflows. Teams can review changes. Users share updates. Formats include, e.g.'
+    elif invalid_kind == 'command':
+        values['summary'] = 'Run npm install to use the tool. Teams can review changes.'
+    elif invalid_kind == 'Markdown':
+        values['summary'] = '# Review workspace. Teams can review changes.'
+    else:
+        values = _artifact().model_dump()
+        request.repository.readme = values['summary']
+        # Keep the complete canonical payload consistent with the copied source.
+        result = pipeline.embed_repository(request.repository.model_dump(mode='json'))
+    malformed = CardSummaryArtifact.model_validate(values)
+    stored_job = str(request.job_id) if same_job else str(uuid.uuid4())
+    result.payload['content_version'] = request.content_version
+    result.payload['content_hash'] = request.repository.content_hash
+    result.payload['content_job_id'] = stored_job
+    result.payload.update(card_summary_payload(malformed))
+    client, store = _qdrant_store()
+    try:
+        store.upsert([result])
+        with patch('api.v2._repository_points', side_effect=lambda _id: client.retrieve(
+            store.collection_name, [REPO_ID], with_payload=True
+        )), patch('api.v2.repository_embedding_pipeline', return_value=pipeline), patch(
+            'api.v2.repository_store', return_value=store
+        ):
+            repaired = _embed_repository_job_locked(request, OwnedLock())
+            replayed = _embed_repository_job_locked(request, OwnedLock())
+        assert repaired['status'] == ('duplicate' if same_job else 'current')
+        assert repaired['card_summary'] != malformed.model_dump(mode='json')
+        assert replayed['card_summary'] == repaired['card_summary']
+        stored = client.retrieve(store.collection_name, [REPO_ID], with_payload=True)[0]
+        current = card_summary_from_payload(stored.payload)
+        assert current is not None
+        assert pipeline.card_summarizer.is_current(current, repo=request.repository.model_dump(mode='json'))
+        assert stored.payload['content_version'] == request.content_version
+        assert stored.payload['content_job_id'] == stored_job
+    finally:
+        client.close()
 
 
 def test_unicode_boundary_artifact_survives_qdrant_persistence_and_replay():

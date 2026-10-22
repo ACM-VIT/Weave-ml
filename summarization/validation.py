@@ -16,7 +16,7 @@ from .contracts import (
     CARD_SUMMARY_MIN_GENERATED_CHARS,
     CardSummaryContent,
 )
-from .sentences import has_two_or_three_complete_sentences
+from .sentences import has_two_or_three_complete_sentences, mask_summary_abbreviations
 
 
 _MARKDOWN = re.compile(
@@ -178,7 +178,7 @@ def _unsafe_text(value: str) -> list[str]:
         reasons.append("summary contains Markdown structure or code")
     if _COMMAND.search(value):
         reasons.append("summary contains a command or installation instruction")
-    if _README_SECTION.search(value) or _LICENSE_BOILERPLATE.search(value):
+    if _README_SECTION.search(value) or _LICENSE_BOILERPLATE.search(mask_summary_abbreviations(value)):
         reasons.append("summary contains an excluded README section")
     return reasons
 

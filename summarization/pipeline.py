@@ -19,9 +19,15 @@ from .contracts import (
 from .provider import SummaryProvider, SummaryProviderError
 from .settings import SummarySettings
 from .source import build_summary_source
-from .sentences import has_two_or_three_complete_sentences, split_summary_sentences
+from .sentences import (
+    has_complete_sentence_ending,
+    has_two_or_three_complete_sentences,
+    mask_summary_abbreviations,
+    split_summary_sentences,
+)
 from .validation import (
     _LICENSE_BOILERPLATE,
+    _unsafe_text,
     SummaryValidationError,
     normalize_summary,
     parse_summary_response,
@@ -52,7 +58,7 @@ def _bounded(value: str, maximum: int) -> str:
     candidate = value[: maximum + 1].rsplit(" ", 1)[0].rstrip(" ,;:-")
     if not candidate:
         candidate = value[:maximum].rstrip(" ,;:-")
-    if candidate and candidate[-1] not in ".!?":
+    if candidate and not has_complete_sentence_ending(candidate):
         candidate = candidate[: maximum - 1].rstrip(" ,;:-") + "."
     return candidate[:maximum]
 
@@ -89,7 +95,7 @@ def description_fallback_artifact(
         normalize_summary(sentence)
         for sentence in split_summary_sentences(raw_description)
         if sentence.strip() and not _UNSAFE_SENTENCE.search(sentence)
-        and not _LICENSE_BOILERPLATE.search(sentence)
+        and not _LICENSE_BOILERPLATE.search(mask_summary_abbreviations(sentence))
     ]
     if len(safe_sentences) >= 2:
         first = _bounded(safe_sentences[0], 175)
@@ -131,11 +137,11 @@ def description_fallback_artifact(
             summary,
             CARD_SUMMARY_MAX_CHARS - len(supplement) - 1,
         )
-        if summary and summary[-1] not in ".!?":
+        if summary and not has_complete_sentence_ending(summary):
             summary = f"{summary}."
         summary = f"{summary} {supplement}"
     summary = _bounded(summary, CARD_SUMMARY_MAX_CHARS)
-    if summary and summary[-1] not in '.!?':
+    if summary and not has_complete_sentence_ending(summary):
         summary = _bounded(summary + '.', CARD_SUMMARY_MAX_CHARS)
     # Truncation or unusual metadata must not create a permanently undeliverable
     # fallback. Keep the same sentence requirement as the canonical backend.
@@ -163,15 +169,30 @@ class CardSummaryPipeline:
         self.settings = settings or SummarySettings()
         self.provider = provider
 
-    def is_current(self, artifact: CardSummaryArtifact) -> bool:
+    def is_current(self, artifact: CardSummaryArtifact, *, repo: Mapping[str, Any] | None = None) -> bool:
         if (
             artifact.prompt_version != self.settings.prompt_version
             or artifact.format_version != self.settings.format_version
             or not has_two_or_three_complete_sentences(artifact.summary)
         ):
             return False
+        # Fingerprints establish integrity, not acceptance under today's rules.
+        # Recheck stored content before duplicate/current replies bypass generation.
+        for text in [artifact.summary, *artifact.highlights]:
+            if _unsafe_text(text) or normalize_summary(text) != text:
+                return False
         if artifact.source == "generated":
-            return artifact.model_version == self.settings.model_id
+            if artifact.model_version != self.settings.model_id:
+                return False
+            material = build_summary_source(repo, repo, max_chars=self.settings.input_max_chars) if repo is not None else None
+            try:
+                validate_generated_summary(
+                    artifact,
+                    comparison_texts=material.comparison_texts if material is not None else (),
+                )
+            except SummaryValidationError:
+                return False
+            return True
         return artifact.model_version == CARD_SUMMARY_FALLBACK_MODEL_VERSION
 
     def should_upgrade(self, artifact: CardSummaryArtifact) -> bool:
