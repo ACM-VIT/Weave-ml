@@ -1325,8 +1325,9 @@ def _readiness_response(
     result = {
         **snapshot,
         "runtime_cleanup": {"state": "not_started", "failed_steps": []},
-        **embedding,
         **getattr(request.app.state, "inference_warmup", {}),
+        # Startup identity is historical; live model/cache fields must win.
+        **embedding,
         "inference_warmup_required": warmup_required,
         "inference_warmup_ready": warmup_ready,
         "inference_warmup_duration_seconds": getattr(

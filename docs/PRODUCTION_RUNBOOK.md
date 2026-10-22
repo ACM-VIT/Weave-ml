@@ -281,6 +281,19 @@ is bounded by `INFERENCE_WARMUP_TIMEOUT_SECONDS` (default 120, range 0.1–300)
 once the inference-warmup worker is submitted. This is not a whole-startup
 deadline: earlier synchronous configuration validation and ranker artifact
 loading/provenance checks run before that timer starts.
+Deployment has a separate 600-second total API-start/readiness ceiling beginning
+before the API restart, including pre-start checks, old-container stop, model
+loading and the configured warmup. The ceiling leaves a finite allowance beyond
+the maximum 300-second inference warmup; it does not guarantee arbitrary artifact
+or model-loading time. Authenticated health attempts have an eight-second HTTP
+timeout and a command limit of at most 15 seconds, capped by the remaining total
+budget; retry sleeps also consume that budget. Final full smoke verification is
+command-bounded to 30 seconds. Rollback gets its own fresh 600-second startup
+window and 30-second verification. Both windows and verifications fit within
+21 minutes, below the existing 35-minute SSH and 60-minute workflow limits;
+staging/bootstrap and all other deployment work still consume those outer
+limits. A startup that exceeds the total ceiling fails deployment and enters
+the existing rollback path rather than extending readiness indefinitely.
 A missing or failed required ranker, encoder failure, startup timeout, or
 cancellation prevents readiness. Non-strict deployments that explicitly set
 `V2_HEAVY_RANKER_REQUIRED=false` preserve hybrid fallback if the optional ranker
