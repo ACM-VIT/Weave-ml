@@ -248,8 +248,13 @@ All health tiers retain internal authentication:
   snapshot without dependency work. Use readiness for traffic/container probes.
   Initial, failed, timed-out, or stale required diagnostics return HTTP 503.
 - `GET /api/v2/health/deep` requests detailed diagnostics, sharing a single actual
-  worker and the same cooldown as the background refresh. It may return a recent
-  snapshot rather than force a new check. It never queues duplicate refreshes.
+  coordinator and the same cooldown as the background refresh. Each actual cycle
+  submits exactly two parallel dependency checks to its own two-worker executor,
+  never back to the reserved coordinator pool. Both actual children are joined
+  before coordinator completion, even on partial submission or failure, so timed-out
+  waiters cannot release their ownership early or race shared-client cleanup.
+  It may return a recent snapshot rather than force a new check and never queues
+  duplicate refreshes.
 
 The process refreshes diagnostics after startup and every
 `V2_HEALTH_REFRESH_SECONDS` (default 15) after the previous bounded wait.

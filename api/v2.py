@@ -7,6 +7,7 @@ import math
 import os
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from functools import lru_cache
 from typing import Any
@@ -1106,24 +1107,25 @@ async def onboard_user(request: OnboardingJob, http_request: Request):
 
 
 def _collect_health_diagnostics(stop: threading.Event) -> tuple[bool, dict[str, Any]]:
-    """Read dependencies once on a reserved worker, retaining safe failures."""
+    """Own two bounded parallel checks until both actual child workers exit."""
     payload: dict[str, Any] = {}
     diagnostics: dict[str, Any] = {}
     healthy = True
     deadline = time.monotonic() + HealthSettings.from_env().timeout_seconds
-    for dependency, check in (("qdrant", _qdrant_health), ("redis", _feedback_health)):
+
+    def check_dependency(dependency: str, check) -> tuple[bool, dict[str, Any], dict[str, Any]]:
+        details: dict[str, Any] = {}
         if stop.is_set() or time.monotonic() >= deadline:
-            healthy = False
-            diagnostics[dependency] = {
+            return False, details, {
                 "status": "not_checked",
                 "reason": "stopping" if stop.is_set() else "deadline_exceeded",
             }
-            continue
         started = time.monotonic()
         outcome = "failed"
+        diagnostic: dict[str, Any] = {"status": "failed", "reason": "dependency_check_failed"}
         try:
             result = check()
-            payload.update(result)
+            details.update(result)
             if dependency == "redis":
                 consumer_required = os.getenv(
                     "V2_FEEDBACK_CONSUMER_REQUIRED", "true"
@@ -1133,16 +1135,31 @@ def _collect_health_diagnostics(stop: threading.Event) -> tuple[bool, dict[str, 
                 if not result.get("feedback_healthy", True):
                     raise RuntimeError("feedback thresholds exceeded")
             outcome = "healthy"
-            diagnostics[dependency] = {"status": "healthy"}
+            diagnostic = {"status": "healthy"}
         except Exception:
-            healthy = False
             # Dependency exceptions can contain URLs/credentials. Keep only a
             # fixed failure category, plus successfully returned diagnostics.
-            diagnostics[dependency] = {"status": "failed", "reason": "dependency_check_failed"}
+            pass
         finally:
             duration = time.monotonic() - started
-            diagnostics[dependency]["duration_seconds"] = duration
+            diagnostic["duration_seconds"] = duration
             record_health_dependency(dependency, outcome, duration)
+        return outcome == "healthy", details, diagnostic
+
+    # Exactly two children belong to this admitted, single-flight coordinator.
+    # They never reenter its reserved pool (which may have only one worker).
+    # The context joins all submitted children even if submission/result handling
+    # fails, so retirement cannot close shared clients under an unfinished RPC.
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ml-health-dependency") as children:
+        checks = [
+            (dependency, children.submit(check_dependency, dependency, check))
+            for dependency, check in (("qdrant", _qdrant_health), ("redis", _feedback_health))
+        ]
+        for dependency, future in checks:
+            dependency_healthy, details, diagnostic = future.result()
+            healthy = healthy and dependency_healthy
+            payload.update(details)
+            diagnostics[dependency] = diagnostic
     payload["dependency_diagnostics"] = diagnostics
     return healthy, payload
 
