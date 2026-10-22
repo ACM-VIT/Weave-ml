@@ -54,7 +54,7 @@ class RequestDeadline:
         # Qdrant's public timeout contract is integer seconds >= 1. Rounding up
         # would exceed the remaining budget; do not launch a sub-second RPC.
         try:
-            timeout = math.floor(min(math.ceil(maximum), self.remaining()))
+            timeout = math.floor(min(maximum, self.remaining()))
             if timeout < 1:
                 self.cancel("timeout")
                 raise CooperativeDeadlineExceeded("insufficient budget for a Qdrant call")

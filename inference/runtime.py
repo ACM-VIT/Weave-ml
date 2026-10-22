@@ -127,7 +127,8 @@ async def run_recommendation_job(function: Callable[..., T], *args: object) -> T
 
     def completed(_future) -> None:
         try:
-            deadline.finish("recommendation")
+            if not _future.cancelled():
+                deadline.finish("recommendation")
         finally:
             _release_recommendation(admission)
     future.add_done_callback(completed)

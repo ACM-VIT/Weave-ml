@@ -150,7 +150,7 @@ class _BoundedExecutor:
             raise
         def completed(_future) -> None:
             try:
-                if deadline is not None:
+                if deadline is not None and not _future.cancelled():
                     deadline.finish(self.operation)
             finally:
                 self._release()
