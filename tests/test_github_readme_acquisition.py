@@ -14,6 +14,7 @@ from acquisition.github_graphql_client import (
 )
 from acquisition.graphql_queries import (
     GET_README_QUERY,
+    GET_README_REF_QUERY,
     README_CANDIDATES,
     build_batch_metadata_query,
 )
@@ -309,7 +310,7 @@ def test_partial_metadata_failure_reaches_acquisition_retry_without_losing_healt
 
     client = GitHubGraphQLClient(token='test-token')
     client.execute = MagicMock(side_effect=lambda query, *args: (
-        _complete_readme_response() if query == GET_README_QUERY else {
+        _complete_readme_response() if query in {GET_README_QUERY, GET_README_REF_QUERY} else {
             'data': {
                 'repo_0': {'nameWithOwner': 'owner/failed', 'description': None},
                 'repo_1': {'nameWithOwner': 'owner/healthy', 'description': 'Healthy project.'},

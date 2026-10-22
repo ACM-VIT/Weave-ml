@@ -253,7 +253,7 @@ def test_metadata_fallback_fetches_readme_only_in_second_pass(projection, readme
                 return response
             if query.count(": repository(") > 1:
                 self.metadata_queries.append(query)
-                raise GitHubGraphQLClientError("batch too large", category="server", status_code=502)
+                raise GitHubGraphQLClientError("unusable batch response", category="response")
             # MetadataFixture marks only the failed identity unresolved, so the
             # healthy singleton must survive and receive exactly one README.
             return super().execute(query, variables)
