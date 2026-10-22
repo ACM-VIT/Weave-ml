@@ -24,6 +24,7 @@ from embedding.embeddings import SentenceTransformerEmbedder
 from embedding.query_cache import QueryEmbeddingCache
 from scripts.user_onboarding import UserOnboardingPipeline
 from summarization.runtime import card_summary_pipeline, shutdown_card_summary_runtime
+from utils.deadline import check_deadline, remaining_seconds
 
 
 T = TypeVar("T")
@@ -152,10 +153,11 @@ class BoundedEmbeddingModel:
         with self._condition:
             self._waiting.append(ticket)
             try:
-                self._condition.wait_for(
-                    lambda: self._waiting[0] is ticket
-                    and self._active < self._max_concurrency
-                )
+                while self._waiting[0] is not ticket or self._active >= self._max_concurrency:
+                    # Preserve FIFO fairness while bounding queue waits. Polling
+                    # observes this job's cancellation without stealing a turn.
+                    self._condition.wait(timeout=remaining_seconds(0.05))
+                check_deadline()
             except BaseException:
                 self._waiting.remove(ticket)
                 self._condition.notify_all()

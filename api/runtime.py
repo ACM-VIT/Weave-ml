@@ -8,9 +8,15 @@ import math
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable, TypeVar
+
+from utils.deadline import (
+    CooperativeDeadlineExceeded, RequestDeadline, check_deadline, current_deadline,
+    deadline_scope, deadline_status,
+)
 
 
 T = TypeVar("T")
@@ -119,6 +125,13 @@ class _BoundedExecutor:
             _instances.add(self)
 
     async def run(self, function: Callable[..., T], *args: Any) -> T:
+        # Durable feedback/refresh jobs deliberately keep their existing semantics.
+        deadline = (current_deadline() or RequestDeadline(self.timeout)) if self.operation == "search" else None
+        if deadline is not None:
+            try:
+                deadline.remaining()
+            except CooperativeDeadlineExceeded as exc:
+                raise ServiceDeadlineExceeded(self.operation) from exc
         if not self.admission.acquire(blocking=False):
             with self._lock:
                 self._rejected += 1
@@ -126,19 +139,43 @@ class _BoundedExecutor:
         with self._lock:
             self._outstanding += 1
         try:
-            future = self.executor.submit(function, *args)
+            with deadline_scope(deadline):
+                context = copy_context()
+            def invoke() -> T:
+                check_deadline()
+                return function(*args)
+            future = self.executor.submit(context.run, invoke)
         except BaseException:
             self._release()
             raise
-        future.add_done_callback(lambda _future: self._release())
+        def completed(_future) -> None:
+            try:
+                if deadline is not None:
+                    deadline.finish(self.operation)
+            finally:
+                self._release()
+        future.add_done_callback(completed)
         try:
             return await asyncio.wait_for(
                 asyncio.wrap_future(future),
-                timeout=self.timeout,
+                timeout=deadline.remaining() if deadline is not None else self.timeout,
             )
+        except CooperativeDeadlineExceeded as exc:
+            if deadline is not None:
+                deadline.cancel("timeout")
+            with self._lock:
+                self._timed_out += 1
+            raise ServiceDeadlineExceeded(self.operation) from exc
+        except asyncio.CancelledError:
+            if deadline is not None:
+                deadline.cancel()
+            future.cancel()
+            raise
         except asyncio.TimeoutError as exc:
             if future.done() and not future.cancelled():
                 return future.result()
+            if deadline is not None:
+                deadline.cancel("timeout")
             with self._lock:
                 self._timed_out += 1
             raise ServiceDeadlineExceeded(self.operation) from exc
@@ -157,6 +194,7 @@ class _BoundedExecutor:
                 "rejected_total": self._rejected,
                 "timed_out_total": self._timed_out,
                 "timeout_seconds": self.timeout,
+                **deadline_status(self.operation),
             }
 
     def close(self) -> None:

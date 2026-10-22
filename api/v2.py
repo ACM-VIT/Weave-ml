@@ -31,6 +31,7 @@ from api.runtime import (
     shutdown_service_runtime,
     validate_service_runtime,
 )
+from api.request_budget import run_read_only_request
 from api.metrics import record_recommendation, render_prometheus
 from config import constant_time_secret_matches, internal_api_header_name
 from embedding.qdrant_store import QdrantRepositoryStore
@@ -71,6 +72,7 @@ from inference.runtime import (
     RecommendationDeadlineExceeded,
     run_recommendation_job,
     recommendation_runtime_status,
+    recommendation_timeout_seconds,
     shutdown_recommendation_runtime,
     validate_recommendation_runtime,
 )
@@ -83,6 +85,7 @@ from summarization.contracts import (
 from summarization.provider import SUMMARY_COMPLETION_RESERVE_SECONDS
 from summarization.settings import SummarySettings
 from utils.readme_processor import clean_markdown_copy, process_markdown
+from utils.deadline import check_deadline
 
 router = APIRouter(prefix="/api/v2", tags=["v2"])
 logger = logging.getLogger("pipeline.api.v2")
@@ -832,14 +835,17 @@ async def generate_recommendations(
     http_request: Request,
 ):
     try:
-        batch = await run_recommendation_job(
-            retriever().recommend_batch,
-            str(request.user_id),
-            request.limit,
-            [str(item) for item in request.exclude_repo_ids],
-            str(request.generation_id),
-            request.context.cold_start,
-            [str(item) for item in request.social_repo_ids],
+        batch = await run_read_only_request(
+            http_request, recommendation_timeout_seconds(),
+            lambda: run_recommendation_job(
+                retriever().recommend_batch,
+                str(request.user_id),
+                request.limit,
+                [str(item) for item in request.exclude_repo_ids],
+                str(request.generation_id),
+                request.context.cold_start,
+                [str(item) for item in request.social_repo_ids],
+            ),
         )
     except HTTPException:
         raise
@@ -1093,7 +1099,9 @@ async def metrics() -> PlainTextResponse:
 
 def _search_repository_job(request: RepositorySearchRequest):
     from api.search import search_repositories
+    check_deadline()
     search_retriever = retriever()
+    check_deadline()
     model = shared_embedding_model()
     embedder = CachedQueryEmbedder(
         model=model, cache=model.query_embedding_cache,
@@ -1115,9 +1123,14 @@ def _search_repository_job(request: RepositorySearchRequest):
     response_model=RepositorySearchResponse,
     dependencies=[Depends(require_internal_secret)],
 )
-async def repository_search(request: RepositorySearchRequest):
+async def repository_search(request: RepositorySearchRequest, http_request: Request):
     try:
-        return await run_service_job("search", _search_repository_job, request)
+        return await run_read_only_request(
+            http_request, service_timeout_seconds("search"),
+            lambda: run_service_job("search", _search_repository_job, request),
+        )
+    except HTTPException:
+        raise
     except (ServiceCapacityError, ServiceDeadlineExceeded) as exc:
         raise HTTPException(
             status_code=503, detail="Semantic search is temporarily unavailable."

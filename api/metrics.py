@@ -168,7 +168,26 @@ def render_prometheus(
             "# TYPE ml_service_executor_timed_out_total counter",
         ]
     )
+    deadline_metrics = {
+        "dependency_calls_total": "Read-only dependency invocation admissions.",
+        "dependency_calls_prevented_total": "Dependency invocations prevented by a read-only budget.",
+        "timeout_worker_exits_total": "Actual worker exits after timeout.",
+        "timeout_to_worker_exit_seconds_total": "Cumulative seconds from timeout to actual worker exit.",
+        "cancelled_worker_exits_total": "Actual worker exits after cancellation.",
+        "cancelled_to_worker_exit_seconds_total": "Cumulative seconds from cancellation to actual worker exit.",
+    }
+    for name, description in deadline_metrics.items():
+        lines.extend((
+            f"# HELP ml_service_executor_{name} {description}",
+            f"# TYPE ml_service_executor_{name} counter",
+        ))
     for operation, values in sorted(service_executors.items()):
+        for name in deadline_metrics:
+            lines.append(
+                f"ml_service_executor_{name}"
+                + _labels(operation=operation)
+                + f" {values.get(name, 0)}"
+            )
         lines.append(
             "ml_service_executor_outstanding"
             + _labels(operation=operation)
