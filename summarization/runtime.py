@@ -16,6 +16,16 @@ def card_summary_pipeline() -> CardSummaryPipeline:
     return CardSummaryPipeline(settings=settings, provider=provider)
 
 
+def card_summary_cleanup_actions():
+    """Capture the provider close independently of its pipeline cache clear."""
+    actions = []
+    if card_summary_pipeline.cache_info().currsize:
+        close = getattr(card_summary_pipeline().provider, "close", None)
+        if callable(close):
+            actions.append(("summary.provider.close", close))
+    return [*actions, ("summary.pipeline.cache.clear", card_summary_pipeline.cache_clear)]
+
+
 def shutdown_card_summary_runtime() -> None:
     if card_summary_pipeline.cache_info().currsize:
         provider = card_summary_pipeline().provider

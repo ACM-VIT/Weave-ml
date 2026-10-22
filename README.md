@@ -200,6 +200,27 @@ still share project modules and one `uv.lock`; the online import-graph tests
 enforce that database code is not imported, and the deployment validator
 prevents database credentials from entering the containers.
 
+Repository ingestion reuses unchanged tower vectors only within the exact loaded,
+frozen encoder's process. The LRU retains at most 768 tower vectors and 2,359,296
+packed-vector bytes, plus bounded entry metadata; it retains no source text,
+payloads, or summaries. No additional worker, flight, or waiter queue is created.
+Restarting/replacing the model starts cold, and other processes do not share it.
+Fingerprints include exact semantic inputs, pinned model revision, preprocessing,
+chunking, dimensions, normalization, and tower weights. Numeric metadata remains
+part of its semantic tower, so counter-only updates recompute metadata while
+README/topics can be reused. New content still rebuilds payloads and summaries
+and passes through the unchanged content-version/CAS path.
+
+Deep diagnostics expose `tower_embedding_cache` hits, misses, invalid entries,
+entry count, and packed-vector bytes in the embedding runtime identity. Measure
+counter deltas over a representative real-update window before considering
+persistent/cross-process storage; aggregate hits include initial indexing and
+retries, so they are not themselves a real-update skip ratio. No measured speedup
+or production skip ratio is asserted. Model/tokenizer weights must remain frozen;
+replace the runtime model/cache rather than mutating them in place. Bump
+`TOWER_PREPROCESSING_VERSION` when changing tower projection/chunk/aggregation
+semantics. Direct pipelines without a supplied model-owned cache stay uncached.
+
 Production configuration uses `V2_HEAVY_RANKER_ENABLED=true`,
 `V2_HEAVY_RANKER_REQUIRED=true`, and traffic percent `100`. In that mode every
 request with an onboarding profile traverses V2 semantic/discovery retrieval,

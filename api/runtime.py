@@ -7,16 +7,18 @@ import atexit
 import math
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable, TypeVar
 
+
 from utils.deadline import (
     CooperativeDeadlineExceeded, RequestDeadline, check_deadline, current_deadline,
     deadline_scope, deadline_status,
 )
+from utils.runtime_lifecycle import runtime_admission
 
 
 T = TypeVar("T")
@@ -118,11 +120,43 @@ class _BoundedExecutor:
         )
         self.admission = threading.BoundedSemaphore(capacity)
         self._lock = threading.Lock()
+        self._settled = threading.Condition(self._lock)
         self._outstanding = 0
         self._rejected = 0
         self._timed_out = 0
         with _instances_lock:
             _instances.add(self)
+
+    def submit(
+        self, function: Callable[..., T], *args: Any,
+        deadline: RequestDeadline | None = None,
+    ) -> Future[T]:
+        """Retain admission until actual worker completion, including cancellation."""
+        with runtime_admission():
+            if not self.admission.acquire(blocking=False):
+                with self._lock:
+                    self._rejected += 1
+                raise ServiceCapacityError(self.operation)
+            with self._lock:
+                self._outstanding += 1
+            try:
+                with deadline_scope(deadline):
+                    context = copy_context()
+                def invoke() -> T:
+                    check_deadline()
+                    return function(*args)
+                future = self.executor.submit(context.run, invoke)
+            except BaseException:
+                self._release()
+                raise
+        def completed(_future) -> None:
+            try:
+                if deadline is not None and not _future.cancelled():
+                    deadline.finish(self.operation)
+            finally:
+                self._release()
+        future.add_done_callback(completed)
+        return future
 
     async def run(self, function: Callable[..., T], *args: Any) -> T:
         # Durable feedback/refresh jobs deliberately keep their existing semantics.
@@ -132,29 +166,7 @@ class _BoundedExecutor:
                 deadline.remaining()
             except CooperativeDeadlineExceeded as exc:
                 raise ServiceDeadlineExceeded(self.operation) from exc
-        if not self.admission.acquire(blocking=False):
-            with self._lock:
-                self._rejected += 1
-            raise ServiceCapacityError(self.operation)
-        with self._lock:
-            self._outstanding += 1
-        try:
-            with deadline_scope(deadline):
-                context = copy_context()
-            def invoke() -> T:
-                check_deadline()
-                return function(*args)
-            future = self.executor.submit(context.run, invoke)
-        except BaseException:
-            self._release()
-            raise
-        def completed(_future) -> None:
-            try:
-                if deadline is not None and not _future.cancelled():
-                    deadline.finish(self.operation)
-            finally:
-                self._release()
-        future.add_done_callback(completed)
+        future = self.submit(function, *args, deadline=deadline)
         try:
             return await asyncio.wait_for(
                 asyncio.wrap_future(future),
@@ -163,8 +175,8 @@ class _BoundedExecutor:
         except CooperativeDeadlineExceeded as exc:
             if deadline is not None:
                 deadline.cancel("timeout")
-            with self._lock:
-                self._timed_out += 1
+            future.cancel()  # A pre-wait expiry must also remove queued work.
+            self.record_timeout()
             raise ServiceDeadlineExceeded(self.operation) from exc
         except asyncio.CancelledError:
             if deadline is not None:
@@ -176,14 +188,18 @@ class _BoundedExecutor:
                 return future.result()
             if deadline is not None:
                 deadline.cancel("timeout")
-            with self._lock:
-                self._timed_out += 1
+            self.record_timeout()
             raise ServiceDeadlineExceeded(self.operation) from exc
 
-    def _release(self) -> None:
+    def record_timeout(self) -> None:
         with self._lock:
+            self._timed_out += 1
+
+    def _release(self) -> None:
+        with self._settled:
             self._outstanding -= 1
-        self.admission.release()
+            self.admission.release()
+            self._settled.notify_all()
 
     def snapshot(self) -> dict[str, int | float]:
         with self._lock:
@@ -200,10 +216,27 @@ class _BoundedExecutor:
     def close(self) -> None:
         self.executor.shutdown(wait=False, cancel_futures=True)
 
+    def drain(self) -> None:
+        # Future.done() is visible before completion callbacks release slots.
+        # Wait for that settlement, not a thread join: diagnostic retirement
+        # may invoke cleanup on the health worker after its own release.
+        if self.operation == "health":
+            with self._settled:
+                settled = self._settled.wait_for(
+                    lambda: self._outstanding == 0,
+                    timeout=min(self.timeout, 1.0),
+                )
+                if not settled:
+                    # Retain this failed drain for the existing owner's retry;
+                    # genuinely stuck work must not permit resource closure.
+                    raise RuntimeError("health workers have not settled")
+        self.executor.shutdown(wait=self.operation != "health", cancel_futures=True)
+
 
 @lru_cache(maxsize=4)
 def _runtime(operation: str) -> _BoundedExecutor:
-    return _BoundedExecutor(operation)
+    with runtime_admission():
+        return _BoundedExecutor(operation)
 
 
 async def run_service_job(
@@ -212,6 +245,20 @@ async def run_service_job(
     *args: Any,
 ) -> T:
     return await _runtime(operation).run(function, *args)
+
+
+def submit_service_job(
+    operation: str,
+    function: Callable[..., T],
+    *args: Any,
+) -> Future[T]:
+    """Submit bounded work for process-owned, single-flight diagnostics."""
+    return _runtime(operation).submit(function, *args)
+
+
+def record_service_job_timeout(operation: str) -> None:
+    """Record a deadline owned by a process-level single-flight coordinator."""
+    _runtime(operation).record_timeout()
 
 
 def service_timeout_seconds(operation: str) -> float:
@@ -226,6 +273,29 @@ def validate_service_runtime() -> None:
 
 def service_runtime_status() -> dict[str, dict[str, int | float]]:
     return {operation: _runtime(operation).snapshot() for operation in _SPECS}
+
+
+def service_runtime_drain_actions():
+    """Capture existing executors for the cleanup plan's pre-resource barrier."""
+    with _instances_lock:
+        instances = tuple(_instances)
+    return [(f"service.{instance.operation}.drain", instance.drain) for instance in instances]
+
+
+def service_runtime_cleanup_actions():
+    """Capture every existing pool without allocating one during shutdown."""
+    with _instances_lock:
+        instances = tuple(_instances)
+
+    def forget_instances():
+        with _instances_lock:
+            _instances.difference_update(instances)
+
+    return [
+        *[(f"service.{instance.operation}.close", instance.close) for instance in instances],
+        ("service.instances.clear", forget_instances),
+        ("service.cache.clear", _runtime.cache_clear),
+    ]
 
 
 def shutdown_service_runtime() -> None:

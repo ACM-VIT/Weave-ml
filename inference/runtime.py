@@ -23,6 +23,7 @@ from utils.deadline import (
     CooperativeDeadlineExceeded, RequestDeadline, check_deadline, current_deadline,
     deadline_scope, deadline_status,
 )
+from utils.runtime_lifecycle import runtime_admission
 
 
 T = TypeVar("T")
@@ -85,11 +86,12 @@ def validate_recommendation_runtime() -> None:
 
 @lru_cache(maxsize=1)
 def recommendation_executor() -> ThreadPoolExecutor:
-    workers = _positive_int("V2_RECOMMENDATION_EXECUTOR_WORKERS", 4, maximum=32)
-    return ThreadPoolExecutor(
-        max_workers=workers,
-        thread_name_prefix="ml-recommendation",
-    )
+    with runtime_admission():
+        workers = _positive_int("V2_RECOMMENDATION_EXECUTOR_WORKERS", 4, maximum=32)
+        return ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="ml-recommendation",
+        )
 
 
 @lru_cache(maxsize=1)
@@ -104,27 +106,27 @@ async def run_recommendation_job(function: Callable[..., T], *args: object) -> T
         deadline.remaining()
     except CooperativeDeadlineExceeded as exc:
         raise RecommendationDeadlineExceeded("recommendation budget expired before admission") from exc
-    admission = recommendation_admission()
-    if not admission.acquire(blocking=False):
+    with runtime_admission():
+        admission = recommendation_admission()
+        if not admission.acquire(blocking=False):
+            with _counter_lock:
+                _rejected = min(_COUNTER_LIMIT, _rejected + 1)
+            raise RecommendationCapacityError(
+                "the bounded recommendation executor is at capacity"
+            )
         with _counter_lock:
-            _rejected = min(_COUNTER_LIMIT, _rejected + 1)
-        raise RecommendationCapacityError(
-            "the bounded recommendation executor is at capacity"
-        )
-    with _counter_lock:
-        _outstanding += 1
-    try:
-        # A fresh Context belongs to this task, never shared across workers.
-        with deadline_scope(deadline):
-            context = copy_context()
-        def invoke() -> T:
-            check_deadline()  # Queue time consumes the same response budget.
-            return function(*args)
-        future = recommendation_executor().submit(context.run, invoke)
-    except BaseException:
-        _release_recommendation(admission)
-        raise
-
+            _outstanding += 1
+        try:
+            # A fresh Context belongs to this task, never shared across workers.
+            with deadline_scope(deadline):
+                context = copy_context()
+            def invoke() -> T:
+                check_deadline()  # Queue time consumes the same response budget.
+                return function(*args)
+            future = recommendation_executor().submit(context.run, invoke)
+        except BaseException:
+            _release_recommendation(admission)
+            raise
     def completed(_future) -> None:
         try:
             if not _future.cancelled():
@@ -139,6 +141,7 @@ async def run_recommendation_job(function: Callable[..., T], *args: object) -> T
         )
     except CooperativeDeadlineExceeded as exc:
         deadline.cancel("timeout")
+        future.cancel()  # Running work retains admission; only queued work stops.
         with _counter_lock:
             _timed_out = min(_COUNTER_LIMIT, _timed_out + 1)
         raise RecommendationDeadlineExceeded("the cooperative recommendation deadline was exceeded") from exc
@@ -181,6 +184,33 @@ def recommendation_runtime_status() -> dict[str, int | float]:
             "timeout_seconds": recommendation_timeout_seconds(),
             **deadline_status("recommendation"),
         }
+
+
+def recommendation_runtime_drain_actions():
+    """Capture the current executor without creating one during retirement."""
+    if not recommendation_executor.cache_info().currsize:
+        return []
+    executor = recommendation_executor()
+    return [(
+        "recommendation.executor.drain",
+        lambda: executor.shutdown(wait=True, cancel_futures=True),
+    )]
+
+
+def recommendation_runtime_cleanup_actions():
+    """Capture the current executor so a failed close remains retryable."""
+    actions = []
+    if recommendation_executor.cache_info().currsize:
+        executor = recommendation_executor()
+        actions.append((
+            "recommendation.executor.close",
+            lambda: executor.shutdown(wait=False, cancel_futures=True),
+        ))
+    return [
+        *actions,
+        ("recommendation.executor.cache.clear", recommendation_executor.cache_clear),
+        ("recommendation.admission.cache.clear", recommendation_admission.cache_clear),
+    ]
 
 
 def shutdown_recommendation_runtime() -> None:
