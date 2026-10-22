@@ -215,6 +215,8 @@ def enrich_repositories(
                             len(clean_results),
                             sum(len(value) for value in results_by_batch.values()),
                         )
+                    except CancelledError:
+                        raise
                     except Exception as exc:
                         logger.warning("  Batch %d/%d failed: %s", batch_index + 1, len(batches), exc)
                         results_by_batch[batch_index] = []
