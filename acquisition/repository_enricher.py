@@ -13,6 +13,7 @@ import logging
 from .github_graphql_client import (
     FetchedReadme,
     GitHubGraphQLClient,
+    GitHubGraphQLClientError,
     build_readme_base_url,
 )
 from .graphql_queries import README_CANDIDATES
@@ -76,6 +77,8 @@ class RepositoryEnricher:
                 result = self._enrich_graphql(owner, name, discovery_category, discovery_band)
                 if result:
                     return result
+            except (CancelledError, TimeoutError):
+                raise
             except Exception as e:
                 logger.warning(f"GraphQL enrichment failed for {full_name}: {e}.")
 
@@ -114,26 +117,27 @@ class RepositoryEnricher:
                     batch_res = self.graphql_client.get_repositories_batch(batch, projection=self.metadata_projection)
             except CancelledError:
                 raise
-            except Exception as e:
-                logger.warning(f"Batch {i//self.metadata_batch_size + 1} failed, retrying one-by-one: {e}")
-                # Retry the batch one repo at a time
+            except GitHubGraphQLClientError as exc:
+                # Transport/server/rate-limit retries are already bounded by the
+                # client. Splitting them into N new retry loops amplifies quota
+                # pressure; permanent auth/HTTP errors must not be retried at all.
+                # Only envelope/field errors can benefit from row isolation.
+                if exc.category != "response" or len(batch) == 1:
+                    raise
+                logger.warning("Metadata response failed; isolating repository rows")
                 for owner, name in batch:
                     self._check_cancelled()
                     try:
-                        # Reuse the lean query for singleton retries too. The
-                        # full repository query includes README blobs, which
-                        # Pass 2 would immediately fetch a second time.
-                        if self.metadata_projection == "legacy":
-                            retry_res = self.graphql_client.get_repositories_batch([(owner, name)])
-                        else:
-                            retry_res = self.graphql_client.get_repositories_batch(
-                                [(owner, name)], projection=self.metadata_projection
-                            )
+                        retry_res = self.graphql_client.get_repositories_batch(
+                            [(owner, name)], projection=self.metadata_projection,
+                        )
                         batch_res.update(retry_res)
                     except CancelledError:
                         raise
-                    except Exception as e2:
-                        logger.warning(f"Individual fetch failed for {owner}/{name}: {e2}")
+                    except GitHubGraphQLClientError as retry_exc:
+                        if retry_exc.category != "response":
+                            raise
+                        logger.warning("Individual metadata response unresolved for %s/%s", owner, name)
 
             for full_name, data in batch_res.items():
                 if not data:
