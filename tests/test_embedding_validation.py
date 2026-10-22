@@ -338,10 +338,17 @@ def test_invalid_cached_tower_recomputes_only_that_tower(corruption):
     assert current.final_embedding == first.final_embedding
 
 
-def test_tower_cache_bounds_and_copy_isolation():
+@pytest.mark.parametrize(
+    ("max_entries", "max_vector_slots"),
+    [(2, 10), (10, 2)],
+    ids=["entry-limit", "byte-limit"],
+)
+def test_tower_cache_bounds_and_copy_isolation(max_entries, max_vector_slots):
     pipeline, encoder, cache = _cached_tower_pipeline()
-    cache.max_entries = 2
-    cache.max_bytes = EMBEDDING_DIM * 8 * 2
+    # Three towers exceed only one limit in each case, exposing either missing
+    # eviction check independently rather than letting the other mask it.
+    cache.max_entries = max_entries
+    cache.max_bytes = EMBEDDING_DIM * 8 * max_vector_slots
     first = pipeline.embed_repository(_repository())
     assert cache.snapshot()["entries"] == 2
     assert cache.snapshot()["vector_bytes"] == EMBEDDING_DIM * 8 * 2
