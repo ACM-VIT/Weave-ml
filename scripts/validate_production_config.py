@@ -532,6 +532,7 @@ def _validate_vector_and_model(v: _Validator) -> None:
             "EMBEDDING_WARMUP_ON_STARTUP",
             "must be true so deployment health validates the baked model",
         )
+    v.number("INFERENCE_WARMUP_TIMEOUT_SECONDS", minimum=0.1, maximum=300, default=120)
     v.integer("EMBEDDING_MAX_CONCURRENCY", minimum=1, maximum=8)
     v.number("EMBEDDING_TIMEOUT_SECONDS", minimum=0.1, maximum=300)
     embedding_workers = v.integer(

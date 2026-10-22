@@ -126,8 +126,11 @@ def check_readiness(
     ) or not 0 <= age <= maximum:
         raise SmokeFailure("V2 readiness diagnostic freshness is invalid")
     _required_string(payload, "diagnostics_checked_at")
-    if payload.get("embedding_runtime_ready") is not True:
-        raise SmokeFailure("embedding runtime is not ready")
+    if (
+        payload.get("embedding_runtime_ready") is not True
+        or payload.get("inference_warmup_ready") is not True
+    ):
+        raise SmokeFailure("inference warmup is not ready")
     return payload
 
 
@@ -152,6 +155,11 @@ def check_health(
 
     if payload.get("status") != "healthy":
         raise SmokeFailure("V2 health did not report healthy")
+    if (
+        payload.get("embedding_runtime_ready") is not True
+        or payload.get("inference_warmup_ready") is not True
+    ):
+        raise SmokeFailure("inference warmup is not ready")
     if payload.get("database_required") is not False:
         raise SmokeFailure("V2 health did not confirm the database-free online boundary")
     if payload.get("feedback_consumer_active") is not True:
@@ -237,8 +245,11 @@ def check_health(
     if ranker_required and not math.isclose(configured_traffic, 100.0, abs_tol=1e-9):
         raise SmokeFailure("required heavy ranker must receive 100 percent of traffic")
     if ranker_enabled:
-        if payload.get("heavy_ranker_ready") is not True:
-            raise SmokeFailure("enabled heavy ranker is not ready")
+        if (
+            payload.get("heavy_ranker_ready") is not True
+            or payload.get("heavy_ranker_warmup_ready") is not True
+        ):
+            raise SmokeFailure("enabled heavy ranker is not warmed and ready")
         if payload.get("heavy_ranker_production_qualified") is not True:
             raise SmokeFailure("enabled heavy ranker is not production-qualified")
     return payload

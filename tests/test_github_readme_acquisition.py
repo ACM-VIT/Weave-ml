@@ -310,6 +310,8 @@ def test_partial_metadata_failure_reaches_acquisition_retry_without_losing_healt
 
     client = GitHubGraphQLClient(token='test-token')
     client.execute = MagicMock(side_effect=lambda query, *args: (
+        # This row-isolation fixture deliberately uses the supported legacy
+        # README reply, including when the new reference lookup is requested.
         _complete_readme_response() if query in {GET_README_QUERY, GET_README_REF_QUERY} else {
             'data': {
                 'repo_0': {'nameWithOwner': 'owner/failed', 'description': None},

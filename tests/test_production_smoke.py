@@ -51,6 +51,8 @@ def smoke_environment() -> dict[str, str]:
 def healthy_payload() -> dict:
     return {
         "status": "healthy",
+        "embedding_runtime_ready": True,
+        "inference_warmup_ready": True,
         "database_required": False,
         "feedback_consumer_active": True,
         "feedback_consumer_release_id": "abcdef1234567890",
@@ -75,6 +77,7 @@ def healthy_payload() -> dict:
         "eligible_repository_points": 12,
         "minimum_eligible_repository_points": 10,
         "heavy_ranker_ready": True,
+        "heavy_ranker_warmup_ready": True,
         "heavy_ranker_enabled": True,
         "heavy_ranker_required": True,
         "heavy_ranker_production_qualified": True,
