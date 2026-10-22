@@ -1,6 +1,6 @@
 """Network-free CPU/provider/memory profile for issue #88.
 
-python3 -m scripts.profile_summary_reuse --baseline-ref upsteam/main
+python3 -m scripts.profile_summary_reuse --baseline-ref 1e11fd507133f15ceea4f34d91701f0ebf587e11
 """
 from __future__ import annotations
 

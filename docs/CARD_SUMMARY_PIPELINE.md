@@ -163,7 +163,7 @@ derived paragraph projection as generation and computes it once per job.
 Run the network-free local profile with:
 
 ```bash
-python3 -m scripts.profile_summary_reuse --baseline-ref upsteam/main --repeats 20
+python3 -m scripts.profile_summary_reuse --baseline-ref 1e11fd507133f15ceea4f34d91701f0ebf587e11 --repeats 20
 ```
 
 On local Python 3.14, a 62,061-character synthetic README took 0.234 CPU seconds
