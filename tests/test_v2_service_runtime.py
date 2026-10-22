@@ -108,7 +108,10 @@ def test_runtime_status_uses_immutable_pool_settings(monkeypatch) -> None:
 
 
 @pytest.mark.anyio
-async def test_search_runs_while_single_embedding_worker_waits_on_summary_provider(monkeypatch) -> None:
+@pytest.mark.parametrize("operation", ["search", "onboarding"])
+async def test_interactive_jobs_run_while_single_embedding_worker_waits_on_summary_provider(
+    monkeypatch, operation,
+) -> None:
     import uuid
     import httpx
     from fastapi import FastAPI
@@ -121,7 +124,7 @@ async def test_search_runs_while_single_embedding_worker_waits_on_summary_provid
 
     embedding_runtime.reset_embedding_runtime_for_tests()
     monkeypatch.setenv("EMBEDDING_EXECUTOR_WORKERS", "1")
-    monkeypatch.setenv("EMBEDDING_MAX_OUTSTANDING_JOBS", "1")
+    monkeypatch.setenv("EMBEDDING_MAX_OUTSTANDING_JOBS", "2")
     started = threading.Event()
     allow_finish = threading.Event()
 
@@ -133,7 +136,8 @@ async def test_search_runs_while_single_embedding_worker_waits_on_summary_provid
 
     class Encoder:
         def encode(self, texts, **kwargs):
-            return [[1.0] + [0.0] * 383 for _ in texts]
+            vector = [1.0] + [0.0] * 383
+            return vector if isinstance(texts, str) else [vector for _ in texts]
 
     model = embedding_runtime.BoundedEmbeddingModel(Encoder(), max_concurrency=1)
     embedder = SentenceTransformerEmbedder(model=model)
@@ -144,8 +148,8 @@ async def test_search_runs_while_single_embedding_worker_waits_on_summary_provid
     task = asyncio.create_task(embedding_runtime.run_embedding_job(pipeline.embed_repository, repo))
     try:
         assert await asyncio.to_thread(started.wait, 2)
-        # No second encoder and no second indexing worker: only a reserved
-        # short-job queue, using the exact model held by the blocked pipeline.
+        # Both interactive paths use the exact encoder held by the blocked
+        # repository pipeline, not a second model or repository worker.
         monkeypatch.setenv("INTERNAL_API_SECRET", "isolated-search-secret")
         monkeypatch.setattr("api.v2.shared_embedding_model", lambda: model)
         monkeypatch.setattr("api.v2.retriever", lambda: SimpleNamespace(embedding_version="repo-embedding-v2", embedding_dim=384))
@@ -156,15 +160,38 @@ async def test_search_runs_while_single_embedding_worker_waits_on_summary_provid
             return {"schema_version": 2, "search_id": str(request.search_id), "embedding_version": "repo-embedding-v2", "items": []}
 
         monkeypatch.setattr("api.search.search_repositories", search)
+        if operation == "onboarding":
+            from scripts.user_onboarding import UserOnboardingPipeline
+
+            onboarding = UserOnboardingPipeline(model=model)
+
+            def onboard(request):
+                vector = onboarding.generate_interest_vector(request.profile.model_dump())
+                assert len(vector) == 384
+                return {"accepted": True}
+
+            # Replace external lock/storage boundaries, retaining real profile
+            # synthesis, vector validation, shared encoder and HTTP admission.
+            monkeypatch.setattr("api.v2._onboard_user_job", onboard)
+            path = "/api/v2/users/onboard"
+            body = {
+                "schema_version": 2, "job_id": str(uuid.uuid4()),
+                "user_id": str(uuid.uuid4()), "profile_version": 1,
+                "profile": {"topics": ["image understanding"]},
+            }
+        else:
+            path = "/api/v2/search/repositories"
+            body = {"schema_version": 2, "search_id": str(uuid.uuid4()), "query": "image understanding", "limit": 5}
         app = FastAPI()
         app.include_router(router)
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://isolated.test") as client:
-            response = await asyncio.wait_for(client.post(
-                "/api/v2/search/repositories", headers={"X-Internal-Secret": "isolated-search-secret"},
-                json={"schema_version": 2, "search_id": str(uuid.uuid4()), "query": "image understanding", "limit": 5},
-            ), timeout=1)
-        assert response.status_code == 200
-        assert not task.done(), "search must complete before the summary provider responds"
+            for _ in range(2):
+                response = await asyncio.wait_for(client.post(
+                    path, headers={"X-Internal-Secret": "isolated-search-secret"},
+                    json=body,
+                ), timeout=1)
+                assert response.status_code == 200
+                assert not task.done(), "interactive work must finish before the summary provider responds"
     finally:
         allow_finish.set()
         await task
@@ -309,3 +336,79 @@ async def test_shared_query_flight_preserves_search_admission_during_http_interr
             release.set()
             await asyncio.gather(*tasks, return_exceptions=True)
             await until(lambda: runtime.service_runtime_status()['search']['outstanding'] == 0)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("interruption", ["cancel", "timeout"])
+async def test_onboarding_and_repository_share_actual_worker_admission(monkeypatch, interruption):
+    from embedding import runtime as embedding_runtime
+
+    embedding_runtime.reset_embedding_runtime_for_tests()
+    monkeypatch.setenv("EMBEDDING_EXECUTOR_WORKERS", "1")
+    monkeypatch.setenv("EMBEDDING_MAX_OUTSTANDING_JOBS", "2")
+    monkeypatch.setenv("EMBEDDING_TIMEOUT_SECONDS", "0.1" if interruption == "timeout" else "30")
+    repository_started, onboarding_started, release = (threading.Event() for _ in range(3))
+
+    def work(started):
+        started.set()
+        assert release.wait(5)
+
+    repository = asyncio.create_task(embedding_runtime.run_embedding_job(work, repository_started))
+    onboarding = None
+    try:
+        assert await asyncio.to_thread(repository_started.wait, 1)
+        onboarding = asyncio.create_task(embedding_runtime.run_onboarding_job(work, onboarding_started))
+        assert await asyncio.to_thread(onboarding_started.wait, 1)
+        if interruption == "cancel":
+            onboarding.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await onboarding
+        else:
+            with pytest.raises(embedding_runtime.EmbeddingDeadlineExceeded):
+                await onboarding
+        for run_job in (embedding_runtime.run_embedding_job, embedding_runtime.run_onboarding_job):
+            with pytest.raises(embedding_runtime.EmbeddingCapacityError):
+                await run_job(lambda: None)
+    finally:
+        release.set()
+        await asyncio.gather(*([repository, onboarding] if onboarding else [repository]), return_exceptions=True)
+        embedding_runtime.reset_embedding_runtime_for_tests()
+
+
+@pytest.mark.anyio
+async def test_embedding_shutdown_cancels_onboarding_queue_but_retains_running_slots(monkeypatch):
+    from embedding import runtime as embedding_runtime
+
+    embedding_runtime.reset_embedding_runtime_for_tests()
+    monkeypatch.setenv("EMBEDDING_EXECUTOR_WORKERS", "1")
+    monkeypatch.setenv("EMBEDDING_MAX_OUTSTANDING_JOBS", "3")
+    release, repository_started, onboarding_started, queued_started = (threading.Event() for _ in range(4))
+    admission = embedding_runtime.embedding_admission()
+
+    def work(started):
+        started.set()
+        assert release.wait(5)
+
+    tasks = [
+        asyncio.create_task(embedding_runtime.run_embedding_job(work, repository_started)),
+        asyncio.create_task(embedding_runtime.run_onboarding_job(work, onboarding_started)),
+    ]
+    try:
+        assert await asyncio.to_thread(repository_started.wait, 1)
+        assert await asyncio.to_thread(onboarding_started.wait, 1)
+        queued = asyncio.create_task(embedding_runtime.run_onboarding_job(work, queued_started))
+        tasks.append(queued)
+        await asyncio.sleep(0)  # Submit the queued job before closing the pools.
+        embedding_runtime.shutdown_embedding_runtime()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(queued, 1)
+        assert not queued_started.is_set()
+        # Only the cancelled queued future released its global slot. Shutdown
+        # does not pretend either running thread has stopped.
+        assert admission.acquire(blocking=False)
+        assert not admission.acquire(blocking=False)
+        admission.release()
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        embedding_runtime.reset_embedding_runtime_for_tests()
