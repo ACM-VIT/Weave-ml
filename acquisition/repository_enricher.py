@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import math
 import re
-from typing import Any
+from typing import Any, TYPE_CHECKING
 import logging
 
 from .github_graphql_client import (
@@ -18,6 +19,9 @@ from .graphql_queries import README_CANDIDATES
 from utils.readme_processor import ReadmeDocument, process_markdown
 from .identity import normalize_repository_name, repository_identity_key
 from .config import metadata_batch_size as validated_metadata_batch_size
+
+if TYPE_CHECKING:
+    from .readme_scheduler import ReadmeScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +43,18 @@ class RepositoryEnricher:
         *,
         metadata_batch_size: int | None = None,
         metadata_projection: str = "legacy",
+        readme_scheduler: ReadmeScheduler | None = None,
     ) -> None:
         self.metadata_batch_size = validated_metadata_batch_size(metadata_batch_size)
         if metadata_projection not in {"legacy", "delivery"}:
             raise ValueError("Unknown metadata projection")
         self.metadata_projection = metadata_projection
+        self.readme_scheduler = readme_scheduler
         self.graphql_client = graphql_client or GitHubGraphQLClient()
+
+    def _check_cancelled(self) -> None:
+        if self.readme_scheduler is not None and self.readme_scheduler.cancelled:
+            raise CancelledError("Acquisition cancelled")
 
     def enrich(self, repository: dict[str, Any] | str) -> EnrichmentResult | None:
         full_name = normalize_repository_name(
@@ -94,6 +104,7 @@ class RepositoryEnricher:
         results = []
         # Pass 1: batch metadata (no readme — avoids 502 on large repos)
         for i in range(0, len(targets), self.metadata_batch_size):
+            self._check_cancelled()
             batch = targets[i:i+self.metadata_batch_size]
             batch_res = {}
             try:
@@ -101,10 +112,13 @@ class RepositoryEnricher:
                     batch_res = self.graphql_client.get_repositories_batch(batch)
                 else:
                     batch_res = self.graphql_client.get_repositories_batch(batch, projection=self.metadata_projection)
+            except CancelledError:
+                raise
             except Exception as e:
                 logger.warning(f"Batch {i//self.metadata_batch_size + 1} failed, retrying one-by-one: {e}")
                 # Retry the batch one repo at a time
                 for owner, name in batch:
+                    self._check_cancelled()
                     try:
                         # Reuse the lean query for singleton retries too. The
                         # full repository query includes README blobs, which
@@ -116,6 +130,8 @@ class RepositoryEnricher:
                                 [(owner, name)], projection=self.metadata_projection
                             )
                         batch_res.update(retry_res)
+                    except CancelledError:
+                        raise
                     except Exception as e2:
                         logger.warning(f"Individual fetch failed for {owner}/{name}: {e2}")
 
@@ -141,13 +157,23 @@ class RepositoryEnricher:
             for r in results
         }
         enriched = []
+        readme_futures = (
+            self.readme_scheduler.ordered(owner_name_map[result.repo_id] for result in results)
+            if self.readme_scheduler is not None else None
+        )
         for result in results:
             repo_id = result.repo_id
             owner, name = owner_name_map.get(repo_id, (None, None))
             readme_text: str | FetchedReadme = ""
             if owner and name:
                 try:
-                    readme_text = self.graphql_client.get_readme(owner, name)
+                    readme_text = (
+                        next(readme_futures).result()
+                        if readme_futures is not None
+                        else self.graphql_client.get_readme(owner, name)
+                    )
+                except CancelledError:
+                    raise
                 except Exception as exc:
                     warning = f"README fetch failed: {type(exc).__name__}: {exc}"
                     result.warnings.append(warning[:500])

@@ -32,6 +32,17 @@ def metadata_batch_size(value: object | None = None) -> int:
     return parsed
 
 
+def readme_workers(value: object | None = None) -> int:
+    """One README concurrency bound shared by every batch in an acquisition run."""
+    parsed = positive_int(
+        os.getenv("GITHUB_README_WORKERS", "4") if value is None else value,
+        name="GITHUB_README_WORKERS",
+    )
+    if parsed > 16:
+        raise ValueError("GITHUB_README_WORKERS must be between 1 and 16")
+    return parsed
+
+
 @dataclass(frozen=True, slots=True)
 class CorpusPipelineSettings:
     target_count: int = 50_000

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any
 
 from .identity import (
@@ -13,7 +13,8 @@ from .identity import (
     repository_name_from_candidate,
 )
 from .models import AcquisitionFailure, AcquisitionRunResult
-from .config import metadata_batch_size as configured_metadata_batch_size
+from .config import metadata_batch_size as configured_metadata_batch_size, readme_workers
+from .readme_scheduler import ReadmeScheduler
 
 logger = logging.getLogger("pipeline.acquisition")
 
@@ -127,10 +128,12 @@ def enrich_repositories(
     batch_size: int = 15,
     workers: int = 4,
     metadata_projection: str = "legacy",
+    cancel_event: threading.Event | None = None,
 ) -> AcquisitionRunResult:
     """Enrich an explicit candidate list concurrently and return stable ordering."""
     _validate_inputs(token=token, limit=max(len(repositories), 1), batch_size=batch_size, workers=workers)
     metadata_size = _validate_metadata_settings(metadata_projection)
+    readme_concurrency = readme_workers()
     targets, duplicates_removed = deduplicate_candidates(repositories)
     batches = [targets[i : i + batch_size] for i in range(0, len(targets), batch_size)]
     logger.info(
@@ -153,6 +156,7 @@ def enrich_repositories(
                 graphql_client=GitHubGraphQLClient(token=token),
                 metadata_batch_size=metadata_size,
                 metadata_projection=metadata_projection,
+                readme_scheduler=readme_scheduler,
             )
         return _thread_local.enricher
 
@@ -160,52 +164,71 @@ def enrich_repositories(
         # get_repositories_batch() uses a two-pass approach: lean metadata first,
         # README fetched separately. Transient README failures are surfaced as
         # retryable structured failures after the batch returns.
+        if readme_scheduler.cancelled:
+            raise CancelledError("Acquisition cancelled")
         return _get_thread_enricher().get_repositories_batch(batch)
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        # Each future processes one batch of batch_size repos. workers controls
-        # how many chunks run concurrently; metadata_size separately bounds
-        # each GraphQL payload inside a scheduler chunk.
-        futures = {executor.submit(_enrich_batch, batch): (i, batch) for i, batch in enumerate(batches)}
-        for future in as_completed(futures):
-            batch_index, batch = futures[future]
+    from acquisition.github_graphql_client import GitHubGraphQLClient
+
+    with ReadmeScheduler(lambda: GitHubGraphQLClient(token=token), readme_concurrency, cancel_event) as readme_scheduler:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {}
             try:
-                results = future.result()
-                clean_results = []
-                for result in results:
-                    warnings = list(getattr(result, "warnings", []))
-                    if warnings:
-                        failures.append(
-                            AcquisitionFailure(
-                                result.repo_id,
-                                "readme_enrichment",
-                                "; ".join(warnings)[:500],
-                            )
+                # Each future processes one batch of batch_size repos. workers controls
+                # how many chunks run concurrently; metadata_size separately bounds
+                # each GraphQL payload inside a scheduler chunk.
+                for i, batch in enumerate(batches):
+                    if readme_scheduler.cancelled:
+                        raise CancelledError("Acquisition cancelled")
+                    futures[executor.submit(_enrich_batch, batch)] = (i, batch)
+                for future in as_completed(futures):
+                    if readme_scheduler.cancelled:
+                        raise CancelledError("Acquisition cancelled")
+                    batch_index, batch = futures[future]
+                    try:
+                        results = future.result()
+                        clean_results = []
+                        for result in results:
+                            warnings = list(getattr(result, "warnings", []))
+                            if warnings:
+                                failures.append(
+                                    AcquisitionFailure(
+                                        result.repo_id,
+                                        "readme_enrichment",
+                                        "; ".join(warnings)[:500],
+                                    )
+                                )
+                            else:
+                                clean_results.append(result)
+                        results_by_batch[batch_index] = clean_results
+                        returned = {repository_identity_key(result.repo_id) for result in results}
+                        for candidate in batch:
+                            name = repository_name_from_candidate(candidate)
+                            if repository_identity_key(name) not in returned:
+                                failures.append(
+                                    AcquisitionFailure(name, "enrichment", "repository was not returned by enrichment")
+                                )
+                        logger.info(
+                            "  Batch %d/%d → +%d enriched  (total: %d)",
+                            batch_index + 1,
+                            len(batches),
+                            len(clean_results),
+                            sum(len(value) for value in results_by_batch.values()),
                         )
-                    else:
-                        clean_results.append(result)
-                results_by_batch[batch_index] = clean_results
-                returned = {repository_identity_key(result.repo_id) for result in results}
-                for candidate in batch:
-                    name = repository_name_from_candidate(candidate)
-                    if repository_identity_key(name) not in returned:
-                        failures.append(
-                            AcquisitionFailure(name, "enrichment", "repository was not returned by enrichment")
+                    except CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning("  Batch %d/%d failed: %s", batch_index + 1, len(batches), exc)
+                        results_by_batch[batch_index] = []
+                        failures.extend(
+                            AcquisitionFailure(repository_name_from_candidate(candidate), "batch_enrichment", str(exc))
+                            for candidate in batch
                         )
-                logger.info(
-                    "  Batch %d/%d → +%d enriched  (total: %d)",
-                    batch_index + 1,
-                    len(batches),
-                    len(clean_results),
-                    sum(len(value) for value in results_by_batch.values()),
-                )
-            except Exception as exc:
-                logger.warning("  Batch %d/%d failed: %s", batch_index + 1, len(batches), exc)
-                results_by_batch[batch_index] = []
-                failures.extend(
-                    AcquisitionFailure(repository_name_from_candidate(candidate), "batch_enrichment", str(exc))
-                    for candidate in batch
-                )
+            except BaseException:
+                readme_scheduler.cancel()
+                for future in futures:
+                    future.cancel()
+                raise
 
     ordered_results = [
         result

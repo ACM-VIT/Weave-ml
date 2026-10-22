@@ -145,12 +145,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _configuration_errors(args: argparse.Namespace) -> list[str]:
     """Return configuration errors without contacting external services."""
     errors: list[str] = []
-    from acquisition.config import metadata_batch_size
+    from acquisition.config import metadata_batch_size, readme_workers
 
-    try:
-        metadata_batch_size()
-    except ValueError as exc:
-        errors.append(str(exc))
+    for validate_setting in (metadata_batch_size, readme_workers):
+        try:
+            validate_setting()
+        except ValueError as exc:
+            errors.append(str(exc))
     token = os.getenv("GITHUB_TOKEN")
     if not token or token == "your_github_token_here":
         errors.append("GITHUB_TOKEN is missing or still uses the placeholder value")
