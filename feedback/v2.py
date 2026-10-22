@@ -19,6 +19,7 @@ import socket
 import threading
 import uuid
 from copy import deepcopy
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
@@ -654,6 +655,7 @@ class OrderedFeedbackApplier:
         self.settings = settings or V2FeedbackSettings.from_env()
         self._owns_qdrant = qdrant is None
         self._enforce_dimension = settings is not None or qdrant is None
+        self._repository_batches = threading.local()
         self.qdrant = qdrant or QdrantClient(
             url=self.settings.qdrant_url,
             api_key=self.settings.qdrant_api_key,
@@ -876,12 +878,11 @@ class OrderedFeedbackApplier:
             raise MissingVectorError("user")
         return user
 
-    def _repository_vector(self, repo_id: str, dimension: int) -> np.ndarray:
-        canonical_repo_id = repository_point_id(repo_id)
+    def _repository_points(self, ids: list[str]) -> list[Any]:
         try:
-            repos = self.qdrant.retrieve(
+            return self.qdrant.retrieve(
                 collection_name=self.settings.repository_collection,
-                ids=[canonical_repo_id],
+                ids=ids,
                 with_payload=[
                     "repo_id",
                     REPOSITORY_SERVING_ELIGIBILITY_FIELD,
@@ -896,8 +897,54 @@ class OrderedFeedbackApplier:
             )
         except Exception as exc:
             raise FeedbackDependencyError() from exc
-        repos_by_id = {str(point.id): point for point in repos}
-        repo = repos_by_id.get(canonical_repo_id)
+
+    @contextmanager
+    def repository_read_batch(self, events: Iterable[Mapping[str, Any]]):
+        """Reuse one bounded repository revision snapshot for this read batch.
+
+        The snapshot includes content/model/embedding revisions and eligibility.
+        Nothing survives the boundary: the next Redis read observes updates,
+        removal or ineligibility afresh. User ledgers are never prefetched.
+        """
+        ids: list[str] = []
+        for event in events:
+            try:
+                normalized = self.normalize_event(event)
+            except PermanentFeedbackError:
+                continue
+            if get_interaction(normalized["event_type"]).reversal_of:
+                continue
+            repo_id = repository_point_id(normalized["repo_id"])
+            if repo_id not in ids:
+                ids.append(repo_id)
+            if len(ids) >= self.settings.read_batch_size:
+                break
+        snapshots = None
+        if ids:
+            try:
+                points = self._repository_points(ids)
+            except FeedbackDependencyError:
+                # Preserve independent per-event retries on partial transport
+                # failure rather than failing unrelated events as one unit.
+                pass
+            else:
+                snapshots = dict.fromkeys(ids)
+                snapshots.update({str(point.id): deepcopy(point) for point in points if str(point.id) in snapshots})
+        previous = getattr(self._repository_batches, "points", None)
+        self._repository_batches.points = snapshots
+        try:
+            yield
+        finally:
+            self._repository_batches.points = previous
+
+    def _repository_vector(self, repo_id: str, dimension: int) -> np.ndarray:
+        canonical_repo_id = repository_point_id(repo_id)
+        snapshots = getattr(self._repository_batches, "points", None)
+        if snapshots is not None and canonical_repo_id in snapshots:
+            repo = snapshots[canonical_repo_id]
+        else:
+            repos = self._repository_points([canonical_repo_id])
+            repo = next((point for point in repos if str(point.id) == canonical_repo_id), None)
         if repo is None:
             raise MissingVectorError("repository")
         payload = self._payload(repo)
@@ -1307,8 +1354,8 @@ class OrderedFeedbackConsumer:
                     else str(raw_cursor)
                 )
                 self._reclaim_cursor = "0-0" if next_cursor == "0-0" else next_cursor
-            for message_id, payload in claimed[1] if claimed and len(claimed) > 1 else []:
-                yield str(message_id), payload
+            messages = claimed[1] if claimed and len(claimed) > 1 else []
+            yield from self._repository_messages(messages)
         except Exception:
             logger.error(
                 "pending feedback reclaim failed",
@@ -1322,6 +1369,17 @@ class OrderedFeedbackConsumer:
             block=self.settings.read_block_ms,
         )
         for _, messages in response or []:
+            yield from self._repository_messages(messages)
+
+    def _repository_messages(self, messages):
+        # Scope snapshots to each actual reclaim/new-read response. Do not
+        # buffer pending work while waiting for the following blocking read.
+        context = (
+            self.applier.repository_read_batch(payload for _, payload in messages)
+            if isinstance(self.applier, OrderedFeedbackApplier)
+            else nullcontext()
+        )
+        with context:
             for message_id, payload in messages:
                 yield str(message_id), payload
 
