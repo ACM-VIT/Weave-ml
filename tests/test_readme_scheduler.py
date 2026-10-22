@@ -15,7 +15,8 @@ from acquisition.readme_scheduler import ReadmeScheduler
 
 def test_shared_scheduler_overlaps_batches_without_sharing_clients():
     lock = threading.Lock()
-    active = peak = 0
+    active = peak = entered = 0
+    first_pair = threading.Barrier(2, timeout=5)
     clients = []
 
     class Client:
@@ -25,14 +26,19 @@ def test_shared_scheduler_overlaps_batches_without_sharing_clients():
             clients.append(self)
 
         def get_readme(self, owner, name):
-            nonlocal active, peak
+            nonlocal active, peak, entered
             assert threading.get_ident() == self.thread
             with lock:
                 active += 1
                 peak = max(peak, active)
-            time.sleep(0.01 if int(name) % 2 else 0.03)
-            with lock:
-                active -= 1
+                entered += 1
+                first_request_pair = entered <= 2
+            try:
+                if first_request_pair:
+                    first_pair.wait()
+            finally:
+                with lock:
+                    active -= 1
             return FetchedReadme(name, source_path=".github/README.md", default_branch="main")
 
     def batch(start):

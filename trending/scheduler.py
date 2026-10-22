@@ -16,6 +16,7 @@ except ImportError:
     HAS_SCHEDULE = False
 
 import trending.config as config
+from .errors import IncompleteTrendingSnapshot
 from .fetcher import TrendingFetcher
 from .storage import TrendingStorage
 from .logger import get_logger
@@ -130,9 +131,24 @@ class TrendingScheduler:
 
             # The production adapter publishes one atomic backend-v2 snapshot.
             refresh_timestamp = datetime.now(timezone.utc)
-            upserted_count = self.storage.upsert_repositories(
-                repositories, refresh_timestamp
-            )
+            # Bound retry starts, not the duration of already-active HTTP calls.
+            retry_deadline = time.monotonic() + 120
+            for attempt in range(3):
+                try:
+                    upserted_count = self.storage.upsert_repositories(
+                        repositories, refresh_timestamp
+                    )
+                    break
+                except IncompleteTrendingSnapshot:
+                    # Reuse the adapter's successful records before its cache
+                    # expires. Never retry configuration, invalid records or
+                    # backend publication errors through this enrichment loop.
+                    if attempt == 2 or time.monotonic() + 1 >= retry_deadline:
+                        raise
+                    logger.warning("Incomplete trending enrichment; retrying same snapshot (%d/3)", attempt + 2)
+                    time.sleep(1)
+                    if time.monotonic() >= retry_deadline:
+                        raise
 
             # Check if all repositories were successfully upserted
             if upserted_count != len(repositories):

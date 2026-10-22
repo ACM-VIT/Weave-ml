@@ -19,6 +19,7 @@ from acquisition.backend_client import (
 from acquisition.identity import repository_identity_key
 from acquisition.models import AcquisitionRunResult
 from acquisition.pipeline import enrich_repositories
+from .errors import IncompleteTrendingSnapshot
 
 logger = logging.getLogger(__name__)
 _RETRY_CACHE_SECONDS = 300
@@ -116,9 +117,9 @@ class BackendTrendingStorage:
                     encoded = json.dumps(
                         record, separators=(",", ":"), ensure_ascii=False, allow_nan=False
                     ).encode("utf-8")
-                except (TypeError, ValueError, KeyError):
-                    # Invalid records are missing work, never fallback content.
-                    continue
+                except (TypeError, ValueError, KeyError) as exc:
+                    # Invalid records are not transient missing enrichment.
+                    raise ValueError("refusing invalid trending enrichment record") from exc
                 if self._retry_bytes + len(encoded) > MAX_BODY_BYTES:
                     self._clear_retry()
                     raise ValueError("refusing trending snapshot larger than the 8 MiB transport limit")
@@ -135,7 +136,7 @@ class BackendTrendingStorage:
             len(identities), len(pending), reused, len(missing),
         )
         if missing:
-            raise RuntimeError(
+            raise IncompleteTrendingSnapshot(
                 f"refusing incomplete trending snapshot: enriched {len(identities) - len(missing)}/"
                 f"{len(identities)} repositories; metadata or README acquisition failed"
             )

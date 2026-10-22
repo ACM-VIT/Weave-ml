@@ -122,6 +122,11 @@ def main(argv: list[str] | None = None):
 
     # Validate configuration (after CLI overrides)
     config_errors = validate_config()
+    from acquisition.config import readme_workers
+    try:
+        readme_workers()
+    except ValueError as exc:
+        config_errors.append(str(exc))
     if config_errors:
         logger.error("Configuration validation failed:")
         for error in config_errors:
