@@ -57,6 +57,7 @@ _FALLBACK_MESSAGES = {
     "NO_ELIGIBLE_CANDIDATES": "no eligible candidates were retrieved",
     "INVALID_HEAVY_OUTPUT": "heavy ranker returned an incomplete or invalid candidate set",
     "HEAVY_SCORING_FAILED": "heavy ranker scoring failed",
+    "CANDIDATE_VECTORS_UNAVAILABLE": "retained candidate vectors are unavailable",
 }
 
 _DISCOVERY_SOURCES = {
@@ -88,6 +89,11 @@ _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS = [
     "repo_id",
     REPOSITORY_SERVING_ELIGIBILITY_FIELD,
     "content_version",
+    "content_job_id",
+    "content_hash",
+    "source_hash",
+    "feature_version",
+    "feature_job_id",
     "embedding_model",
     "embedding_model_revision",
     "embedding_version",
@@ -661,6 +667,64 @@ class QdrantV2Retriever:
             **qdrant_timeout(self.qdrant_timeout_seconds),
         )
 
+    def _fetch_retained_vectors(self, repo_ids: list[str]) -> list[Any]:
+        return self.client.retrieve(
+            collection_name=self.repository_collection,
+            ids=repo_ids,
+            with_payload=(
+                _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS + _HEAVY_RANKER_PAYLOAD_FIELDS
+            ),
+            with_vectors=[QDRANT_VECTOR_NAME],
+            **qdrant_timeout(self.qdrant_timeout_seconds),
+        )
+
+    def _hydrate_retained_candidates(
+        self,
+        ranked: list[RankedRepository],
+        metadata: dict[str, dict[str, Any]],
+    ) -> tuple[list[RankedRepository], dict[str, list[float] | None]]:
+        if not ranked:
+            return [], {}
+        # Fusion and max-candidate selection have already deduplicated IDs.
+        # Keep this defensive bound if another caller reuses this helper.
+        ids = list(dict.fromkeys(item.repo_id for item in ranked))[:self.max_candidates]
+        with RetrievalWork() as work:
+            records = work.result(work.submit(
+                "vectors", self._fetch_retained_vectors, ids,
+            ))
+        requested = set(ids)
+        eligible: dict[str, _EligibleRepositoryPoint] = {}
+        seen: set[str] = set()
+        for record in records:
+            point_id = str(getattr(record, "id", ""))
+            if point_id not in requested:
+                continue
+            if point_id in seen:
+                # Ambiguous duplicate responses must not choose a version by
+                # response order, even if a broken client returns two copies.
+                eligible.pop(point_id, None)
+                continue
+            seen.add(point_id)
+            # Never use the payload-only eligibility cache for this second read.
+            point = self._eligible_repository_point(record, require_vector=True)
+            previous = metadata.get(point_id)
+            if point is None or previous is None:
+                continue
+            # Do not combine a stale semantic/discovery score with newer
+            # content, feature or eligibility metadata. Deleted/changed points
+            # are dropped from heavy input AND any optional hybrid fallback.
+            if any(
+                previous.get(field) != point.payload.get(field)
+                for field in _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS
+            ):
+                continue
+            eligible[point_id] = point
+        retained = [item for item in ranked if item.repo_id in eligible]
+        vectors = {repo_id: point.vector for repo_id, point in eligible.items()}
+        for repo_id, point in eligible.items():
+            metadata[repo_id] = point.payload
+        return retained, vectors
+
     def _collect_semantic(
         self, response: Any,
         cache: dict[tuple[str, bool], _EligibleRepositoryPoint | None] | None,
@@ -1061,9 +1125,9 @@ class QdrantV2Retriever:
             profile_future = work.submit("profile", self._fetch_user_profile, user_id)
             discovery_futures = self._start_discovery(
                 work, max(limit * 8, 200),
-                # We cannot know profile validity yet. Fetch the heavy projection
-                # speculatively, but preserve post-profile vector eligibility.
-                include_vectors=bool(heavy_selected and self.ranker is not None),
+                # Payload-first retrieval avoids transferring overlapping or
+                # ultimately dropped repository vectors on every channel.
+                include_vectors=False,
                 exclude_repo_ids=excluded,
             )
             user_vector, user_profile = self._profile_from_points(
@@ -1090,12 +1154,12 @@ class QdrantV2Retriever:
                     semantic_response = work.result(work.submit(
                         "semantic", self._fetch_semantic, user_vector,
                         max(limit * 5, 100),
-                        include_vectors=include_candidate_vectors,
+                        include_vectors=False,
                         exclude_repo_ids=excluded,
                     ))
                     semantic = self._collect_semantic(
                         semantic_response, eligibility_cache,
-                        include_vectors=include_candidate_vectors,
+                        include_vectors=False,
                     )
                 except CooperativeDeadlineExceeded:
                     raise
@@ -1121,7 +1185,7 @@ class QdrantV2Retriever:
             try:
                 discovery_points = self._collect_discovery(
                     work, discovery_futures, max(limit * 8, 200), eligibility_cache,
-                    include_vectors=include_candidate_vectors,
+                    include_vectors=False,
                 )
             except RetrievalDependencyError:
                 if not candidates:
@@ -1168,7 +1232,23 @@ class QdrantV2Retriever:
         heavy_ranked: list[RankedRepository] | None = None
         fallback_code: str | None = None
         fallback_reason: str | None = None
-        if heavy_selected:
+        if include_candidate_vectors:
+            try:
+                hybrid_ranked, vectors = self._hydrate_retained_candidates(
+                    hybrid_ranked, metadata,
+                )
+            except CooperativeDeadlineExceeded:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "V2 retained vector retrieval failed",
+                    extra={"retrieval_context": {
+                        "channel": "vectors", "error_type": type(exc).__name__,
+                    }},
+                )
+                fallback_code = "CANDIDATE_VECTORS_UNAVAILABLE"
+                fallback_reason = _FALLBACK_MESSAGES[fallback_code]
+        if heavy_selected and fallback_code is None:
             heavy_ranked, fallback_code, fallback_reason = self._heavy_rank(
                 user_vector=user_vector,
                 user_profile=user_profile,
