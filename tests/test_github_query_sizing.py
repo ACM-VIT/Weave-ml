@@ -229,3 +229,51 @@ def test_delivery_projection_does_not_change_backend_record():
     before.pop("observed_at", None)
     after.pop("observed_at", None)
     assert before == after
+
+
+@pytest.mark.parametrize("projection", ["legacy", "delivery"])
+@pytest.mark.parametrize("readme_state", ["present", "missing", "failed"])
+def test_metadata_fallback_fetches_readme_only_in_second_pass(projection, readme_state):
+    class FallbackFixture(MetadataFixture):
+        def __init__(self):
+            super().__init__()
+            self.readme_calls = []
+
+        def execute(self, query, variables=None):
+            if "query GetReadme" in query:
+                self.readme_calls.append(variables["name"])
+                if readme_state == "failed":
+                    raise GitHubGraphQLClientError("temporary README failure")
+                response = super().execute(query, variables)
+                if readme_state == "present":
+                    response["data"]["repository"].update({
+                        "readmeGithub1": {"text": "# Canonical community README"},
+                        "readme1": {"text": "# Lower priority root README"},
+                    })
+                return response
+            if query.count(": repository(") > 1:
+                self.metadata_queries.append(query)
+                raise GitHubGraphQLClientError("batch too large", category="server", status_code=502)
+            # MetadataFixture marks only the failed identity unresolved, so the
+            # healthy singleton must survive and receive exactly one README.
+            return super().execute(query, variables)
+
+    client = FallbackFixture()
+    results = RepositoryEnricher(client, metadata_projection=projection).get_repositories_batch(
+        ["owner/failed", "owner/healthy"]
+    )
+    assert [result.repo_id for result in results] == ["owner/healthy"]
+    assert len(client.metadata_queries) == 3
+    assert all("readme" not in query.lower() for query in client.metadata_queries)
+    assert all(("pullRequests" in query) == (projection == "legacy") for query in client.metadata_queries)
+    assert client.readme_calls == ["healthy"]
+    result = results[0]
+    assert result.raw_repository["description"] == "Healthy project."
+    if readme_state == "present":
+        assert result.readme.raw_markdown == "# Canonical community README"
+        assert result.readme.source_path == ".github/README.md"
+        assert result.readme.default_branch == "main"
+        assert result.readme.base_url.endswith("/refs/heads/main/.github/")
+    else:
+        assert result.readme.raw_markdown == ""
+    assert bool(result.warnings) == (readme_state == "failed")
