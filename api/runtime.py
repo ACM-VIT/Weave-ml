@@ -120,6 +120,7 @@ class _BoundedExecutor:
         )
         self.admission = threading.BoundedSemaphore(capacity)
         self._lock = threading.Lock()
+        self._settled = threading.Condition(self._lock)
         self._outstanding = 0
         self._rejected = 0
         self._timed_out = 0
@@ -174,6 +175,7 @@ class _BoundedExecutor:
         except CooperativeDeadlineExceeded as exc:
             if deadline is not None:
                 deadline.cancel("timeout")
+            future.cancel()  # A pre-wait expiry must also remove queued work.
             self.record_timeout()
             raise ServiceDeadlineExceeded(self.operation) from exc
         except asyncio.CancelledError:
@@ -194,9 +196,10 @@ class _BoundedExecutor:
             self._timed_out += 1
 
     def _release(self) -> None:
-        with self._lock:
+        with self._settled:
             self._outstanding -= 1
-        self.admission.release()
+            self.admission.release()
+            self._settled.notify_all()
 
     def snapshot(self) -> dict[str, int | float]:
         with self._lock:
@@ -214,11 +217,18 @@ class _BoundedExecutor:
         self.executor.shutdown(wait=False, cancel_futures=True)
 
     def drain(self) -> None:
-        # Diagnostic retirement invokes cleanup on the health worker itself.
-        # Its actual job must already have settled; never join that thread.
+        # Future.done() is visible before completion callbacks release slots.
+        # Wait for that settlement, not a thread join: diagnostic retirement
+        # may invoke cleanup on the health worker after its own release.
         if self.operation == "health":
-            with self._lock:
-                if self._outstanding:
+            with self._settled:
+                settled = self._settled.wait_for(
+                    lambda: self._outstanding == 0,
+                    timeout=min(self.timeout, 1.0),
+                )
+                if not settled:
+                    # Retain this failed drain for the existing owner's retry;
+                    # genuinely stuck work must not permit resource closure.
                     raise RuntimeError("health workers have not settled")
         self.executor.shutdown(wait=self.operation != "health", cancel_futures=True)
 

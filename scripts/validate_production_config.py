@@ -670,6 +670,24 @@ def _validate_ranker_and_retrieval(v: _Validator) -> None:
             "V2_HEALTH_MAX_AGE_SECONDS",
             "must cover refresh interval plus two diagnostic timeouts",
         )
+    # Runtime defaults apply only when absent; an explicitly blank value is invalid.
+    retrieval_workers = v.integer(
+        "V2_RETRIEVAL_IO_WORKERS", minimum=1, maximum=32,
+        default=4 if "V2_RETRIEVAL_IO_WORKERS" not in v.environ else None,
+    )
+    retrieval_capacity = v.integer(
+        "V2_RETRIEVAL_IO_MAX_OUTSTANDING", minimum=1, maximum=128,
+        default=8 if "V2_RETRIEVAL_IO_MAX_OUTSTANDING" not in v.environ else None,
+    )
+    if (
+        retrieval_workers is not None and retrieval_capacity is not None
+        and retrieval_capacity < retrieval_workers
+    ):
+        v.issue(
+            "V2_RETRIEVAL_IO_MAX_OUTSTANDING",
+            "must be at least V2_RETRIEVAL_IO_WORKERS",
+        )
+
     recommendation_workers = v.integer(
         "V2_RECOMMENDATION_EXECUTOR_WORKERS", minimum=1, maximum=32
     )

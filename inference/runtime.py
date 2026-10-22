@@ -141,6 +141,7 @@ async def run_recommendation_job(function: Callable[..., T], *args: object) -> T
         )
     except CooperativeDeadlineExceeded as exc:
         deadline.cancel("timeout")
+        future.cancel()  # Running work retains admission; only queued work stops.
         with _counter_lock:
             _timed_out = min(_COUNTER_LIMIT, _timed_out + 1)
         raise RecommendationDeadlineExceeded("the cooperative recommendation deadline was exceeded") from exc
