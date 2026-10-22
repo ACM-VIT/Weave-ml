@@ -23,7 +23,10 @@ subject matter is preserved when its heading is not a legal-section label.
 
 Each retained section is cleaned and split using the loaded encoder's own fast
 tokenizer and `max_seq_length`. The content budget reserves the tokenizer's
-special tokens. Chunks use source character offsets rather than decoded token
+special tokens. The production wrapper retains a frozen tokenizer template and
+one copy per bounded worker, so chunk preparation cannot race with the encoder's
+mutable padding/truncation settings. These copies follow the loaded model's
+lifetime. Chunks use source character offsets rather than decoded token
 strings, with 32 token overlap by default. Every exact chunk string is tokenized
 again without truncation to verify that special tokens plus content fit the
 active limit. `RepositoryEmbeddingConfig.readme_chunk_overlap_tokens` supports

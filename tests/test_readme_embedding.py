@@ -11,11 +11,10 @@ from config import TOKEN_SECTION_EMBEDDING_VERSION
 from embedding.embeddings import SentenceTransformerEmbedder, aggregate_vectors
 from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
 from embedding.readme_embedding import (
-    SECTION_CHUNK_LIMITS, SECTION_WEIGHTS, prepare_readme_chunks, readme_source, token_chunks,
+    SECTION_CHUNK_LIMITS, prepare_readme_chunks, readme_source, token_chunks,
 )
 from embedding.repository_embedding import RepositoryEmbeddingConfig
 from embedding.runtime import BoundedEmbeddingModel
-from embedding.tower_cache import TowerEmbeddingCache
 from summarization.pipeline import description_fallback_artifact
 
 
@@ -157,7 +156,7 @@ def repository(markdown):
 def test_heading_only_changes_invalidate_readme_cache_and_source_hash(tokenizer):
     encoder = Encoder(tokenizer)
     wrapper = BoundedEmbeddingModel(encoder, max_concurrency=1)
-    assert wrapper.tokenizer is tokenizer
+    assert wrapper.tokenizer.get_vocab() == tokenizer.get_vocab()
     cache = wrapper.tower_embedding_cache
     pipeline = RepositoryEmbeddingPipeline(config=RepositoryEmbeddingConfig(version=TOKEN_SECTION_EMBEDDING_VERSION, readme_chunk_overlap_tokens=8), embedder=SentenceTransformerEmbedder(model=wrapper), tower_cache=cache, card_summarizer=Summarizer())
     markdown = "# Overview\nPurpose search.\n# Details\nOther material."
@@ -171,6 +170,31 @@ def test_heading_only_changes_invalidate_readme_cache_and_source_hash(tokenizer)
     assert repeat.final_embedding == second.final_embedding
     pipeline.tower_cache = None
     assert pipeline.embed_repository(repository(markdown.replace("# Overview", "# Installation"))).final_embedding == second.final_embedding
+
+
+def test_readme_workers_do_not_share_mutable_encoder_tokenizer_state(tokenizer):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    wrapper = BoundedEmbeddingModel(Encoder(tokenizer), max_concurrency=1)
+    barrier = Barrier(2)
+    text = "distributed search indexes " * 100
+
+    def worker(limit):
+        local = wrapper.tokenizer
+        assert local is wrapper.tokenizer and local is not tokenizer
+        barrier.wait(timeout=2)
+        encoded = local(text, truncation=limit is not None, max_length=limit)
+        return local, len(encoded["input_ids"])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        short = pool.submit(worker, 16)
+        complete = pool.submit(worker, None)
+        short_tokenizer, short_count = short.result(timeout=5)
+        complete_tokenizer, complete_count = complete.result(timeout=5)
+    assert short_tokenizer is not complete_tokenizer
+    assert short_count == 16 and complete_count > 16
+    assert tokenizer.backend_tokenizer.truncation is None
 
 
 def test_all_excluded_readme_renormalizes_metadata_and_topics(tokenizer):

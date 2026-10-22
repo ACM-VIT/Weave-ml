@@ -69,14 +69,18 @@ class RepositoryEmbeddingPipeline:
         repo["full_name"] = full_name
         # The below text builders are for splitting source material into the
         # three approved towers before final weighted composition.
-        readme_text = build_readme_text(source)
+        # Preserve legacy projection exactly; v3 parses the bounded Markdown
+        # source once instead of first flattening it through the old cleaner.
+        legacy_readme = self.config.version != TOKEN_SECTION_EMBEDDING_VERSION
+        readme_text = (
+            build_readme_text(source) if legacy_readme else readme_source(source, repo)
+        )
         metadata_text = build_metadata_text(repo)
         topic_text = build_topic_text(repo)
         card_summary = self.summarize_repository(source, repo, deadline=deadline)
 
         # The reserved v2 identity must continue producing v2 vectors while a
         # separately versioned corpus and ranker are qualified for cutover.
-        legacy_readme = self.config.version != TOKEN_SECTION_EMBEDDING_VERSION
         readme_weights = None
         readme_plan = None
         if legacy_readme:
@@ -88,7 +92,7 @@ class RepositoryEmbeddingPipeline:
         else:
             model = self.embedder.model
             readme_chunks = prepare_readme_chunks(
-                readme_source(source, repo), model.tokenizer,
+                readme_text, model.tokenizer,
                 sequence_limit=model.max_seq_length,
                 overlap_tokens=self.config.readme_chunk_overlap_tokens,
             )

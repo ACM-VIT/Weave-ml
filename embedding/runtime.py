@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+from copy import deepcopy
 import math
 import os
 import threading
@@ -152,6 +153,11 @@ class BoundedEmbeddingModel:
 
     def __init__(self, model: Any, *, max_concurrency: int) -> None:
         self._model = model
+        # Fast tokenizers mutate backend padding/truncation state on each call.
+        # Freeze a template before encoding starts; README workers must not
+        # borrow the backend concurrently with encode or another README job.
+        self._tokenizer_template = deepcopy(getattr(model, "tokenizer", None))
+        self._worker_tokenizers = threading.local()
         # Cache lifetime follows this exact loaded encoder, not a reusable ID.
         self.query_embedding_cache = QueryEmbeddingCache()
         self.query_embedding_revision = embedding_model_revision()
@@ -173,8 +179,12 @@ class BoundedEmbeddingModel:
 
     @property
     def tokenizer(self):
-        """Expose the exact frozen encoder tokenizer for README chunking."""
-        return self._model.tokenizer
+        """Return a worker-local copy of the frozen encoder tokenizer."""
+        if self._tokenizer_template is None:
+            raise ValueError("README token chunking requires an encoder tokenizer")
+        if not hasattr(self._worker_tokenizers, "tokenizer"):
+            self._worker_tokenizers.tokenizer = deepcopy(self._tokenizer_template)
+        return self._worker_tokenizers.tokenizer
 
     def encode(self, *args: Any, **kwargs: Any) -> Any:
         ticket = object()
