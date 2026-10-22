@@ -299,3 +299,18 @@ def test_legacy_generated_artifact_requires_source_key_before_durable_reuse():
     # Revalidation must still protect a matching-key artifact after tampering.
     generated.summary = "Run npm install to start. This is a useful tool."
     assert not pipeline.is_current(generated, repo=REPO)
+
+
+def test_full_api_topic_and_language_limits_have_durable_provenance():
+    provider = Provider()
+    pipeline = CardSummaryPipeline(provider=provider)
+    repo = {**REPO, "topics": [f"topic-{i}" for i in range(200)],
+            "languages": [f"language-{i}" for i in range(100)]}
+    artifact = pipeline.summarize(repo, repo)
+    assert artifact.source == "generated"
+    assert artifact._reuse_key is not None
+    assert pipeline.is_current(artifact, repo=repo)
+    changed = {**repo, "topics": [*repo["topics"][:-1], "last-topic-changed"]}
+    assert not pipeline.is_current(artifact, repo=changed)
+    pipeline.summarize(changed, changed)
+    assert provider.calls == 2

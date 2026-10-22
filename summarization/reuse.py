@@ -41,7 +41,7 @@ def source_identity(source: Any, repo: Mapping[str, Any]) -> bytes | None:
             if remaining < 0:
                 raise ValueError("cache input work bound exceeded")
             return value
-        if isinstance(value, list) and len(value) <= 80:
+        if isinstance(value, list) and len(value) <= 200:
             # Source metadata/paragraph lists are flat. Reject nested or unusual
             # values instead of traversing arbitrary objects or cycles.
             if any(isinstance(item, (list, dict)) for item in value):
