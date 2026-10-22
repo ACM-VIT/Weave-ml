@@ -9,6 +9,7 @@ import re
 import threading
 import uuid
 from collections.abc import Mapping
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,7 @@ from inference.feed_assembly import FeedAssemblySystem
 from inference.feature_spec import FEATURE_ORDER
 from inference.ranker_service import RankerService
 from retrieval.config import TOTAL_CANDIDATE_POOL
+from retrieval.runtime import RetrievalWork, validate_retrieval_runtime
 from utils.deadline import CooperativeDeadlineExceeded, check_deadline, qdrant_timeout
 from scripts.user_onboarding import TARGET_VECTOR_NAME, USER_PROFILES_COLLECTION
 
@@ -161,6 +163,7 @@ class QdrantV2Retriever:
         minimum_eligible_repositories: int | None = None,
         allow_unqualified_ranker: bool | None = None,
     ) -> None:
+        validate_retrieval_runtime()
         self.qdrant_timeout_seconds = float(os.getenv("QDRANT_TIMEOUT_SECONDS", "10"))
         if not math.isfinite(self.qdrant_timeout_seconds) or self.qdrant_timeout_seconds <= 0:
             raise ValueError("QDRANT_TIMEOUT_SECONDS must be finite and positive")
@@ -570,15 +573,19 @@ class QdrantV2Retriever:
             cache[cache_key] = eligible
         return eligible
 
-    def _user_profile(self, user_id: str) -> tuple[list[float] | None, dict[str, Any]]:
-        canonical = user_point_id(user_id)
-        points = self.client.retrieve(
+    def _fetch_user_profile(self, user_id: str) -> list[Any]:
+        return self.client.retrieve(
             collection_name=self.user_collection,
-            ids=[canonical],
+            ids=[user_point_id(user_id)],
             with_vectors=True,
             with_payload=_USER_RETRIEVAL_PAYLOAD_FIELDS,
             **qdrant_timeout(self.qdrant_timeout_seconds),
         )
+
+    def _profile_from_points(
+        self, user_id: str, points: list[Any],
+    ) -> tuple[list[float] | None, dict[str, Any]]:
+        canonical = user_point_id(user_id)
         if not points:
             return None, {}
         by_id = {str(point.id): point for point in points}
@@ -611,6 +618,11 @@ class QdrantV2Retriever:
             logger.warning("Ignoring incompatible user profile vector: %s", exc)
             return None, payload
 
+    def _user_profile(self, user_id: str) -> tuple[list[float] | None, dict[str, Any]]:
+        with RetrievalWork() as work:
+            points = work.result(work.submit("profile", self._fetch_user_profile, user_id))
+        return self._profile_from_points(user_id, points)
+
     def _user_vector(self, user_id: str) -> list[float] | None:
         """Compatibility wrapper retained for existing callers and tests."""
         vector, _ = self._user_profile(user_id)
@@ -627,16 +639,15 @@ class QdrantV2Retriever:
                     terms.append(text)
         return list(dict.fromkeys(terms))
 
-    def _semantic(
+    def _fetch_semantic(
         self,
         vector: list[float],
         limit: int,
-        cache: dict[tuple[str, bool], _EligibleRepositoryPoint | None] | None = None,
         *,
-        include_vectors: bool = True,
-        exclude_repo_ids: set[str] | None = None,
-    ) -> list[tuple[_EligibleRepositoryPoint, float]]:
-        response = self.client.query_points(
+        include_vectors: bool,
+        exclude_repo_ids: set[str] | None,
+    ) -> Any:
+        return self.client.query_points(
             collection_name=self.repository_collection,
             query=vector,
             using=QDRANT_VECTOR_NAME,
@@ -649,6 +660,12 @@ class QdrantV2Retriever:
             with_vectors=[QDRANT_VECTOR_NAME] if include_vectors else False,
             **qdrant_timeout(self.qdrant_timeout_seconds),
         )
+
+    def _collect_semantic(
+        self, response: Any,
+        cache: dict[tuple[str, bool], _EligibleRepositoryPoint | None] | None,
+        *, include_vectors: bool,
+    ) -> list[tuple[_EligibleRepositoryPoint, float]]:
         eligible: list[tuple[_EligibleRepositoryPoint, float]] = []
         for point in response.points:
             candidate = self._eligible_repository_point(
@@ -660,41 +677,85 @@ class QdrantV2Retriever:
                 eligible.append((candidate, float(point.score)))
         return eligible
 
-    def _discovery(
+    def _semantic(
         self,
+        vector: list[float],
         limit: int,
         cache: dict[tuple[str, bool], _EligibleRepositoryPoint | None] | None = None,
         *,
         include_vectors: bool = True,
         exclude_repo_ids: set[str] | None = None,
-    ) -> list[tuple[_EligibleRepositoryPoint, str]]:
+    ) -> list[tuple[_EligibleRepositoryPoint, float]]:
+        with RetrievalWork() as work:
+            response = work.result(work.submit(
+                "semantic", self._fetch_semantic, vector, limit,
+                include_vectors=include_vectors, exclude_repo_ids=exclude_repo_ids,
+            ))
+        return self._collect_semantic(response, cache, include_vectors=include_vectors)
+
+    def _fetch_discovery_channel(
+        self,
+        channel: str,
+        per_channel: int,
+        *,
+        include_vectors: bool,
+        exclude_repo_ids: set[str] | None,
+    ) -> list[Any]:
+        records, _ = self.client.scroll(
+            collection_name=self.repository_collection,
+            scroll_filter=self._eligible_filter(exclude_repo_ids=exclude_repo_ids),
+            limit=per_channel,
+            order_by=models.OrderBy(
+                key=REPOSITORY_DISCOVERY_CHANNELS[channel],
+                direction=models.Direction.DESC,
+            ),
+            with_payload=(
+                _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS
+                + (_HEAVY_RANKER_PAYLOAD_FIELDS if include_vectors else [])
+            ),
+            with_vectors=[QDRANT_VECTOR_NAME] if include_vectors else False,
+            **qdrant_timeout(self.qdrant_timeout_seconds),
+        )
+        return records
+
+    def _start_discovery(
+        self,
+        work: RetrievalWork,
+        limit: int,
+        *,
+        include_vectors: bool,
+        exclude_repo_ids: set[str] | None,
+    ) -> list[tuple[str, Future]]:
         target = min(limit, self.max_candidates)
-        channels = list(_DISCOVERY_SOURCES)
         per_channel = min(
             self.max_candidates,
-            max(25, math.ceil((target * 2) / len(channels))),
+            max(25, math.ceil((target * 2) / len(_DISCOVERY_SOURCES))),
         )
+        return [
+            (channel, work.submit(
+                channel, self._fetch_discovery_channel, channel, per_channel,
+                include_vectors=include_vectors, exclude_repo_ids=exclude_repo_ids,
+            ))
+            for channel in _DISCOVERY_SOURCES
+        ]
+
+    def _collect_discovery(
+        self,
+        work: RetrievalWork,
+        futures: list[tuple[str, Future]],
+        limit: int,
+        cache: dict[tuple[str, bool], _EligibleRepositoryPoint | None] | None,
+        *,
+        include_vectors: bool,
+    ) -> list[tuple[_EligibleRepositoryPoint, str]]:
+        target = min(limit, self.max_candidates)
         channel_points: list[list[tuple[_EligibleRepositoryPoint, str]]] = []
         successful_channels = 0
-        for channel in channels:
+        # Completion order must never affect candidate eligibility, fusion or
+        # the shared eligibility cache. Only the request worker validates here.
+        for channel, future in futures:
             try:
-                records, _ = self.client.scroll(
-                    collection_name=self.repository_collection,
-                    scroll_filter=self._eligible_filter(
-                        exclude_repo_ids=exclude_repo_ids
-                    ),
-                    limit=per_channel,
-                    order_by=models.OrderBy(
-                        key=REPOSITORY_DISCOVERY_CHANNELS[channel],
-                        direction=models.Direction.DESC,
-                    ),
-                    with_payload=(
-                        _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS
-                        + (_HEAVY_RANKER_PAYLOAD_FIELDS if include_vectors else [])
-                    ),
-                    with_vectors=[QDRANT_VECTOR_NAME] if include_vectors else False,
-                    **qdrant_timeout(self.qdrant_timeout_seconds),
-                )
+                records = work.result(future)
             except CooperativeDeadlineExceeded:
                 raise
             except Exception as exc:
@@ -713,9 +774,7 @@ class QdrantV2Retriever:
             eligible_points: list[tuple[_EligibleRepositoryPoint, str]] = []
             for point in records:
                 candidate = self._eligible_repository_point(
-                    point,
-                    cache,
-                    require_vector=include_vectors,
+                    point, cache, require_vector=include_vectors,
                 )
                 if candidate is not None:
                     eligible_points.append((candidate, _DISCOVERY_SOURCES[channel]))
@@ -742,6 +801,23 @@ class QdrantV2Retriever:
                     if len(combined) >= target:
                         return combined
         return combined
+
+    def _discovery(
+        self,
+        limit: int,
+        cache: dict[tuple[str, bool], _EligibleRepositoryPoint | None] | None = None,
+        *,
+        include_vectors: bool = True,
+        exclude_repo_ids: set[str] | None = None,
+    ) -> list[tuple[_EligibleRepositoryPoint, str]]:
+        with RetrievalWork() as work:
+            futures = self._start_discovery(
+                work, limit, include_vectors=include_vectors,
+                exclude_repo_ids=exclude_repo_ids,
+            )
+            return self._collect_discovery(
+                work, futures, limit, cache, include_vectors=include_vectors,
+            )
 
     @staticmethod
     def _number(value: Any, *, default: float = 0.0) -> float:
@@ -980,65 +1056,77 @@ class QdrantV2Retriever:
         eligibility_cache: dict[
             tuple[str, bool], _EligibleRepositoryPoint | None
         ] = {}
-        user_vector, user_profile = self._user_profile(user_id)
         heavy_selected = self._heavy_ranker_selected(user_id)
-        if self.heavy_ranker_required and not heavy_selected:
-            raise RetrievalDependencyError(
-                "the required V2 heavy ranker was not selected"
-            )
-        include_candidate_vectors = bool(
-            heavy_selected and self.ranker is not None and user_vector is not None
-        )
-        retrieval_mode = (
-            "cold_start_profile"
-            if cold_start and user_vector is not None
-            else "cold_start_discovery"
-            if cold_start
-            else "personalized"
-            if user_vector is not None
-            else "profile_missing_discovery"
-        )
-        if user_vector:
-            try:
-                semantic = self._semantic(
-                    user_vector,
-                    max(limit * 5, 100),
-                    eligibility_cache,
-                    include_vectors=include_candidate_vectors,
-                    exclude_repo_ids=excluded,
-                )
-            except CooperativeDeadlineExceeded:
-                raise
-            except Exception as exc:
-                logger.error(
-                    "V2 semantic retrieval failed; continuing with discovery",
-                    extra={
-                        "retrieval_context": {
-                            "channel": "semantic",
-                            "error_type": type(exc).__name__,
-                        }
-                    },
-                )
-                semantic = []
-            for point, score in semantic:
-                repo_id = point.repo_id
-                if repo_id not in excluded and math.isfinite(score):
-                    candidates[repo_id] = RankedRepository(repo_id, score, "semantic")
-                    metadata[repo_id] = point.payload
-                    vectors[repo_id] = point.vector
-
-        discovery: list[tuple[str, float, str, dict[str, Any], list[float] | None]] = []
-        try:
-            discovery_points = self._discovery(
-                max(limit * 8, 200),
-                eligibility_cache,
-                include_vectors=include_candidate_vectors,
+        with RetrievalWork() as work:
+            profile_future = work.submit("profile", self._fetch_user_profile, user_id)
+            discovery_futures = self._start_discovery(
+                work, max(limit * 8, 200),
+                # We cannot know profile validity yet. Fetch the heavy projection
+                # speculatively, but preserve post-profile vector eligibility.
+                include_vectors=bool(heavy_selected and self.ranker is not None),
                 exclude_repo_ids=excluded,
             )
-        except RetrievalDependencyError:
-            if not candidates:
-                raise
-            discovery_points = []
+            user_vector, user_profile = self._profile_from_points(
+                user_id, work.result(profile_future),
+            )
+            if self.heavy_ranker_required and not heavy_selected:
+                raise RetrievalDependencyError(
+                    "the required V2 heavy ranker was not selected"
+                )
+            include_candidate_vectors = bool(
+                heavy_selected and self.ranker is not None and user_vector is not None
+            )
+            retrieval_mode = (
+                "cold_start_profile"
+                if cold_start and user_vector is not None
+                else "cold_start_discovery"
+                if cold_start
+                else "personalized"
+                if user_vector is not None
+                else "profile_missing_discovery"
+            )
+            if user_vector:
+                try:
+                    semantic_response = work.result(work.submit(
+                        "semantic", self._fetch_semantic, user_vector,
+                        max(limit * 5, 100),
+                        include_vectors=include_candidate_vectors,
+                        exclude_repo_ids=excluded,
+                    ))
+                    semantic = self._collect_semantic(
+                        semantic_response, eligibility_cache,
+                        include_vectors=include_candidate_vectors,
+                    )
+                except CooperativeDeadlineExceeded:
+                    raise
+                except Exception as exc:
+                    logger.error(
+                        "V2 semantic retrieval failed; continuing with discovery",
+                        extra={
+                            "retrieval_context": {
+                                "channel": "semantic",
+                                "error_type": type(exc).__name__,
+                            }
+                        },
+                    )
+                    semantic = []
+                for point, score in semantic:
+                    repo_id = point.repo_id
+                    if repo_id not in excluded and math.isfinite(score):
+                        candidates[repo_id] = RankedRepository(repo_id, score, "semantic")
+                        metadata[repo_id] = point.payload
+                        vectors[repo_id] = point.vector
+
+            discovery: list[tuple[str, float, str, dict[str, Any], list[float] | None]] = []
+            try:
+                discovery_points = self._collect_discovery(
+                    work, discovery_futures, max(limit * 8, 200), eligibility_cache,
+                    include_vectors=include_candidate_vectors,
+                )
+            except RetrievalDependencyError:
+                if not candidates:
+                    raise
+                discovery_points = []
         for point, channel_source in discovery_points:
             repo_id = point.repo_id
             if repo_id in excluded:

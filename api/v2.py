@@ -77,6 +77,7 @@ from inference.runtime import (
     validate_recommendation_runtime,
 )
 from retrieval.v2_retriever import QdrantV2Retriever, RetrievalDependencyError
+from retrieval.runtime import shutdown_retrieval_runtime
 from summarization.contracts import (
     CARD_SUMMARY_PAYLOAD_FIELDS,
     CardSummaryArtifact,
@@ -258,6 +259,7 @@ def onboarding_pipeline():
 
 def shutdown_v2_runtime() -> None:
     """Close process-scoped clients and executors without creating new ones."""
+    shutdown_retrieval_runtime()
     if producer.cache_info().currsize:
         redis = producer().redis
         close = getattr(redis, "close", None)
