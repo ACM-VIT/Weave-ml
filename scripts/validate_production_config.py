@@ -654,7 +654,22 @@ def _validate_ranker_and_retrieval(v: _Validator) -> None:
     v.number("V2_EXPLORATION_FRACTION", minimum=0, maximum=0.5)
     v.integer("V2_MAX_SAME_LANGUAGE", minimum=1, maximum=100)
     v.number("V2_RECOMMENDATION_TIMEOUT_SECONDS", minimum=0.1, maximum=120)
-    v.number("V2_HEALTH_TIMEOUT_SECONDS", minimum=0.1, maximum=30)
+    health_timeout = v.number("V2_HEALTH_TIMEOUT_SECONDS", minimum=0.1, maximum=30)
+    health_refresh = v.number(
+        "V2_HEALTH_REFRESH_SECONDS", minimum=1, maximum=300, default=15
+    )
+    health_max_age = v.number(
+        "V2_HEALTH_MAX_AGE_SECONDS", minimum=1, maximum=600, default=45
+    )
+    if (
+        health_timeout is not None and health_refresh is not None
+        and health_max_age is not None
+        and health_max_age < health_refresh + 2 * health_timeout
+    ):
+        v.issue(
+            "V2_HEALTH_MAX_AGE_SECONDS",
+            "must cover refresh interval plus two diagnostic timeouts",
+        )
     recommendation_workers = v.integer(
         "V2_RECOMMENDATION_EXECUTOR_WORKERS", minimum=1, maximum=32
     )

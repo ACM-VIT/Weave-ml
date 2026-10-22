@@ -149,6 +149,22 @@ def recommendation_runtime_status() -> dict[str, int | float]:
         }
 
 
+def recommendation_runtime_cleanup_actions():
+    """Capture the current executor so a failed close remains retryable."""
+    actions = []
+    if recommendation_executor.cache_info().currsize:
+        executor = recommendation_executor()
+        actions.append((
+            "recommendation.executor.close",
+            lambda: executor.shutdown(wait=False, cancel_futures=True),
+        ))
+    return [
+        *actions,
+        ("recommendation.executor.cache.clear", recommendation_executor.cache_clear),
+        ("recommendation.admission.cache.clear", recommendation_admission.cache_clear),
+    ]
+
+
 def shutdown_recommendation_runtime() -> None:
     if recommendation_executor.cache_info().currsize:
         recommendation_executor().shutdown(wait=False, cancel_futures=True)

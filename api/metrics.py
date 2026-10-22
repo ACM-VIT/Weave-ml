@@ -16,6 +16,9 @@ _ROUTES = {
     "/api/v2/repositories/refresh",
     "/api/v2/users/onboard",
     "/api/v2/health",
+    "/api/v2/health/live",
+    "/api/v2/health/ready",
+    "/api/v2/health/deep",
     "/api/v2/metrics",
 }
 _METHODS = {"GET", "POST"}
@@ -34,6 +37,8 @@ _requests: Counter[tuple[str, str, str]] = Counter()
 _durations: Counter[tuple[str, str, float]] = Counter()
 _duration_sum: Counter[tuple[str, str]] = Counter()
 _recommendations: Counter[tuple[str, str]] = Counter()
+_health_checks: Counter[tuple[str, str]] = Counter()
+_health_duration_sum: Counter[str] = Counter()
 _empty_recommendations = 0
 
 
@@ -80,6 +85,15 @@ def record_recommendation(
             _empty_recommendations = min(_COUNTER_LIMIT, _empty_recommendations + 1)
 
 
+def record_health_dependency(dependency: str, outcome: str, duration: float) -> None:
+    """Count logical diagnostic checks, not underlying client RPCs."""
+    if dependency not in {"qdrant", "redis"} or outcome not in {"healthy", "failed"}:
+        return
+    with _lock:
+        _bounded_increment(_health_checks, (dependency, outcome))
+        _bounded_increment(_health_duration_sum, dependency, max(0.0, duration))
+
+
 def _labels(**values: str) -> str:
     return "{" + ",".join(f'{key}="{value}"' for key, value in values.items()) + "}"
 
@@ -93,6 +107,8 @@ def render_prometheus(
         duration_sum = dict(_duration_sum)
         recommendations = dict(_recommendations)
         empty_recommendations = _empty_recommendations
+        health_checks = dict(_health_checks)
+        health_duration_sum = dict(_health_duration_sum)
 
     lines = [
         "# HELP ml_api_requests_total Authenticated ML API requests.",
@@ -189,6 +205,22 @@ def render_prometheus(
             + _labels(operation=operation)
             + f" {int(values['timed_out_total'])}"
         )
+    lines.extend([
+        "# HELP ml_health_dependency_checks_total Logical deep diagnostic checks, not client RPCs.",
+        "# TYPE ml_health_dependency_checks_total counter",
+        "# HELP ml_health_dependency_duration_seconds_sum Deep diagnostic dependency time.",
+        "# TYPE ml_health_dependency_duration_seconds_sum counter",
+    ])
+    for (dependency, outcome), count in sorted(health_checks.items()):
+        lines.append(
+            "ml_health_dependency_checks_total"
+            + _labels(dependency=dependency, outcome=outcome) + f" {count}"
+        )
+    for dependency, duration in sorted(health_duration_sum.items()):
+        lines.append(
+            "ml_health_dependency_duration_seconds_sum"
+            + _labels(dependency=dependency) + f" {duration:.9f}"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -199,4 +231,6 @@ def reset_metrics_for_tests() -> None:
         _durations.clear()
         _duration_sum.clear()
         _recommendations.clear()
+        _health_checks.clear()
+        _health_duration_sum.clear()
         _empty_recommendations = 0

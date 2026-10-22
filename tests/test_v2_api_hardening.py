@@ -239,22 +239,37 @@ def test_unsafe_request_id_is_replaced_before_logging(monkeypatch) -> None:
     assert response.json()["request_id"] == replacement
 
 
-def test_health_hides_raw_dependency_errors(monkeypatch) -> None:
+@pytest.mark.parametrize("failed_dependency", ["qdrant", "redis"])
+def test_health_hides_raw_dependency_errors(
+    monkeypatch, health_probe_cache, failed_dependency,
+) -> None:
     monkeypatch.setenv("INTERNAL_API_SECRET", "test-internal-secret")
     secret_dependency_text = "redis://user:password@private-host:6379"
-    failing = SimpleNamespace(
-        health=MagicMock(side_effect=RuntimeError(secret_dependency_text))
-    )
-    with patch("api.v2.retriever", return_value=failing):
-        response = TestClient(api_main.app).get(
-            "/api/v2/health",
-            headers={"x-internal-secret": "test-internal-secret"},
-        )
+    qdrant = SimpleNamespace(health=MagicMock(return_value={"qdrant": "healthy"}))
+    redis = SimpleNamespace(health=MagicMock(return_value={
+        "redis": "healthy", "feedback_consumer_active": True,
+    }))
+    failing = qdrant if failed_dependency == "qdrant" else redis
+    failing.health.side_effect = RuntimeError(secret_dependency_text)
+    with patch("api.v2.retriever", return_value=qdrant), patch(
+        "api.v2.producer", return_value=redis,
+    ):
+        client = TestClient(api_main.app)
+        headers = {"x-internal-secret": "test-internal-secret"}
+        # Exercise the failed dependency, not merely an initially empty cache.
+        response = client.get("/api/v2/health/deep", headers=headers)
+        cached = client.get("/api/v2/health", headers=headers)
 
-    assert response.status_code == 503
-    assert response.json()["code"] == "DEPENDENCY_UNAVAILABLE"
-    assert secret_dependency_text not in response.text
-    assert response.json()["message"] == "Dependency health check failed."
+    qdrant.health.assert_called_once()
+    redis.health.assert_called_once()
+    for result in (response, cached):
+        assert result.status_code == 503
+        assert result.json()["code"] == "DEPENDENCY_UNAVAILABLE"
+        assert secret_dependency_text not in result.text
+        assert result.json()["message"] == "Dependency health check failed."
+        diagnostic = result.json()["details"]["dependency_diagnostics"][failed_dependency]
+        assert diagnostic["status"] == "failed"
+        assert diagnostic["reason"] == "dependency_check_failed"
 
 
 @pytest.mark.parametrize(

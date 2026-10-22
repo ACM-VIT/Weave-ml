@@ -100,6 +100,37 @@ def _semantic_version(value: str, *, field: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in match.groups())
 
 
+def check_readiness(
+    environment: Mapping[str, str] | None = None,
+    *,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Routine container probe: no diagnostic refresh or recommendation work."""
+    env = os.environ if environment is None else environment
+    secret = env.get("INTERNAL_API_SECRET", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", secret):
+        raise SmokeFailure("INTERNAL_API_SECRET must be 64 lowercase hexadecimal characters")
+    payload = _request(
+        "/api/v2/health/ready", secret=secret,
+        timeout=timeout or float(env.get("ML_SMOKE_TIMEOUT_SECONDS", "10")),
+        environment=env,
+    )
+    if payload.get("status") != "healthy" or payload.get("diagnostics_fresh") is not True:
+        raise SmokeFailure("V2 readiness diagnostics are unhealthy or stale")
+    age = payload.get("diagnostics_age_seconds")
+    maximum = payload.get("diagnostics_max_age_seconds")
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        for value in (age, maximum)
+    ) or not 0 <= age <= maximum:
+        raise SmokeFailure("V2 readiness diagnostic freshness is invalid")
+    _required_string(payload, "diagnostics_checked_at")
+    if payload.get("embedding_runtime_ready") is not True:
+        raise SmokeFailure("embedding runtime is not ready")
+    return payload
+
+
 def check_health(
     environment: Mapping[str, str] | None = None,
     *,
@@ -113,7 +144,7 @@ def check_health(
         )
     request_timeout = timeout or float(env.get("ML_SMOKE_TIMEOUT_SECONDS", "10"))
     payload = _request(
-        "/api/v2/health",
+        "/api/v2/health/deep",
         secret=secret,
         timeout=request_timeout,
         environment=env,
@@ -338,7 +369,12 @@ def check_recommendation(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run bounded authenticated V2 smoke checks")
-    parser.add_argument(
+    probes = parser.add_mutually_exclusive_group()
+    probes.add_argument(
+        "--readiness-only", action="store_true",
+        help="read the cached readiness snapshot only; never refresh diagnostics",
+    )
+    probes.add_argument(
         "--health-only",
         action="store_true",
         help="check readiness/contracts only; skip recommendation generation",
@@ -353,6 +389,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Smoke check failed: timeout must be between 1 and 30 seconds", file=sys.stderr)
         return 2
     try:
+        if args.readiness_only:
+            health = check_readiness(timeout=args.timeout)
+            print(json.dumps({
+                "status": "healthy", "tier": "readiness",
+                "diagnostics_checked_at": health["diagnostics_checked_at"],
+            }, sort_keys=True))
+            return 0
         health = check_health(timeout=args.timeout)
         item_count = None
         model_version = None

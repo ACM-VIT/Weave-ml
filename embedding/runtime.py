@@ -23,7 +23,9 @@ from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
 from embedding.embeddings import SentenceTransformerEmbedder
 from embedding.query_cache import QueryEmbeddingCache
 from scripts.user_onboarding import UserOnboardingPipeline
-from summarization.runtime import card_summary_pipeline, shutdown_card_summary_runtime
+from summarization.runtime import (
+    card_summary_cleanup_actions, card_summary_pipeline, shutdown_card_summary_runtime,
+)
 
 
 T = TypeVar("T")
@@ -325,6 +327,27 @@ def embedding_runtime_status() -> dict[str, Any]:
         ),
         "embedding_max_outstanding_jobs": embedding_max_outstanding_jobs(),
     }
+
+
+def embedding_runtime_cleanup_actions():
+    """Capture each executor/provider before independently clearing caches."""
+    actions = []
+    for name, factory in (("embedding", embedding_executor), ("onboarding", onboarding_executor)):
+        if factory.cache_info().currsize:
+            executor = factory()
+            actions.append((
+                f"{name}.executor.close",
+                lambda executor=executor: executor.shutdown(wait=False, cancel_futures=True),
+            ))
+        actions.append((f"{name}.executor.cache.clear", factory.cache_clear))
+    return [
+        *actions,
+        ("embedding.admission.cache.clear", embedding_admission.cache_clear),
+        ("embedding.repository_pipeline.cache.clear", repository_embedding_pipeline.cache_clear),
+        ("embedding.user_pipeline.cache.clear", user_onboarding_pipeline.cache_clear),
+        ("embedding.model.cache.clear", shared_embedding_model.cache_clear),
+        *card_summary_cleanup_actions(),
+    ]
 
 
 def shutdown_embedding_runtime() -> None:

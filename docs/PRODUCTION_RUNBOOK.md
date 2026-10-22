@@ -240,7 +240,47 @@ repair, and result.
 
 ## Health and smoke checks
 
-`GET /api/v2/health` is authenticated and bounded. A production-ready response
+All health tiers retain internal authentication:
+
+- `GET /api/v2/health/live` is process liveness only. It never queries Redis or
+  Qdrant, loads models, or submits executor work. Use it for frequent liveness.
+- `GET /api/v2/health/ready` and legacy `GET /api/v2/health` read the same bounded
+  snapshot without dependency work. Use readiness for traffic/container probes.
+  Initial, failed, timed-out, or stale required diagnostics return HTTP 503.
+- `GET /api/v2/health/deep` requests detailed diagnostics, sharing a single actual
+  coordinator and the same cooldown as the background refresh. Each actual cycle
+  submits exactly two parallel dependency checks to its own two-worker executor,
+  never back to the reserved coordinator pool. Both actual children are joined
+  before coordinator completion, even on partial submission or failure, so timed-out
+  waiters cannot release their ownership early or race shared-client cleanup.
+  It may return a recent snapshot rather than force a new check and never queues
+  duplicate refreshes.
+
+The process refreshes diagnostics after startup and every
+`V2_HEALTH_REFRESH_SECONDS` (default 15) after the previous bounded wait.
+`V2_HEALTH_MAX_AGE_SECONDS` (default 45) is measured from the diagnostic start
+using a monotonic clock, not completion or response time. It must cover refresh
+plus two `V2_HEALTH_TIMEOUT_SECONDS` deadlines (default 5 each). Responses expose
+UTC checked/completed timestamps, age, freshness, in-flight state and safe
+per-dependency status. A timed-out/stuck worker retains its admission slot until
+it really exits, and cannot later turn its timed-out result into healthy data.
+A failed refresh immediately invalidates earlier success. Shutdown stops new
+refreshes immediately and retires the actual diagnostic future before closing
+shared clients or clearing their caches. If a native RPC is still running,
+cleanup is deferred to its completion callback rather than blocking the API
+shutdown indefinitely or closing dependencies underneath it. Native RPC/thread
+termination remains subject to the existing client timeouts and process manager;
+this is not a promise to forcibly kill a running worker. Each captured client,
+executor and cache cleanup action is attempted independently. Failures report
+only fixed step names in sanitized logs and `runtime_cleanup`; retirement tracks
+scheduled/running/completed/failed state rather than treating scheduling as
+success. A later shutdown call retries only failed captured actions without
+recreating clients. Incomplete cleanup blocks a new runtime startup and readiness.
+No fleet-wide or production performance gain is implied by these defaults.
+
+The Docker image uses `--readiness-only`, which does no refresh. Deployment
+smoke checks use the explicit deep tier and retain the complete contract gate.
+A production-ready response
 must report:
 
 - healthy repository and required user collection contracts;
@@ -251,9 +291,12 @@ must report:
 - heavy-ranker readiness/qualification when required;
 - `database_required: false`.
 
-Run the same bounded check used by deployment from inside the API container:
+Run the cached container probe and the full deployment gate from inside the API container:
 
 ```bash
+sudo docker exec gh-social-ml \
+  python -m scripts.production_smoke --readiness-only --timeout 8
+
 sudo docker exec gh-social-ml \
   python -m scripts.production_smoke --health-only --timeout 8
 
@@ -261,10 +304,21 @@ sudo docker exec gh-social-ml \
   python -m scripts.production_smoke --timeout 10
 ```
 
-The second command sends one deterministic request for `ML_SMOKE_USER_ID` and
+The final command sends one deterministic request for `ML_SMOKE_USER_ID` and
 validates UUIDs, uniqueness, finite scores, item count, model version, and the
 embedding allowlist. It does not mutate a user vector. Never use a real user as
 the smoke identity.
+
+For health load comparisons, use the separate fixed route latency series for
+`/health/live`, `/health/ready` and `/health/deep`, plus
+`ml_service_executor_outstanding{operation="health"}` and its admission/timeout
+counters. `ml_health_dependency_checks_total{dependency,outcome}` counts logical
+Qdrant/Redis diagnostic invocations, not individual client RPCs;
+`ml_health_dependency_duration_seconds_sum{dependency}` records their elapsed
+worker time. Compare client-side RPC instrumentation separately when measuring
+actual Qdrant/Redis call counts. Routine probe traffic should leave the logical
+check rate unchanged at the configured controlled cadence. Benchmarks and live
+outage/load verification must still be run before rollout.
 
 ## Metrics scrape and alert wiring
 
