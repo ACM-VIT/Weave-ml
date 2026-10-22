@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
+from copy import deepcopy
+import hashlib
 from datetime import datetime, timezone
 import math
 import re
@@ -17,7 +19,9 @@ from .github_graphql_client import (
     build_readme_base_url,
 )
 from .graphql_queries import README_CANDIDATES
-from utils.readme_processor import ReadmeDocument, process_markdown
+from utils.readme_processor import README_PROCESSING_VERSION, ReadmeDocument, process_markdown
+from .github_rate_limit import GitHubRequestBudget
+from .readme_cache import README_DOCUMENT_CACHE
 from .identity import normalize_repository_name, repository_identity_key
 from .config import metadata_batch_size as validated_metadata_batch_size
 
@@ -52,6 +56,52 @@ class RepositoryEnricher:
         self.metadata_projection = metadata_projection
         self.readme_scheduler = readme_scheduler
         self.graphql_client = graphql_client or GitHubGraphQLClient()
+
+    def _process_readme(
+        self, value: str, *, source_path: str | None,
+        default_branch: str | None, base_url: str | None,
+    ) -> ReadmeDocument:
+        source_commit = getattr(value, "source_commit", None)
+        blob_oid = getattr(value, "blob_oid", None)
+        scope = getattr(value, "authorization_scope", None)
+        repository = getattr(value, "source_repository", None)
+
+        def process() -> ReadmeDocument:
+            document = process_markdown(
+                str(value), source_path=source_path,
+                default_branch=default_branch, base_url=base_url,
+            )
+            document.source_commit = source_commit
+            document.blob_oid = blob_oid
+            return document
+
+        if not (scope and repository and source_path and blob_oid):
+            return process()
+        # Include media resolution context and processing version; the same
+        # blob can appear on a renamed branch/path or under a different parser.
+        key = (
+            scope, repository, source_path, blob_oid, README_PROCESSING_VERSION,
+            source_commit, default_branch, base_url,
+            hashlib.sha256(str(value).encode("utf-8")).hexdigest(),
+        )
+        deadline = getattr(self.graphql_client, "deadline", None)
+        deadline = deadline if type(deadline) in {int, float} else None
+        budget = GitHubRequestBudget(
+            deadline=deadline, defer_retries=False,
+            cancelled=lambda: bool(self.readme_scheduler is not None and self.readme_scheduler.cancelled),
+        )
+        try:
+            document = README_DOCUMENT_CACHE.get_or_load(
+                key, process, budget,
+                size=lambda result: len(result.raw_markdown.encode("utf-8"))
+                + len(result.clean_text.encode("utf-8"))
+                + sum(len(paragraph.encode("utf-8")) for paragraph in result.extracted_paragraphs),
+            )
+            # Downstream summary stages may mutate ReadmeDocument. They must
+            # never modify a canonical/shared artifact seen by another caller.
+            return deepcopy(document)
+        finally:
+            budget.finish()
 
     def _check_cancelled(self) -> None:
         if self.readme_scheduler is not None and self.readme_scheduler.cancelled:
@@ -183,7 +233,7 @@ class RepositoryEnricher:
                     result.warnings.append(warning[:500])
                     logger.warning("README fetch failed for %s: %s", repo_id, exc)
 
-            if readme_text:
+            if readme_text or isinstance(readme_text, FetchedReadme):
                 source_path = getattr(readme_text, "source_path", None)
                 default_branch = (
                     getattr(readme_text, "default_branch", None)
@@ -194,8 +244,8 @@ class RepositoryEnricher:
                     base_url = build_readme_base_url(
                         owner, name, default_branch, source_path
                     )
-                readme = process_markdown(
-                    str(readme_text),
+                readme = self._process_readme(
+                    readme_text,
                     source_path=source_path,
                     default_branch=default_branch,
                     base_url=base_url,
@@ -275,8 +325,8 @@ class RepositoryEnricher:
             readme_base_url = build_readme_base_url(
                 owner, name, readme_default_branch, source_path
             )
-        readme = process_markdown(
-            str(readme_text or ""),
+        readme = self._process_readme(
+            readme_text or "",
             source_path=source_path,
             default_branch=readme_default_branch,
             base_url=readme_base_url,

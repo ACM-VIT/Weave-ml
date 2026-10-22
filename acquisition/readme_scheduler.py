@@ -92,7 +92,9 @@ class ReadmeScheduler:
     def _finished(self, future: Future[FetchedReadme]) -> None:
         with self._condition:
             self._futures.discard(future)
-            self._jobs.pop(future, None)
+            job = self._jobs.pop(future, None)
+            if job is not None:
+                job.budget.finish()
             self._condition.notify_all()
         self._slots.release()
 

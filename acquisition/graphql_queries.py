@@ -299,3 +299,41 @@ query GetRepository($owner: String!, $name: String!) {
   }
 }
 """
+
+
+# Mutable reference lookup is deliberately never a cross-operation cache hit.
+GET_README_REF_QUERY = """
+query GetReadmeRef($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    id
+    defaultBranchRef { name target { oid } }
+  }
+  rateLimit { cost remaining resetAt }
+}
+"""
+
+GET_README_BLOB_QUERY = """
+query GetReadmeBlob($owner: String!, $name: String!, $oid: GitObjectID!) {
+  repository(owner: $owner, name: $name) {
+    object(oid: $oid) { ... on Blob { oid byteSize isBinary text } }
+  }
+  rateLimit { cost remaining resetAt }
+}
+"""
+
+
+def build_readme_manifest_query(commit_oid: str) -> str:
+    """All candidate lookups are pinned to one validated immutable commit."""
+    if len(commit_oid) not in {40, 64} or any(c not in "0123456789abcdef" for c in commit_oid):
+        raise ValueError("README commit must be an immutable Git object ID")
+    fields = "\n".join(
+        f'    {alias}: object(expression: "{commit_oid}:{path}") '
+        '{ ... on Blob { oid byteSize isBinary } }'
+        for alias, path in README_CANDIDATES
+    )
+    return (
+        "query GetReadmeManifest($owner: String!, $name: String!) {\n"
+        "  repository(owner: $owner, name: $name) {\n"
+        f"{fields}\n"
+        "  }\n  rateLimit { cost remaining resetAt }\n}"
+    )

@@ -165,3 +165,77 @@ admission_deferred, throttled, retries, waiting and remaining counters without
 credential labels. These are admission/attempt counters, not measured throughput
 or proof of bytes saved. Fake-clock concurrency/cancellation and injected-throttle
 throughput measurements remain required before claiming runtime acceptance.
+
+## Immutable README cache
+
+Every get_readme operation revalidates the current default-branch commit and
+repository access. That mutable lookup is not reused across operations. Candidate
+paths are then resolved at the exact commit, and canonical text is fetched by
+blob OID. Returned FetchedReadme and ReadmeDocument artifacts expose source_commit
+and blob_oid alongside source_path/default_branch/base_url. Immutable media base
+URLs pin the commit too. Canonical Markdown is neither summarized nor truncated;
+byte count and Git blob hash must match before a blob can enter the cache.
+
+The process-wide caches include the endpoint/credential HMAC scope, repository,
+path and immutable commit/blob identity. Different credentials never share
+private content or in-flight work. No token or failed response is stored as a
+cache value. A failed or incomplete candidate set cannot become a cached missing
+README; a fully resolved missing result is cached only for its exact commit.
+Usable partial-response fallbacks remain usable, but their selection is not
+cached when a higher-priority path was unresolved. Clients lacking immutable
+metadata fall back to uncached canonical acquisition rather than guessing.
+
+Cold immutable acquisition takes a ref, manifest and blob request. Unchanged
+warm acquisition still performs its ref/access check, but reuses the manifest
+and blob. A moved branch re-resolves its manifest, while an unchanged blob can
+still be reused. Candidate/byte/identity failures propagate for acquisition
+retry and cannot overwrite canonical content with empty text.
+
+Limits per process are 512 manifests / 2 MiB, 256 canonical blobs / 64 MiB,
+and 256 processed documents / 32 MiB, using LRU eviction. Accounting is artifact
+payload bytes plus the separate entry bound, not an exact Python heap measure.
+Oversized whole artifacts are returned without retention. Each layer allows at
+most 32 distinct in-flight producers; duplicates share that work. Scheduler
+producers retain ownership across deferrals, followers yield their transport
+worker, and logical-job cleanup releases abandoned flights. None of this is a
+persistent or cross-process cache.
+
+Processed keys additionally include README_PROCESSING_VERSION and media/source
+context. Bump that version when parser behavior or derived-view limits change.
+Parsed documents are copied before downstream use so summaries or other mutable
+fields cannot poison the shared canonical artifact.
+
+The three caches in acquisition.readme_cache expose snapshot() counters for
+hits, misses, coalesced work, failures, evictions, entries, payload bytes,
+in-flight producers and bytes_reused. Hits/coalescing identify avoided layer
+loads, not avoided mutable-ref checks; bytes_reused is artifact payload reuse,
+not measured HTTP transfer savings. Record cold/warm timings and GitHub request
+counts externally when running the deferred acceptance suite. Existing mocked
+README fixtures must model the new ref/manifest/blob stages for immutable-cache
+coverage; legacy text-only fixtures still exercise the uncached fallback.
+
+A producer's cancellation or abrupt termination is local to its logical job.
+Its shared flight completes with SharedReadmeLoadUnavailable, an ordinary
+retryable load failure, so healthy followers in another acquisition run do not
+inherit CancelledError. Followers still check their own cancellation/deadline.
+They do not automatically elect a fresh producer or reset request attempts for
+that failed flight; normal acquisition retry can start a new operation after
+the old producer/IO has settled. Failed flights never populate content caches.
+
+Clients using opaque mutable session.auth implementations bypass shared
+manifest/blob/processed caches, single flight and successful-query replay.
+Auth-object replacement changes their per-session coordination scope too, but
+in-place mutations cannot be safely fingerprinted. Header-token clients retain
+their existing HMAC-scoped sharing; no custom-auth secrets are inspected or
+retained to infer an identity.
+
+Opaque-auth README acquisition stays in one invocation during quota/backoff
+waits rather than restarting completed ref/manifest stages. This preserves the
+original request-attempt counts without caching/replaying access-dependent
+successes. The job keeps its worker and admission permit until completion;
+opaque-auth waits therefore occupy a transport worker. Waiting checks local
+cancellation every 50ms and honors the caller's monotonic deadline when supplied.
+Without a caller deadline there is no unconditional total wall-clock bound on
+quota waiting; transport IO retains its existing timeout limitations. The prior
+budget deferral mode is restored in finally. Header-token clients continue to
+use scheduler-owned delayed retries with the same future and attempt budget.
