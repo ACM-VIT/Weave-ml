@@ -103,7 +103,13 @@ python main.py --limit 150 --batch-size 15 --workers 4
 `GITHUB_METADATA_BATCH_SIZE` independently bounds metadata queries to 1–10
 repositories (default 10, an application response-size guard). Backend delivery
 omits homepage and pull-request-count fields; the default legacy/local enrichment
-projection retains them. READMEs remain individual requests. Discovery's
+projection retains them. READMEs remain individual requests. `GITHUB_README_WORKERS`
+sets a shared per-run concurrency bound across all metadata batches (1–16,
+default 4; use 1 for a serial baseline). README workers own separate HTTP sessions,
+with at most twice this many admitted README jobs and a rolling submission window.
+Cancellation prevents new work and cancels queued work; active HTTP requests keep
+their slot until completion under existing transport timeouts/retries. Direct
+`RepositoryEnricher` callers without a scheduler stay sequential. Discovery's
 `DiscoveryConfig.per_query` sets GraphQL `first` to 1–100 (default 20), and
 `pages_per_query` permits 1–10 cursor pages (default 1). Partial pages retain usable
 nodes but do not advance their cursor. Effective query bounds are logged.
