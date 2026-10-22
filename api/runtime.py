@@ -265,9 +265,10 @@ def submit_service_job(
     operation: str,
     function: Callable[..., T],
     *args: Any,
+    observation: WorkObservation | None = None,
 ) -> Future[T]:
     """Submit bounded work for process-owned, single-flight diagnostics."""
-    return _runtime(operation).submit(function, *args)
+    return _runtime(operation).submit(function, *args, observation=observation)
 
 
 def record_service_job_timeout(operation: str) -> None:

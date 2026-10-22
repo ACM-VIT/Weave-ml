@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from api.runtime import record_service_job_timeout, submit_service_job
+from utils.observability import WorkObservation
 
 
 logger = logging.getLogger("pipeline.api.health")
@@ -104,7 +105,15 @@ class HealthDiagnostics:
             self._attempt_started_at = started_at
             self._next_attempt = now + self.settings.refresh_seconds
             try:
-                future = submit_service_job("health", self.collect, self._stop)
+                # One observation shares the coordinator's expiry across all
+                # waiters. Native worker completion alone records late work;
+                # this does not cancel the Future or release its admission.
+                observation = WorkObservation(
+                    "health", shared_deadline=now + self.settings.timeout_seconds,
+                )
+                future = submit_service_job(
+                    "health", self.collect, self._stop, observation=observation,
+                )
             except Exception:
                 # Admission/configuration failure invalidates prior success.
                 self._healthy = False

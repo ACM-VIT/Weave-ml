@@ -186,7 +186,7 @@ def diagnostic_snapshot() -> dict:
         "spans": [json.loads(record) for record in records],
         "histogram_bounds_seconds": list(_BUCKETS), "histograms": histograms,
         "queue_scope": "in_process_submission_to_worker_start_not_durable_queue_age",
-        "late_work_scope": "actual_running_work_after_caller_stopped_waiting",
+        "late_work_scope": "actual_running_work_after_caller_abandonment_or_shared_deadline",
         "http_scope": "middleware_entry_after_auth_to_response_object_not_body_completion",
         "durable_enqueue_context": "not_propagated",
         "client_app_timing": "not_measured",
@@ -196,9 +196,24 @@ def diagnostic_snapshot() -> dict:
 def _exception_outcome(exc: BaseException | None) -> str:
     if exc is None:
         return "ok"
-    if isinstance(exc, TimeoutError):
-        return "timeout"
-    return "cancelled" if type(exc).__name__ == "CancelledError" else "error"
+    # Follow only the known service wrapper, not arbitrary chained application
+    # errors. RuntimeError inheritance is retained and no API import cycle is
+    # introduced. Only fixed class identity strings are compared, never emitted.
+    seen: set[int] = set()
+    for _ in range(8):
+        if id(exc) in seen:
+            break
+        seen.add(id(exc))
+        if isinstance(exc, TimeoutError):
+            return "timeout"
+        if type(exc).__name__ == "CancelledError":
+            return "cancelled"
+        if (type(exc).__module__, type(exc).__name__) != ("api.runtime", "ServiceDeadlineExceeded"):
+            break
+        exc = exc.__cause__
+        if exc is None:
+            break
+    return "error"
 
 
 def observe_duration(operation: str, stage: str, outcome: str, elapsed: float) -> None:
@@ -225,10 +240,15 @@ class WorkObservation:
     start belongs to the actual worker; finish belongs to its native Future.
     abandon merely marks when a caller stopped waiting. It never finishes work.
     """
-    def __init__(self, operation: str):
+    def __init__(self, operation: str, *, shared_deadline: float | None = None):
+        if shared_deadline is not None and not math.isfinite(shared_deadline):
+            raise ValueError("shared observation deadline must be finite")
         self.operation = operation if operation in _OPERATIONS else "other"
         self._lock = threading.Lock()
         self._submitted = time.monotonic()
+        # A process coordinator may own a shared expiry independently of any
+        # HTTP waiter. Store its existing clock value, never start another timer.
+        self._shared_deadline = shared_deadline
         self._started: float | None = None
         self._worker_stopped: float | None = None
         self._abandoned: float | None = None
@@ -268,6 +288,10 @@ class WorkObservation:
                 observe_duration(self.operation, "queue", outcome, now - self._submitted)
             else:
                 observe_duration(self.operation, "service", outcome, now - self._started)
-                if self._abandoned is not None:
-                    observe_duration(self.operation, "late_work", self._abandon_outcome,
-                                     now - max(self._started, self._abandoned))
+                abandoned, abandon_outcome = self._abandoned, self._abandon_outcome
+                if (self._shared_deadline is not None and now > self._shared_deadline
+                        and (abandoned is None or self._shared_deadline < abandoned)):
+                    abandoned, abandon_outcome = self._shared_deadline, "timeout"
+                if abandoned is not None:
+                    observe_duration(self.operation, "late_work", abandon_outcome,
+                                     now - max(self._started, abandoned))
