@@ -16,7 +16,7 @@ from .contracts import (
     CARD_SUMMARY_MIN_GENERATED_CHARS,
     CardSummaryContent,
 )
-from .sentences import has_two_or_three_complete_sentences, mask_summary_abbreviations
+from .sentences import SENTENCE_END_PATTERN, has_two_or_three_complete_sentences, mask_summary_abbreviations
 
 
 _MARKDOWN = re.compile(
@@ -36,7 +36,7 @@ _README_SECTION = re.compile(
     re.IGNORECASE,
 )
 _LICENSE_BOILERPLATE = re.compile(
-    r"\blicensed under\b|(?:^|[.!?][ \t]+|\n)[ \t]*GPL(?:[ \t-]*v?\d+(?:\.\d+)*(?:\+|[ \t]+or[ \t]+later)?|[ \t]*\+|[ \t]+or[ \t]+later)?[ \t]*(?:[.!?:]|$)",
+    rf"\blicensed under\b|(?:^|{SENTENCE_END_PATTERN}\s+|\n)[ \t]*GPL(?:[ \t-]*v?\d+(?:\.\d+)*(?:\+|[ \t]+or[ \t]+later)?|[ \t]*\+|[ \t]+or[ \t]+later)?[ \t]*(?:[.!?:]|$)",
     re.IGNORECASE,
 )
 _WORD = re.compile(r"[a-z0-9]+(?:['’-][a-z0-9]+)?", re.IGNORECASE)

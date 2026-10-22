@@ -7,7 +7,8 @@ generated-output validation use exactly the same boundaries.
 import re
 import unicodedata
 
-_END = re.compile(r"[.!?](?:[\"'”’)\]]+)?(?=\s|$)")
+SENTENCE_END_PATTERN = r"[.!?](?:[\"'”’)\]]+)?(?=\s|$)"
+_END = re.compile(SENTENCE_END_PATTERN)
 
 
 def mask_summary_abbreviations(value: str) -> str:

@@ -474,7 +474,7 @@ def test_previously_saved_abbreviation_fallback_is_repaired(same_job):
 
 
 @pytest.mark.parametrize('same_job', [True, False], ids=['duplicate', 'current'])
-@pytest.mark.parametrize('invalid_kind', ['GPL', 'highlight', 'unfinished', 'command', 'Markdown', 'copied'])
+@pytest.mark.parametrize('invalid_kind', ['GPL', 'quoted GPL', 'bracket GPL', 'highlight', 'unfinished', 'command', 'Markdown', 'copied'])
 def test_invalid_fingerprinted_artifact_is_repaired_in_real_qdrant(same_job, invalid_kind):
     request = _job()
     pipeline = RepositoryEmbeddingPipeline(embedder=FakeEmbedder())
@@ -484,6 +484,12 @@ def test_invalid_fingerprinted_artifact_is_repaired_in_real_qdrant(same_job, inv
     values = old_artifact.model_dump()
     if invalid_kind == 'GPL':
         values['summary'] = 'GPL. Teams can redistribute the software.'
+    elif invalid_kind in {'quoted GPL', 'bracket GPL'}:
+        closer = '"' if invalid_kind == 'quoted GPL' else ']'
+        values = _artifact(
+            f'Maintainers describe a shared workspace for inspecting ownership decisions and coordinating repository changes.{closer} '
+            'GPL. Teams can review package choices and keep their collaborative tooling aligned with project goals.'
+        ).model_dump()
     elif invalid_kind == 'highlight':
         values['highlights'] = ['GPL v3 or later']
     elif invalid_kind == 'unfinished':
