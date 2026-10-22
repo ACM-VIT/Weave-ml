@@ -14,8 +14,15 @@ The embedding path prefers original Markdown from acquisition or the backend
 `readme` field. Cleaned text and extracted paragraphs remain supported when
 Markdown is unavailable. Canonical source Markdown is never modified.
 
-The parser recognizes ATX and Setext headings, nested section inheritance, and
-backtick/tilde fences. It omits fenced code and entire License, Sponsors,
+The parser recognizes ATX and multiline Setext headings, nested section
+inheritance, and backtick/tilde fences. ATX recognition uses a prefix scan and
+string trimming so whitespace-heavy headings cannot cause regex backtracking.
+Non-excluded heading text remains in the section, including heading-only feature
+lists. Emoji and punctuation decorations are stripped only for classification;
+meaningful text such as `License compatibility checker` and literal symbols such
+as `C#` are retained. Inline backtick spans do not open fenced blocks.
+
+It omits fenced code and entire License, Sponsors,
 Changelog, Contributors, Contributing, Acknowledgements, table-of-contents and
 API/generated-reference subtrees. This is a deterministic English-heading
 heuristic; unknown/localized headings remain neutral. License-related project
@@ -49,7 +56,7 @@ these limits is deliberately omitted; the guarantee is that emitted chunks fit,
 not that arbitrarily large documents are fully represented. Prefix/class limits
 can omit late useful sections and should be evaluated on a representative corpus.
 
-Absent classes contribute no weight. Empty, code-only or entirely excluded
+Absent classes contribute no weight. Empty, fence-only or entirely excluded
 READMEs produce no README tower; metadata and topics are renormalized using the
 existing tower weights. No provider call is introduced by this representation;
 card summaries remain an independent artifact.

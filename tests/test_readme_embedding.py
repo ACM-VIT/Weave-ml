@@ -11,7 +11,7 @@ from config import TOKEN_SECTION_EMBEDDING_VERSION
 from embedding.embeddings import SentenceTransformerEmbedder, aggregate_vectors
 from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
 from embedding.readme_embedding import (
-    SECTION_CHUNK_LIMITS, prepare_readme_chunks, readme_source, token_chunks,
+    SECTION_CHUNK_LIMITS, _sections, prepare_readme_chunks, readme_source, token_chunks,
 )
 from embedding.repository_embedding import RepositoryEmbeddingConfig
 from embedding.runtime import BoundedEmbeddingModel
@@ -53,12 +53,107 @@ def test_every_chunk_fits_active_tokenizer_including_special_tokens(text, tokeni
     assert result[-1][0].endswith(text.rstrip()[-10:])
 
 
-def test_no_tokens_are_lost_at_subword_boundaries(tokenizer):
-    text = "abcdefghijklmnopqrstuvwxyz0123456789 " * 7
+def test_no_source_ranges_are_lost_at_subword_boundaries(tokenizer):
+    # Distinct markers bind chunks to their actual source positions, including
+    # subword splits through a marker, rather than matching any repeated copy.
+    text = " ".join(f"marker{index:04d}abcdefghijklmnopqrstuvwxyz" for index in range(40))
     result = token_chunks(text, tokenizer, sequence_limit=16, overlap_tokens=3)
-    # Every unique source marker occurs in at least one chunk after overlap.
-    for marker in ("abcdefgh", "ijklmnop", "qrstuvwx", "yz012345", "6789"):
-        assert any(marker in chunk for chunk, _ in result)
+    offsets = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)["offset_mapping"]
+
+    def assert_complete(chunks):
+        covered = set()
+        previous_start = -1
+        for chunk, _ in chunks:
+            start = text.find(chunk, previous_start + 1)
+            assert start >= 0
+            covered.update(range(start, start + len(chunk)))
+            previous_start = start
+        expected = {position for start, end in offsets for position in range(start, end)}
+        assert expected <= covered
+
+    assert_complete(result)
+    middle = len(result) // 2
+    # Prove this assertion detects both middle and trailing chunk loss.
+    with pytest.raises(AssertionError):
+        assert_complete(result[:middle] + result[middle + 1:])
+    with pytest.raises(AssertionError):
+        assert_complete(result[:-1])
+
+
+def test_heading_whitespace_does_not_stall_workers():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    # A subprocess bounds the regression itself if quadratic/cubic matching is
+    # accidentally restored. The original 1,600-space case took seconds.
+    script = """
+from embedding.readme_embedding import _sections
+from utils.readme_processor import MAX_PREPROCESS_CHARS
+for size in (1600, MAX_PREPROCESS_CHARS - 32):
+    for heading in ('# Overview' + ' ' * size + '!', '#' + ' ' * size,
+                    '# Overview' + ' ' * size + '#'):
+        sections = _sections(heading + '\\nUseful details.')
+        assert any('Useful details.' in text for _, text in sections)
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=5,
+                   cwd=Path(__file__).resolve().parents[1])
+
+
+@pytest.mark.parametrize("inline", ["```pip install package```", "````inline `code` span````"])
+def test_inline_backtick_spans_do_not_swallow_later_sections(inline):
+    sections = _sections(inline + "\n\n## Features\nSemantic retrieval supports metadata filters.")
+    assert any(category == "purpose" and "Semantic retrieval" in text for category, text in sections)
+
+
+@pytest.mark.parametrize("fence", ["```python", "~~~~info `backticks` allowed"])
+def test_real_fences_still_hide_code_and_preserve_following_sections(fence):
+    close = fence[:3] if fence.startswith("`") else "~~~~~"
+    sections = _sections(fence + "\n# Features\nsecret code\n" + close + "\n## Usage\nRun semantic queries.")
+    assert any("Run semantic queries." in text for _, text in sections)
+    assert all("secret code" not in text for _, text in sections)
+
+
+@pytest.mark.parametrize("title", ["License ⚖️", "📜 License 📜", "Sponsors ❤️", "Generated API reference 📚"])
+def test_decorated_legal_and_reference_subtrees_are_omitted(title):
+    sections = _sections("# Features\nUseful details.\n## " + title + "\nUnrelated boilerplate.\n### Nested\nMore boilerplate.\n## Usage\nSemantic queries.")
+    text = " ".join(text for _, text in sections)
+    assert "Useful details." in text and "Semantic queries." in text
+    assert "boilerplate" not in text
+
+
+def test_descriptive_heading_only_readme_retains_features_and_literal_symbols(tokenizer):
+    markdown = "# Features\n## Semantic vector search\n## Metadata filters\n## C# and .NET\n## License ⚖️\n### Excluded details"
+    sections = _sections(markdown)
+    assert all(category == "purpose" for category, _ in sections)
+    text = " ".join(text for _, text in sections)
+    assert "Semantic vector search" in text and "Metadata filters" in text
+    assert "C# and .NET" in text and "Excluded" not in text
+    result = chunks(markdown, tokenizer)
+    assert result and all(chunk.section_class == "purpose" for chunk in result)
+
+
+@pytest.mark.parametrize("title", [
+    "A guide to checking\nLicense", "License\ncompatibility checker",
+    "Features: license detection", "License compatibility checker ⚖️",
+])
+def test_full_setext_title_preserves_project_subject_matter(title):
+    sections = _sections(title + "\n-------\nDetect incompatible dependency policies.")
+    text = " ".join(text for _, text in sections)
+    assert "Detect incompatible" in text
+    assert " ".join(title.split()) in text
+
+
+def test_multiline_legal_setext_title_is_omitted():
+    assert _sections("License\nInformation\n-------\nPermission is hereby granted.") == []
+
+
+@pytest.mark.parametrize("boundary", ["\n\n", "\n# New section\n", "\n- list item\n", "\n> quote\n", "\n```python\ncode\n```\n"])
+def test_setext_title_stops_at_block_boundaries(boundary):
+    sections = _sections("Useful introduction." + boundary + "License\n-------\nExcluded boilerplate.")
+    text = " ".join(text for _, text in sections)
+    assert "Useful introduction." in text
+    assert "Excluded boilerplate." not in text
 
 
 def test_heading_free_and_paragraph_only_inputs_have_neutral_fallback(tokenizer):

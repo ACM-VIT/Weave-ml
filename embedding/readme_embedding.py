@@ -18,9 +18,12 @@ README_STRATEGY_VERSION = "token-sections-v1"
 SECTION_WEIGHTS = {"purpose": 3.0, "neutral": 1.0, "setup": 0.1}
 # At most 64 README encoder inputs per repository, even for dense code/text.
 SECTION_CHUNK_LIMITS = {"purpose": 32, "neutral": 24, "setup": 8}
-_HEADING = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
+# Match only the prefix: overlapping trailing whitespace/hash expressions can
+# otherwise backtrack for seconds on a single bounded but adversarial line.
+_ATX_PREFIX = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+|$)")
 _SETEXT = re.compile(r"^ {0,3}(=+|-+)\s*$")
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_BLOCK_START = re.compile(r"^(?: {4}|\t| {0,3}(?:>|[-+*][ \t]|[0-9]{1,9}[.)][ \t]|\|))")
 _OMIT = re.compile(
     r"(?:licen[cs]es?(?: information)?|copyright(?: notice)?|sponsors?|sponsorship|"
     r"changelog|change log|release notes?|contributors?|contributing|"
@@ -70,6 +73,7 @@ def _sections(markdown: str) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = []
     stack: list[tuple[int, str]] = []
     body: list[str] = []
+    paragraph: list[str] = []
     category = "neutral"
     fence: tuple[str, int] | None = None
 
@@ -80,48 +84,77 @@ def _sections(markdown: str) -> list[tuple[str, str]]:
                 sections.append((category, text))
         body.clear()
 
-    index = 0
-    while index < len(lines):
+    def commit_paragraph() -> None:
+        body.extend(paragraph)
+        paragraph.clear()
+
+    def begin_section(depth: int, title: str) -> None:
+        nonlocal category
+        flush()
+        title = clean_markdown_copy(title).strip()
+        # Strip decorations for classification only: C#/.NET and other useful
+        # punctuation remain intact in the text sent to the encoder.
+        start, end = 0, len(title)
+        while start < end and not (title[start].isalnum() or title[start] == "_"):
+            start += 1
+        while end > start and not (title[end - 1].isalnum() or title[end - 1] == "_"):
+            end -= 1
+        label = title[start:end]
+        while stack and stack[-1][0] >= depth:
+            stack.pop()
+        inherited = stack[-1][1] if stack else "neutral"
+        if inherited == "omit" or _OMIT.fullmatch(label):
+            category = "omit"
+        elif _SETUP.search(label):
+            category = "setup"
+        elif _PURPOSE.search(label):
+            category = "purpose"
+        else:
+            category = inherited
+        stack.append((depth, category))
+        if category != "omit" and title:
+            body.append(title)
+
+    for line in lines:
         check_deadline()
-        line = lines[index]
         opening = _FENCE.match(line)
         if fence is not None:
             if opening and opening[1][0] == fence[0] and len(opening[1]) >= fence[1] and not line[opening.end():].strip():
                 fence = None
-            index += 1
             continue
-        if opening:
+        # A backtick fence's info string cannot contain backticks. In
+        # particular, a one-line inline span must not swallow the rest of the
+        # README. Tilde fence info strings do allow backticks.
+        if opening and not (opening[1][0] == "`" and "`" in line[opening.end():]):
+            commit_paragraph()
+            body.append("")
             fence = (opening[1][0], len(opening[1]))
-            index += 1
             continue
-        heading = _HEADING.match(line)
-        setext = (
-            index + 1 < len(lines) and bool(line.strip())
-            and not line.lstrip().startswith(("- ", "* ", ">", "|"))
-            and _SETEXT.match(lines[index + 1])
-        )
-        if heading or setext:
-            flush()
-            depth = len(heading[1]) if heading else (1 if lines[index + 1].lstrip().startswith("=") else 2)
-            title = heading[2] if heading else line.strip()
-            # Emoji and inline markup commonly decorate README headings.
-            title = re.sub(r"^[^\w]+", "", clean_markdown_copy(title)).strip()
-            while stack and stack[-1][0] >= depth:
-                stack.pop()
-            inherited = stack[-1][1] if stack else "neutral"
-            if inherited == "omit" or _OMIT.fullmatch(title):
-                category = "omit"
-            elif _SETUP.search(title):
-                category = "setup"
-            elif _PURPOSE.search(title):
-                category = "purpose"
-            else:
-                category = inherited
-            stack.append((depth, category))
-            index += 1 if heading else 2
+        heading = _ATX_PREFIX.match(line)
+        if heading:
+            commit_paragraph()
+            title = line[heading.end():].rstrip(" \t")
+            without_hashes = title.rstrip("#")
+            if len(without_hashes) < len(title) and (
+                not without_hashes or without_hashes[-1] in " \t"
+            ):
+                title = without_hashes.rstrip(" \t")
+            begin_section(len(heading[1]), title)
             continue
-        body.append(line)
-        index += 1
+        setext = _SETEXT.fullmatch(line)
+        if setext and paragraph:
+            # A Setext heading contains the complete preceding paragraph,
+            # which can span several lines; never classify just its last line.
+            title = "\n".join(paragraph)
+            paragraph.clear()
+            begin_section(1 if setext[1][0] == "=" else 2, title)
+            continue
+        if not line.strip() or setext or _BLOCK_START.match(line):
+            commit_paragraph()
+            body.append(line)
+            continue
+        paragraph.append(line)
+    commit_paragraph()
     flush()
     return sections
 
