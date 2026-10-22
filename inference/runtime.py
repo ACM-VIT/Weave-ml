@@ -14,7 +14,9 @@ import atexit
 import math
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from functools import lru_cache
 from typing import Callable, TypeVar
 
@@ -25,6 +27,26 @@ _outstanding = 0
 _rejected = 0
 _timed_out = 0
 _COUNTER_LIMIT = 2**63 - 1
+_recommendation_deadline: ContextVar[float | None] = ContextVar(
+    "recommendation_deadline", default=None
+)
+
+
+def current_recommendation_deadline() -> float | None:
+    """Absolute request deadline, including time spent queued for a worker."""
+    return _recommendation_deadline.get()
+
+
+def _invoke_before_deadline(
+    function: Callable[..., T], args: tuple[object, ...], deadline: float
+) -> T:
+    token = _recommendation_deadline.set(deadline)
+    try:
+        if time.monotonic() >= deadline:
+            raise RecommendationDeadlineExceeded("recommendation expired in queue")
+        return function(*args)
+    finally:
+        _recommendation_deadline.reset(token)
 
 
 class RecommendationCapacityError(RuntimeError):
@@ -93,6 +115,8 @@ def recommendation_admission() -> threading.BoundedSemaphore:
 
 async def run_recommendation_job(function: Callable[..., T], *args: object) -> T:
     global _outstanding, _rejected, _timed_out
+    timeout = recommendation_timeout_seconds()
+    deadline = time.monotonic() + timeout
     admission = recommendation_admission()
     if not admission.acquire(blocking=False):
         with _counter_lock:
@@ -103,7 +127,9 @@ async def run_recommendation_job(function: Callable[..., T], *args: object) -> T
     with _counter_lock:
         _outstanding += 1
     try:
-        future = recommendation_executor().submit(function, *args)
+        future = recommendation_executor().submit(
+            _invoke_before_deadline, function, args, deadline
+        )
     except BaseException:
         _release_recommendation(admission)
         raise
@@ -112,8 +138,12 @@ async def run_recommendation_job(function: Callable[..., T], *args: object) -> T
     try:
         return await asyncio.wait_for(
             asyncio.wrap_future(future),
-            timeout=recommendation_timeout_seconds(),
+            timeout=max(0.0, deadline - time.monotonic()),
         )
+    except RecommendationDeadlineExceeded:
+        with _counter_lock:
+            _timed_out = min(_COUNTER_LIMIT, _timed_out + 1)
+        raise
     except asyncio.TimeoutError as exc:
         # Built-in TimeoutError is also used by Redis/Qdrant clients.  If the
         # worker itself completed with that exception, preserve it for the API's

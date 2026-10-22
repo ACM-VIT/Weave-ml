@@ -7,6 +7,8 @@ import math
 import threading
 from typing import Mapping
 
+from retrieval.metrics import render_candidate_metrics, reset_candidate_metrics_for_tests
+
 
 _ROUTES = {
     "/api/v2/search/repositories",
@@ -221,11 +223,13 @@ def render_prometheus(
             "ml_health_dependency_duration_seconds_sum"
             + _labels(dependency=dependency) + f" {duration:.9f}"
         )
+    lines.extend(render_candidate_metrics())
     return "\n".join(lines) + "\n"
 
 
 def reset_metrics_for_tests() -> None:
     global _empty_recommendations
+    reset_candidate_metrics_for_tests()
     with _lock:
         _requests.clear()
         _durations.clear()

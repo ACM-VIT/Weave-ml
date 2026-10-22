@@ -421,6 +421,134 @@ def test_exclusion_filter_keeps_defensive_validation_and_deduplication(
     assert [candidate["id"] for candidate in retriever.ranker.calls[0][2]] == [valid]
 
 
+@pytest.mark.parametrize("semantic", [True, False], ids=["semantic", "discovery-only"])
+def test_low_yield_refills_past_invalid_points_with_real_qdrant(
+    local_recommendation_corpus, semantic,
+):
+    corpus = local_recommendation_corpus
+    # These still match Qdrant's eligibility stamp but fail defensive feature
+    # validation. Reading the same top pool again cannot recover the batch.
+    corpus.client.set_payload(
+        corpus.repository_collection, payload={"doc_quality": "invalid"},
+        points=corpus.repo_ids[:180],
+    )
+    if not semantic:
+        corpus.client.delete(
+            corpus.user_collection,
+            points_selector=models.PointIdsList(points=[corpus.user_id]),
+        )
+    retriever = _corpus_retriever(corpus, heavy=semantic)
+
+    batch = retriever.recommend_batch(corpus.user_id, 45, [])
+
+    ids = [item.repo_id for item in batch.items]
+    assert len(ids) == len(set(ids)) == 45
+    assert set(ids) <= set(corpus.repo_ids[180:])
+    queries = corpus.client.query_points.call_args_list
+    scrolls = corpus.client.scroll.call_args_list
+    assert len(queries) == (2 if semantic else 0)
+    assert len(scrolls) == (4 if semantic else 12)
+    if semantic:
+        assert set(queries[1].kwargs["query_filter"].must_not[0].has_id) == set(corpus.repo_ids[:150])
+    else:
+        assert set(scrolls[4].kwargs["scroll_filter"].must_not[0].has_id) == set(corpus.repo_ids[:75])
+    assert sum(call.kwargs["limit"] for call in queries + scrolls) <= 6 * retriever.max_candidates
+
+
+def test_exhausted_low_yield_corpus_returns_partial_without_repeats(
+    local_recommendation_corpus,
+):
+    corpus = local_recommendation_corpus
+    corpus.client.set_payload(
+        corpus.repository_collection, payload={"doc_quality": "invalid"},
+        points=corpus.repo_ids[500:595],
+    )
+    retriever = _corpus_retriever(corpus, heavy=False)
+
+    batch = retriever.recommend_batch(corpus.user_id, 45, corpus.repo_ids[:500])
+
+    assert {item.repo_id for item in batch.items} == set(corpus.repo_ids[595:])
+    assert len(batch.items) == 5
+    assert len(corpus.client.query_points.call_args_list) == 1
+    assert len(corpus.client.scroll.call_args_list) == 8
+    # User exclusions and refill exclusions never leak into later requests.
+    retriever.recommend_batch(corpus.user_id, 2, [])
+    assert corpus.client.query_points.call_args.kwargs["query_filter"].must_not is None
+
+
+def test_always_invalid_candidates_cannot_exceed_shared_read_budget():
+    client = HeavyRankerQdrant()
+    limits = []
+
+    def invalid_points(**kwargs):
+        limits.append(kwargs["limit"])
+        points = [client._point(str(uuid.uuid4()), score=0.9) for _ in range(kwargs["limit"])]
+        for point in points:
+            point.payload["doc_quality"] = "invalid"
+        return points
+
+    client.query_points = lambda **kwargs: SimpleNamespace(points=invalid_points(**kwargs))
+    client.scroll = lambda **kwargs: (invalid_points(**kwargs), None)
+    retriever = QdrantV2Retriever(client=client, heavy_ranker_enabled=False)
+
+    assert retriever.recommend_batch(client.user_id, 45, []).items == []
+    assert sum(limits) == 6 * retriever.max_candidates
+    assert len(limits) <= 3 + 3 * 4
+
+
+def test_filter_ignoring_client_stops_when_refill_makes_no_progress():
+    client = HeavyRankerQdrant()
+    invalid = client._point(client.repo_ids[0], score=0.9)
+    invalid.payload["doc_quality"] = float("nan")
+    client.query_points = Mock(side_effect=lambda **kwargs: SimpleNamespace(points=[invalid] * kwargs["limit"]))
+    client.scroll = Mock(side_effect=lambda **kwargs: ([invalid] * kwargs["limit"], None))
+    retriever = QdrantV2Retriever(client=client, heavy_ranker_enabled=False)
+
+    assert retriever.recommend_batch(client.user_id, 45, []).items == []
+    assert client.query_points.call_count == 2
+    assert client.scroll.call_count == 8
+
+
+def test_optional_refill_failure_keeps_successful_candidates():
+    client = HeavyRankerQdrant()
+    valid = client._point(client.repo_ids[0], score=0.9)
+    invalid = client._point(client.repo_ids[1], score=0.8)
+    invalid.payload["doc_quality"] = "invalid"
+    client.query_points = Mock(side_effect=[
+        SimpleNamespace(points=[valid] + [invalid] * 149),
+        RuntimeError("optional refill unavailable"),
+    ])
+    client.scroll = Mock(return_value=([], None))
+    retriever = QdrantV2Retriever(client=client, heavy_ranker_enabled=False)
+
+    batch = retriever.recommend_batch(client.user_id, 45, [])
+
+    assert [item.repo_id for item in batch.items] == [valid.id]
+    assert client.query_points.call_count == 2
+
+
+def test_expired_candidate_deadline_starts_no_more_qdrant_calls(monkeypatch):
+    from inference.runtime import RecommendationDeadlineExceeded
+    from retrieval.v2_retriever import _CandidateReadBudget
+
+    client = HeavyRankerQdrant()
+    retriever = QdrantV2Retriever(client=client, heavy_ranker_enabled=False)
+    budget = _CandidateReadBudget(900, float("inf"))
+    monkeypatch.setattr(retriever, "_candidate_read_budget", lambda: budget)
+    invalid = client._point(client.repo_ids[0], score=0.9)
+    invalid.payload["doc_quality"] = "invalid"
+
+    def expire(**kwargs):
+        budget.deadline = 0.0
+        return SimpleNamespace(points=[invalid] * kwargs["limit"])
+
+    client.query_points = Mock(side_effect=expire)
+    with pytest.raises(RecommendationDeadlineExceeded):
+        retriever.recommend_batch(client.user_id, 45, [])
+    assert client.query_points.call_count == 1
+    assert client.scroll_calls == []
+
+
 def test_qdrant_only_retrieval_deduplicates_and_rejects_legacy_identity():
     client = FakeQdrant()
     retriever = QdrantV2Retriever(client=client)
