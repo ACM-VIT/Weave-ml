@@ -31,8 +31,10 @@ from api.runtime import (
     service_runtime_status,
     service_timeout_seconds,
     service_runtime_cleanup_actions,
+    service_runtime_drain_actions,
     validate_service_runtime,
 )
+from api.request_budget import run_read_only_request
 from api.health import HealthDiagnostics, HealthSettings
 from api.metrics import record_health_dependency, record_recommendation, render_prometheus
 from config import constant_time_secret_matches, internal_api_header_name
@@ -49,6 +51,7 @@ from embedding.runtime import (
     run_embedding_job,
     run_onboarding_job,
     embedding_runtime_cleanup_actions,
+    embedding_runtime_drain_actions,
     user_onboarding_pipeline,
 )
 from embedding.user_profile_store import QdrantUserProfileStore
@@ -74,10 +77,15 @@ from inference.runtime import (
     RecommendationDeadlineExceeded,
     run_recommendation_job,
     recommendation_runtime_status,
+    recommendation_timeout_seconds,
     recommendation_runtime_cleanup_actions,
+    recommendation_runtime_drain_actions,
     validate_recommendation_runtime,
 )
 from retrieval.v2_retriever import QdrantV2Retriever, RetrievalDependencyError
+from retrieval.runtime import (
+    retrieval_runtime_cleanup_actions, retrieval_runtime_drain_actions,
+)
 from summarization.contracts import (
     CARD_SUMMARY_PAYLOAD_FIELDS,
     CardSummaryArtifact,
@@ -86,6 +94,10 @@ from summarization.contracts import (
 from summarization.provider import SUMMARY_COMPLETION_RESERVE_SECONDS
 from summarization.settings import SummarySettings
 from utils.readme_processor import clean_markdown_copy, process_markdown
+from utils.deadline import check_deadline
+from utils.runtime_lifecycle import (
+    RuntimeRetiringError, resume_runtime_admission, stop_runtime_admission,
+)
 
 router = APIRouter(prefix="/api/v2", tags=["v2"])
 logger = logging.getLogger("pipeline.api.v2")
@@ -94,8 +106,10 @@ logger = logging.getLogger("pipeline.api.v2")
 class _RuntimeCleanupPlan:
     """Retain only failed actions for existing process-owned resources."""
 
-    def __init__(self, capture_actions) -> None:
+    def __init__(self, capture_actions, capture_drains) -> None:
         self._capture_actions = capture_actions
+        self._capture_drains = capture_drains
+        self._drains = None
         self._pending = None
         self._lock = threading.Lock()
         self._status = {"state": "pending", "failed_steps": ()}
@@ -106,11 +120,32 @@ class _RuntimeCleanupPlan:
 
     def run(self) -> tuple[str, ...]:
         with self._lock:
+            self._status = {"state": "draining", "failed_steps": ()}
+            if self._drains is None:
+                try:
+                    self._drains = [list(phase) for phase in self._capture_drains()]
+                except Exception:
+                    logger.error("V2 runtime cleanup failed step=drain_capture")
+                    self._status = {"state": "failed", "failed_steps": ("drain_capture",)}
+                    return ("drain_capture",)
+            for index, phase in enumerate(self._drains):
+                failed_drains = []
+                for name, action in phase:
+                    try:
+                        action()
+                    except Exception:
+                        logger.error("V2 runtime cleanup failed step=%s", name)
+                        failed_drains.append((name, action))
+                self._drains[index] = failed_drains
+                if failed_drains:
+                    failures = tuple(name for name, _action in failed_drains)
+                    self._status = {"state": "failed", "failed_steps": failures}
+                    return failures  # Do not advance to children or resource cleanup.
             self._status = {"state": "running", "failed_steps": ()}
             if self._pending is None:
                 try:
-                    # Capture only after the real diagnostic worker exits: it
-                    # may have published a lazy client while retirement began.
+                    # Capture only after real workers settle: any of them may
+                    # have published a lazy client while retirement began.
                     self._pending = list(self._capture_actions())
                 except Exception:
                     logger.error("V2 runtime cleanup failed step=cleanup_capture")
@@ -174,6 +209,7 @@ def _is_temporary_dependency_error(exc: Exception) -> bool:
             LockAcquisitionError,
             LockLostError,
             EmbeddingCapacityError,
+            RuntimeRetiringError,
         ),
     ):
         return True
@@ -311,13 +347,30 @@ def shutdown_v2_runtime() -> None:
         if _shutdown_plan is None:
             if health_diagnostics.cache_info().currsize:
                 _retiring_diagnostics = health_diagnostics()
-            _shutdown_plan = _RuntimeCleanupPlan(_runtime_cleanup_actions)
+            # Freeze every queue/factory before any executor can be captured or
+            # joined. Admitted workers retain their resources until real exit.
+            stop_runtime_admission()
+            _shutdown_plan = _RuntimeCleanupPlan(
+                _runtime_cleanup_actions, _runtime_drain_actions,
+            )
         plan = _shutdown_plan
         diagnostics = _retiring_diagnostics
     if diagnostics is not None:
         diagnostics.retire(plan.run)
     else:
         plan.run()
+
+
+def _runtime_drain_actions():
+    """No model/client capture or close until all admitted workers settle."""
+    return [
+        [
+            *service_runtime_drain_actions(),
+            *recommendation_runtime_drain_actions(),
+            *embedding_runtime_drain_actions(),
+        ],
+        retrieval_runtime_drain_actions(),
+    ]
 
 
 def _runtime_cleanup_actions():
@@ -342,6 +395,7 @@ def _runtime_cleanup_actions():
         *recommendation_runtime_cleanup_actions(),
         *service_runtime_cleanup_actions(),
         *embedding_runtime_cleanup_actions(),
+        *retrieval_runtime_cleanup_actions(),
     ]
 
 
@@ -354,6 +408,7 @@ def _prepare_runtime_startup() -> None:
             health_diagnostics.cache_clear()
             _shutdown_plan = None
             _retiring_diagnostics = None
+            resume_runtime_admission()
 
 
 def _repository_points(repo_id: str) -> list[Any]:
@@ -916,14 +971,17 @@ async def generate_recommendations(
     http_request: Request,
 ):
     try:
-        batch = await run_recommendation_job(
-            retriever().recommend_batch,
-            str(request.user_id),
-            request.limit,
-            [str(item) for item in request.exclude_repo_ids],
-            str(request.generation_id),
-            request.context.cold_start,
-            [str(item) for item in request.social_repo_ids],
+        batch = await run_read_only_request(
+            http_request, recommendation_timeout_seconds(),
+            lambda: run_recommendation_job(
+                retriever().recommend_batch,
+                str(request.user_id),
+                request.limit,
+                [str(item) for item in request.exclude_repo_ids],
+                str(request.generation_id),
+                request.context.cold_start,
+                [str(item) for item in request.social_repo_ids],
+            ),
         )
     except HTTPException:
         raise
@@ -1259,7 +1317,9 @@ async def metrics() -> PlainTextResponse:
 
 def _search_repository_job(request: RepositorySearchRequest):
     from api.search import search_repositories
+    check_deadline()
     search_retriever = retriever()
+    check_deadline()
     model = shared_embedding_model()
     embedder = CachedQueryEmbedder(
         model=model, cache=model.query_embedding_cache,
@@ -1281,9 +1341,14 @@ def _search_repository_job(request: RepositorySearchRequest):
     response_model=RepositorySearchResponse,
     dependencies=[Depends(require_internal_secret)],
 )
-async def repository_search(request: RepositorySearchRequest):
+async def repository_search(request: RepositorySearchRequest, http_request: Request):
     try:
-        return await run_service_job("search", _search_repository_job, request)
+        return await run_read_only_request(
+            http_request, service_timeout_seconds("search"),
+            lambda: run_service_job("search", _search_repository_job, request),
+        )
+    except HTTPException:
+        raise
     except (ServiceCapacityError, ServiceDeadlineExceeded) as exc:
         raise HTTPException(
             status_code=503, detail="Semantic search is temporarily unavailable."

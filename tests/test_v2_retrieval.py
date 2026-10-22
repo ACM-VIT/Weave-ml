@@ -543,10 +543,59 @@ def test_expired_candidate_deadline_starts_no_more_qdrant_calls(monkeypatch):
         return SimpleNamespace(points=[invalid] * kwargs["limit"])
 
     client.query_points = Mock(side_effect=expire)
+    # Initial discovery now fans out alongside profile retrieval. Exercise the
+    # semantic/refill boundary directly so this asserts no *new* RPC after expiry.
+    assert retriever._semantic(VECTOR, 150, minimum_candidates=45, budget=budget) == []
     with pytest.raises(RecommendationDeadlineExceeded):
-        retriever.recommend_batch(client.user_id, 45, [])
+        retriever._discovery(150, minimum_candidates=45, budget=budget)
     assert client.query_points.call_count == 1
     assert client.scroll_calls == []
+
+
+def test_initial_discovery_starts_while_profile_lookup_is_waiting():
+    import threading
+
+    client = HeavyRankerQdrant()
+    discovery_started = threading.Event()
+    retrieve, scroll = client.retrieve, client.scroll
+
+    def waiting_profile(**kwargs):
+        assert discovery_started.wait(2), "discovery must overlap profile retrieval"
+        return retrieve(**kwargs)
+
+    def signal_discovery(**kwargs):
+        discovery_started.set()
+        return scroll(**kwargs)
+
+    client.retrieve = waiting_profile
+    client.scroll = signal_discovery
+    retriever = QdrantV2Retriever(client=client, heavy_ranker_enabled=False)
+
+    assert len(retriever.recommend_batch(client.user_id, 2, []).items) == 2
+    assert len(client.scroll_calls) == 4
+
+
+def test_cooperative_cancellation_stops_refills_and_settles_read_children():
+    from retrieval.runtime import retrieval_runtime_status
+    from utils.deadline import CooperativeDeadlineExceeded, RequestDeadline, deadline_scope
+
+    client = HeavyRankerQdrant()
+    invalid = client._point(client.repo_ids[0], score=0.9)
+    invalid.payload["doc_quality"] = "invalid"
+    deadline = RequestDeadline(10)
+
+    def cancel_after_read(**kwargs):
+        deadline.cancel()
+        return SimpleNamespace(points=[invalid] * kwargs["limit"])
+
+    client.query_points = Mock(side_effect=cancel_after_read)
+    retriever = QdrantV2Retriever(client=client, heavy_ranker_enabled=False)
+    with deadline_scope(deadline), pytest.raises(CooperativeDeadlineExceeded):
+        retriever._semantic(VECTOR, 150, minimum_candidates=45)
+
+    assert client.query_points.call_count == 1
+    assert 1 <= client.query_points.call_args.kwargs["timeout"] <= 10
+    assert retrieval_runtime_status()["outstanding"] == 0
 
 
 def test_qdrant_only_retrieval_deduplicates_and_rejects_legacy_identity():

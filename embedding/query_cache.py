@@ -21,6 +21,9 @@ from typing import Callable
 from config import REPOSITORY_EMBEDDING_MODEL
 from embedding.embeddings import SentenceTransformerEmbedder
 from embedding.vector_contract import validate_embedding_vector
+from utils.deadline import (
+    RequestDeadline, check_deadline, current_deadline, deadline_scope, remaining_seconds,
+)
 
 
 class QueryCacheCapacityError(RuntimeError):
@@ -87,6 +90,7 @@ class QueryEmbeddingCache:
     ) -> list[float]:
         if not math.isfinite(wait_seconds) or wait_seconds <= 0:
             raise ValueError('wait_seconds must be finite and positive')
+        check_deadline()
         # Namespace serialization is unambiguous. Only the digest is retained,
         # including for flights; raw query text is never a key or metric label.
         digest = hashlib.sha256(json.dumps(
@@ -116,17 +120,22 @@ class QueryEmbeddingCache:
 
         if not owner:
             try:
-                try:
-                    value = future.result(timeout=wait_seconds)
-                except FutureTimeoutError as exc:
-                    if (future.done() and not future.cancelled()
-                            and future.exception() is exc):
-                        # result() re-raised the owner's stored exception, not
-                        # a waiter deadline. Preserve that exact error.
-                        raise
-                    # Before Python 3.11 this is not the built-in TimeoutError
-                    # caught by the search route. Keep one boundary contract.
-                    raise TimeoutError('query embedding wait deadline was exceeded') from exc
+                wait_until = time.monotonic() + wait_seconds
+                while True:
+                    check_deadline()
+                    remaining = wait_until - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('query embedding wait deadline was exceeded')
+                    try:
+                        value = future.result(timeout=remaining_seconds(min(remaining, 0.05)))
+                        break
+                    except FutureTimeoutError as exc:
+                        if (future.done() and not future.cancelled()
+                                and future.exception() is exc):
+                            # Preserve an owner's exception, not our wait expiry.
+                            raise
+                        # Waiters only stop their own wait, never the flight.
+                        continue
                 with self._lock:
                     self._saved_seconds += value.compute_seconds
                 return value.copy()
@@ -136,7 +145,17 @@ class QueryEmbeddingCache:
 
         began = time.perf_counter()
         try:
-            computed = compute()
+            request_deadline = current_deadline()
+            # Once elected, this is cache-owned work. A caller disconnecting
+            # must not cancel encoding still needed by other waiters. Its own
+            # configured finite budget bounds model admission independently of
+            # the first caller's relative header or remaining request deadline.
+            shared_deadline = (
+                RequestDeadline(wait_seconds)
+                if request_deadline is not None else None
+            )
+            with deadline_scope(shared_deadline):
+                computed = compute()
             compute_seconds = time.perf_counter() - began
             vector = validate_embedding_vector(
                 computed, expected_size=expected_size, field_name='search query embedding',

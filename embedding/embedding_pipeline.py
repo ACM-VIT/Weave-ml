@@ -22,6 +22,7 @@ from .repository_embedding import (
     combine_repo_tower,
     source_fingerprint,
 )
+from .tower_cache import TowerEmbeddingCache
 from .vector_contract import resolve_repository_identity, validate_embedding_vector
 
 logger = logging.getLogger(__name__)
@@ -37,9 +38,11 @@ class RepositoryEmbeddingPipeline:
         embedder: SentenceTransformerEmbedder | None = None,
         store: QdrantRepositoryStore | None = None,
         card_summarizer: CardSummaryPipeline | None = None,
+        tower_cache: TowerEmbeddingCache | None = None,
     ) -> None:
         self.config = config or RepositoryEmbeddingConfig()
         self.embedder = embedder or SentenceTransformerEmbedder(self.config.model_name)
+        self.tower_cache = tower_cache
         self.store = store
         self.card_summarizer = card_summarizer or CardSummaryPipeline()
 
@@ -73,19 +76,57 @@ class RepositoryEmbeddingPipeline:
             max_chars=self.config.readme_chunk_chars,
             overlap_chars=self.config.readme_chunk_overlap_chars,
         )
-        # Keep tower order/empty-string behavior while filling bounded encoder
-        # groups across towers instead of dispatching metadata/topics alone.
-        tower_vectors = self.embedder.embed_texts(
-            [chunk.text for chunk in readme_chunks] + [metadata_text, topic_text]
-        )
-        if len(tower_vectors) != len(readme_chunks) + 2:
+        # A cache is supplied only by the frozen, revision-pinned runtime.
+        # Unknown/injected encoders continue through the uncached path.
+        cache = self.tower_cache
+        if cache is not None and (
+            type(self.embedder) is not SentenceTransformerEmbedder
+            or not cache.owns(self.embedder.model)
+        ):
+            cache = None
+        inputs = {
+            "readme": [chunk.text for chunk in readme_chunks],
+            "metadata": [metadata_text],
+            "topics": [topic_text],
+        }
+        fingerprints = {}
+        vectors = {}
+        missing = []
+        for tower, texts in inputs.items():
+            # Preserve the empty README's absent-vector weighting semantics.
+            if not texts:
+                vectors[tower] = []
+                continue
+            key = cache.fingerprint(tower=tower, texts=texts, config=self.config) if cache else None
+            fingerprints[tower] = key
+            vector = cache.get(key, expected_size=self.config.embedding_dim) if cache else None
+            if vector is None:
+                missing.append(tower)
+            else:
+                vectors[tower] = vector
+
+        # Fill the same bounded encoder groups with only the missing towers.
+        texts_to_encode = [text for tower in missing for text in inputs[tower]]
+        encoded = self.embedder.embed_texts(texts_to_encode) if texts_to_encode else []
+        if len(encoded) != len(texts_to_encode):
             raise ValueError("encoder must return exactly one vector per tower input")
-        readme_vectors = tower_vectors[:len(readme_chunks)]
-        # The below aggregation is for making each repository contribute one
-        # README vector regardless of README length.
-        readme_embedding = aggregate_vectors(readme_vectors)
-        metadata_embedding = tower_vectors[len(readme_chunks)]
-        topic_embedding = tower_vectors[len(readme_chunks) + 1]
+        offset = 0
+        for tower in missing:
+            count = len(inputs[tower])
+            tower_vectors = [
+                validate_embedding_vector(
+                    vector, expected_size=self.config.embedding_dim,
+                    field_name=f"{tower} embedding for {repo_id}",
+                )
+                for vector in encoded[offset:offset + count]
+            ]
+            offset += count
+            vectors[tower] = (
+                aggregate_vectors(tower_vectors) if tower == "readme" else tower_vectors[0]
+            )
+        readme_embedding = vectors["readme"]
+        metadata_embedding = vectors["metadata"]
+        topic_embedding = vectors["topics"]
         final_embedding = combine_repo_tower(
             readme_embedding=readme_embedding,
             metadata_embedding=metadata_embedding,
@@ -114,6 +155,13 @@ class RepositoryEmbeddingPipeline:
             config=self.config,
             card_summary=card_summary,
         )
+        # Publish only successful computations. These are semantic vectors,
+        # never a content-version/CAS result or a cached summary/payload.
+        if cache is not None:
+            for tower in missing:
+                cache.put(
+                    fingerprints[tower], vectors[tower], expected_size=self.config.embedding_dim,
+                )
         logger.info("Embedded repository %s with %d README chunks", repo_id, len(readme_chunks))
         return RepositoryEmbeddingResult(
             repo_id=repo_id,

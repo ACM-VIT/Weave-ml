@@ -8,6 +8,7 @@ import threading
 from typing import Mapping
 
 from retrieval.metrics import render_candidate_metrics, reset_candidate_metrics_for_tests
+from retrieval.runtime import retrieval_runtime_status
 
 
 _ROUTES = {
@@ -186,7 +187,26 @@ def render_prometheus(
             "# TYPE ml_service_executor_timed_out_total counter",
         ]
     )
+    deadline_metrics = {
+        "dependency_calls_total": "Read-only dependency invocation admissions.",
+        "dependency_calls_prevented_total": "Dependency invocations prevented by a read-only budget.",
+        "timeout_worker_exits_total": "Actual worker exits after timeout.",
+        "timeout_to_worker_exit_seconds_total": "Cumulative seconds from timeout to actual worker exit.",
+        "cancelled_worker_exits_total": "Actual worker exits after cancellation.",
+        "cancelled_to_worker_exit_seconds_total": "Cumulative seconds from cancellation to actual worker exit.",
+    }
+    for name, description in deadline_metrics.items():
+        lines.extend((
+            f"# HELP ml_service_executor_{name} {description}",
+            f"# TYPE ml_service_executor_{name} counter",
+        ))
     for operation, values in sorted(service_executors.items()):
+        for name in deadline_metrics:
+            lines.append(
+                f"ml_service_executor_{name}"
+                + _labels(operation=operation)
+                + f" {values.get(name, 0)}"
+            )
         lines.append(
             "ml_service_executor_outstanding"
             + _labels(operation=operation)
@@ -224,6 +244,23 @@ def render_prometheus(
             + _labels(dependency=dependency) + f" {duration:.9f}"
         )
     lines.extend(render_candidate_metrics())
+    retrieval = retrieval_runtime_status()
+    for name in ("workers", "capacity", "outstanding", "running", "peak_running", "waiting_submitters"):
+        lines.extend((
+            f"# HELP ml_retrieval_io_{name} Process-wide bounded retrieval I/O {name}.",
+            f"# TYPE ml_retrieval_io_{name} gauge",
+            f"ml_retrieval_io_{name} {retrieval[name]}",
+        ))
+    for name in ("calls_total", "completed_total", "errors_total", "queue_seconds_total", "duration_seconds_total"):
+        lines.extend((
+            f"# HELP ml_retrieval_io_{name} Raw retrieval stage {name}.",
+            f"# TYPE ml_retrieval_io_{name} counter",
+        ))
+        for stage, values in sorted(retrieval["stages"].items()):
+            lines.append(
+                f"ml_retrieval_io_{name}" + _labels(stage=stage)
+                + f" {values.get(name, 0)}"
+            )
     return "\n".join(lines) + "\n"
 
 

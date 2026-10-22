@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from inference import runtime
+from utils.deadline import RequestDeadline
 
 
 def test_recommendation_runtime_rejects_an_undersized_capacity(monkeypatch) -> None:
@@ -102,8 +103,11 @@ async def test_recommendation_deadline_includes_queue_time_and_is_request_local(
             queued.set()
         return future
 
-    # Patch only the runtime's clock; asyncio retains its real event-loop clock.
-    monkeypatch.setattr(runtime, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    # Only the request budget uses this clock; asyncio retains its real clock.
+    monkeypatch.setattr(
+        runtime, "RequestDeadline",
+        lambda seconds: RequestDeadline(seconds, clock=lambda: clock.now),
+    )
     monkeypatch.setattr(runtime, "recommendation_admission", lambda: admission)
     monkeypatch.setattr(runtime, "recommendation_executor", lambda: SimpleNamespace(submit=submit))
     monkeypatch.setattr(runtime, "recommendation_timeout_seconds", lambda: 2.0)
@@ -117,7 +121,7 @@ async def test_recommendation_deadline_includes_queue_time_and_is_request_local(
     try:
         assert await asyncio.to_thread(started.wait, 1)
         second = asyncio.create_task(runtime.run_recommendation_job(
-            lambda: (runtime.current_recommendation_deadline(), clock.now)
+            lambda: (runtime.current_deadline().expires_at, clock.now)
         ))
         assert await asyncio.to_thread(queued.wait, 1)
         # Advance time only after the second job is queued behind the blocker.
@@ -128,8 +132,8 @@ async def test_recommendation_deadline_includes_queue_time_and_is_request_local(
         assert deadline == 102.0
         assert worker_started == 100.5
         assert deadline - worker_started == 1.5
-        assert runtime.current_recommendation_deadline() is None
-        assert executor.submit(runtime.current_recommendation_deadline).result(1) is None
+        assert runtime.current_deadline() is None
+        assert executor.submit(runtime.current_deadline).result(1) is None
     finally:
         release.set()
         await asyncio.gather(*([first, second] if second else [first]), return_exceptions=True)

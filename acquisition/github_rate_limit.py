@@ -7,7 +7,7 @@ other GitHub consumers and tokens sharing one account can still exhaust quota.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -43,10 +43,23 @@ class GitHubRequestBudget:
     """
 
     deadline: float | None = None
+    defer_retries: bool = True
+    authorization_scope: str | None = None
     cancelled: Callable[[], bool] = lambda: False
     attempts: dict[str, int] = field(default_factory=dict)
     not_before: dict[str, float] = field(default_factory=dict)
     responses: dict[str, dict[str, Any] | None] = field(default_factory=dict)
+
+    shared_flights: dict[Hashable, Any] = field(default_factory=dict)
+    cleanups: dict[Hashable, Callable[[], None]] = field(default_factory=dict)
+
+    def finish(self) -> None:
+        callbacks = tuple(self.cleanups.values())
+        self.cleanups.clear()
+        for callback in callbacks:
+            callback()
+        self.shared_flights.clear()
+        self.responses.clear()
 
     def check(self) -> None:
         if self.cancelled():

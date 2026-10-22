@@ -51,13 +51,16 @@ def setup_test_environment(monkeypatch):
 @pytest.fixture
 def health_probe_cache(monkeypatch):
     """Isolate router-only health observations; requests explicitly refresh them."""
+    import threading
     from api import v2
+    from utils import runtime_lifecycle
 
     monkeypatch.setenv("APP_ENV", "development")
     monkeypatch.setenv("V2_HEALTH_REFRESH_SECONDS", "15")
     monkeypatch.setenv("V2_HEALTH_MAX_AGE_SECONDS", "45")
     monkeypatch.setenv("V2_HEALTH_TIMEOUT_SECONDS", "5")
     monkeypatch.setattr(v2, "_shutdown_plan", None)
+    monkeypatch.setattr(runtime_lifecycle, "_retiring", threading.Event())
     monkeypatch.setattr(v2, "embedding_runtime_status", lambda: {"embedding_runtime_ready": True})
     monkeypatch.setattr(v2, "service_runtime_status", lambda: {})
     monkeypatch.setattr(v2, "recommendation_runtime_status", lambda: {})

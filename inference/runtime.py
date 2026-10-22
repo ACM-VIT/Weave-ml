@@ -14,11 +14,16 @@ import atexit
 import math
 import os
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
-from contextvars import ContextVar
+from contextvars import copy_context
 from functools import lru_cache
 from typing import Callable, TypeVar
+
+from utils.deadline import (
+    CooperativeDeadlineExceeded, RequestDeadline, check_deadline, current_deadline,
+    deadline_scope, deadline_status,
+)
+from utils.runtime_lifecycle import runtime_admission
 
 
 T = TypeVar("T")
@@ -27,26 +32,6 @@ _outstanding = 0
 _rejected = 0
 _timed_out = 0
 _COUNTER_LIMIT = 2**63 - 1
-_recommendation_deadline: ContextVar[float | None] = ContextVar(
-    "recommendation_deadline", default=None
-)
-
-
-def current_recommendation_deadline() -> float | None:
-    """Absolute request deadline, including time spent queued for a worker."""
-    return _recommendation_deadline.get()
-
-
-def _invoke_before_deadline(
-    function: Callable[..., T], args: tuple[object, ...], deadline: float
-) -> T:
-    token = _recommendation_deadline.set(deadline)
-    try:
-        if time.monotonic() >= deadline:
-            raise RecommendationDeadlineExceeded("recommendation expired in queue")
-        return function(*args)
-    finally:
-        _recommendation_deadline.reset(token)
 
 
 class RecommendationCapacityError(RuntimeError):
@@ -101,11 +86,12 @@ def validate_recommendation_runtime() -> None:
 
 @lru_cache(maxsize=1)
 def recommendation_executor() -> ThreadPoolExecutor:
-    workers = _positive_int("V2_RECOMMENDATION_EXECUTOR_WORKERS", 4, maximum=32)
-    return ThreadPoolExecutor(
-        max_workers=workers,
-        thread_name_prefix="ml-recommendation",
-    )
+    with runtime_admission():
+        workers = _positive_int("V2_RECOMMENDATION_EXECUTOR_WORKERS", 4, maximum=32)
+        return ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="ml-recommendation",
+        )
 
 
 @lru_cache(maxsize=1)
@@ -115,34 +101,53 @@ def recommendation_admission() -> threading.BoundedSemaphore:
 
 async def run_recommendation_job(function: Callable[..., T], *args: object) -> T:
     global _outstanding, _rejected, _timed_out
-    timeout = recommendation_timeout_seconds()
-    deadline = time.monotonic() + timeout
-    admission = recommendation_admission()
-    if not admission.acquire(blocking=False):
-        with _counter_lock:
-            _rejected = min(_COUNTER_LIMIT, _rejected + 1)
-        raise RecommendationCapacityError(
-            "the bounded recommendation executor is at capacity"
-        )
-    with _counter_lock:
-        _outstanding += 1
+    deadline = current_deadline() or RequestDeadline(recommendation_timeout_seconds())
     try:
-        future = recommendation_executor().submit(
-            _invoke_before_deadline, function, args, deadline
-        )
-    except BaseException:
-        _release_recommendation(admission)
-        raise
-
-    future.add_done_callback(lambda _future: _release_recommendation(admission))
+        deadline.remaining()
+    except CooperativeDeadlineExceeded as exc:
+        raise RecommendationDeadlineExceeded("recommendation budget expired before admission") from exc
+    with runtime_admission():
+        admission = recommendation_admission()
+        if not admission.acquire(blocking=False):
+            with _counter_lock:
+                _rejected = min(_COUNTER_LIMIT, _rejected + 1)
+            raise RecommendationCapacityError(
+                "the bounded recommendation executor is at capacity"
+            )
+        with _counter_lock:
+            _outstanding += 1
+        try:
+            # A fresh Context belongs to this task, never shared across workers.
+            with deadline_scope(deadline):
+                context = copy_context()
+            def invoke() -> T:
+                check_deadline()  # Queue time consumes the same response budget.
+                return function(*args)
+            future = recommendation_executor().submit(context.run, invoke)
+        except BaseException:
+            _release_recommendation(admission)
+            raise
+    def completed(_future) -> None:
+        try:
+            if not _future.cancelled():
+                deadline.finish("recommendation")
+        finally:
+            _release_recommendation(admission)
+    future.add_done_callback(completed)
     try:
         return await asyncio.wait_for(
             asyncio.wrap_future(future),
-            timeout=max(0.0, deadline - time.monotonic()),
+            timeout=deadline.remaining(),
         )
-    except RecommendationDeadlineExceeded:
+    except CooperativeDeadlineExceeded as exc:
+        deadline.cancel("timeout")
+        future.cancel()  # Running work retains admission; only queued work stops.
         with _counter_lock:
             _timed_out = min(_COUNTER_LIMIT, _timed_out + 1)
+        raise RecommendationDeadlineExceeded("the cooperative recommendation deadline was exceeded") from exc
+    except asyncio.CancelledError:
+        deadline.cancel()
+        future.cancel()  # Only queued work can actually be cancelled.
         raise
     except asyncio.TimeoutError as exc:
         # Built-in TimeoutError is also used by Redis/Qdrant clients.  If the
@@ -151,6 +156,7 @@ async def run_recommendation_job(function: Callable[..., T], *args: object) -> T
         # into the request-level deadline code.
         if future.done() and not future.cancelled():
             raise
+        deadline.cancel("timeout")
         with _counter_lock:
             _timed_out = min(_COUNTER_LIMIT, _timed_out + 1)
         raise RecommendationDeadlineExceeded(
@@ -176,7 +182,19 @@ def recommendation_runtime_status() -> dict[str, int | float]:
             "rejected_total": _rejected,
             "timed_out_total": _timed_out,
             "timeout_seconds": recommendation_timeout_seconds(),
+            **deadline_status("recommendation"),
         }
+
+
+def recommendation_runtime_drain_actions():
+    """Capture the current executor without creating one during retirement."""
+    if not recommendation_executor.cache_info().currsize:
+        return []
+    executor = recommendation_executor()
+    return [(
+        "recommendation.executor.drain",
+        lambda: executor.shutdown(wait=True, cancel_futures=True),
+    )]
 
 
 def recommendation_runtime_cleanup_actions():

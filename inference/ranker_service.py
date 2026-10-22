@@ -22,6 +22,7 @@ from inference.feature_spec import (
 )
 from inference.value_function import VALUE_WEIGHTS
 from config import REPOSITORY_EMBEDDING_VERSION
+from utils.deadline import check_deadline
 
 
 logger = logging.getLogger("pipeline.ranker")
@@ -517,6 +518,7 @@ class RankerService:
         """
         Executes the MMoE network on a micro-batch (e.g. 15 or 150 repos).
         """
+        check_deadline()
         if not self._model_loaded:
             logger.warning("Heavy Ranker model is not loaded; returning no scores")
             return []
@@ -579,6 +581,7 @@ class RankerService:
         operation order, avoiding float32 rounding changes around score ties.
         Python's stable sort retains candidate order for equal final scores.
         """
+        check_deadline()
         with torch.inference_mode():
             outputs = self.model(X_tensor)
             if len(outputs) != 5 or any(

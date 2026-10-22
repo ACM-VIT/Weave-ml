@@ -94,6 +94,30 @@ purpose and production rule.
 `SUPABASE_DATABASE_URL`, `GITHUB_TOKEN`, legacy `OPENROUTER_API_KEY`, and
 `GROQ_API_KEY` are rejected in the online env file.
 
+### Read-only budgets and runtime retirement
+
+`QDRANT_TIMEOUT_SECONDS` must be finite and between 1 and 120 seconds in
+both startup construction and production preflight. Fractional caps such as
+1.5 remain valid: online Qdrant RPCs receive the floor of the minimum of that
+cap and the remaining request budget, never a rounded-up timeout. A positive
+remaining budget below one second cannot start another integer-second RPC.
+This does not change the independent feedback-write timeout setting.
+
+The existing V2 cleanup plan first freezes submission and pool replacement,
+then waits for captured service, recommendation, and embedding workers to
+actually settle before capturing or closing lazy clients/providers and caches.
+Diagnostic retirement still owns its real worker; cleanup never joins the
+current health worker. Queued cancellation does not count as an actual worker
+exit. An uninterruptible worker keeps retirement draining, and a failed drain
+blocks client/cache cleanup and runtime reuse. Failed close actions retain
+their captured resources for retry; startup resumes admission only after the
+entire cleanup plan completes. The shared retrieval I/O pool is a second drain
+phase, reached only after every outer worker pool has settled; its captured
+children must finish before clients or caches can close. The same admission
+freeze rejects queued/new child submissions and pool replacement. No running
+durable apply or summary completion reserve is shortened by a read-only request
+budget or the admission freeze.
+
 ## Model cache and collection migration
 
 Before enabling these binaries against an existing persistent Qdrant cluster,
@@ -186,6 +210,9 @@ When validation or duplicates leave fewer candidates than the requested batch,
 semantic and discovery retrieval each allow at most two refill rounds. All
 candidate calls share a conservative read budget of six times `max_candidates`
 (900 candidate slots by default), including reservations for failed calls.
+Initial discovery still overlaps the profile lookup. Initial and refill reads
+use the same FIFO-admitted I/O pool and cooperative request deadline; the
+request worker validates results and drains all admitted children before exit.
 The worst case is 15 candidate calls plus the user lookup. Refills exclude raw
 point IDs already read, including rejected points, and stop on exhaustion or
 lack of progress. No further call starts after the absolute recommendation

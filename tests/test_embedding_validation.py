@@ -224,3 +224,143 @@ def test_payload_rejects_invalid_numeric_and_timestamp_values(overrides, message
 def test_vector_validation_rejects_boolean_values():
     with pytest.raises(TypeError, match=r"embedding\[0\]"):
         validate_embedding_vector([True], expected_size=1)
+
+
+class CountingTowerEncoder:
+    max_seq_length = 256
+
+    def __init__(self):
+        self.calls = []
+
+    def encode(self, texts, **kwargs):
+        import hashlib
+        self.calls.append(list(texts))
+        # Text-sensitive vectors detect stale reuse, not just dispatch counts.
+        return [
+            [1.0] + [value / 255 for value in hashlib.sha256(text.encode()).digest()]
+            + [0.0] * (EMBEDDING_DIM - 33)
+            for text in texts
+        ]
+
+
+class CountingTowerSummary:
+    def __init__(self):
+        self.calls = 0
+
+    def summarize(self, source, repo, *, deadline=None):
+        from summarization.pipeline import description_fallback_artifact
+        self.calls += 1
+        return description_fallback_artifact(repo)
+
+
+def _cached_tower_pipeline():
+    from embedding.embeddings import SentenceTransformerEmbedder
+    from embedding.tower_cache import TowerEmbeddingCache
+    encoder = CountingTowerEncoder()
+    cache = TowerEmbeddingCache(model=encoder, model_revision="immutable-test-revision")
+    pipeline = RepositoryEmbeddingPipeline(
+        embedder=SentenceTransformerEmbedder(model=encoder), tower_cache=cache,
+        card_summarizer=CountingTowerSummary(),
+    )
+    return pipeline, encoder, cache
+
+
+def test_tower_reuse_keeps_current_payload_and_independent_summary():
+    pipeline, encoder, cache = _cached_tower_pipeline()
+    first = pipeline.embed_repository(_repository())
+    current = pipeline.embed_repository(_repository(content_version=8, content_hash="new"))
+    assert len(encoder.calls) == 1
+    assert current.final_embedding == first.final_embedding
+    assert current.payload["content_version"] == 8
+    assert current.payload["content_hash"] == "new"
+    assert pipeline.card_summarizer.calls == 2
+    assert cache.snapshot()["hits"] == 3
+
+
+def test_numeric_update_reuses_only_unchanged_semantic_towers():
+    pipeline, encoder, cache = _cached_tower_pipeline()
+    first = pipeline.embed_repository(_repository())
+    changed = _repository(content_version=8, star_count=20)
+    current = pipeline.embed_repository(changed)
+    assert len(encoder.calls[-1]) == 1
+    assert "Stars: 20" in encoder.calls[-1][0]
+    assert current.readme_embedding == first.readme_embedding
+    assert current.topic_embedding == first.topic_embedding
+    assert current.metadata_embedding != first.metadata_embedding
+    assert current.payload["star_count"] == 20
+    pipeline.tower_cache = None
+    uncached = pipeline.embed_repository(changed)
+    assert current.final_embedding == uncached.final_embedding
+
+
+@pytest.mark.parametrize("change", ["version", "chunk", "weights", "revision", "model"])
+def test_tower_reuse_invalidates_changed_computation_identity(change):
+    pipeline, encoder, cache = _cached_tower_pipeline()
+    pipeline.embed_repository(_repository())
+    if change == "version":
+        pipeline.config.version += "-new"
+    elif change == "chunk":
+        pipeline.config.readme_chunk_chars += 1
+    elif change == "weights":
+        pipeline.config.tower_weights["readme"] += 0.1
+    elif change == "revision":
+        cache.model_revision += "-new"
+    else:
+        encoder = CountingTowerEncoder()
+        pipeline.embedder._model = encoder
+    pipeline.embed_repository(_repository(content_version=8))
+    assert len(encoder.calls[-1]) == 3
+
+
+@pytest.mark.parametrize("corruption", ["missing", "dimension", "nonfinite", "identity"])
+def test_invalid_cached_tower_recomputes_only_that_tower(corruption):
+    from array import array
+    from dataclasses import replace
+    pipeline, encoder, cache = _cached_tower_pipeline()
+    first = pipeline.embed_repository(_repository())
+    key, entry = next(iter(cache._entries.items()))
+    if corruption == "missing":
+        del cache._entries[key]
+        cache._bytes -= len(entry.data)
+    else:
+        data = entry.data
+        if corruption == "dimension":
+            data = array("d", [1.0]).tobytes()
+        elif corruption == "nonfinite":
+            data = array("d", [float("nan")] * EMBEDDING_DIM).tobytes()
+        cache._entries[key] = replace(
+            entry, data=data,
+            fingerprint=b"incorrect" if corruption == "identity" else key,
+        )
+        cache._bytes += len(data) - len(entry.data)
+    current = pipeline.embed_repository(_repository(content_version=8))
+    assert len(encoder.calls[-1]) == 1
+    assert current.final_embedding == first.final_embedding
+
+
+@pytest.mark.parametrize(
+    ("max_entries", "max_vector_slots"),
+    [(2, 10), (10, 2)],
+    ids=["entry-limit", "byte-limit"],
+)
+def test_tower_cache_bounds_and_copy_isolation(max_entries, max_vector_slots):
+    pipeline, encoder, cache = _cached_tower_pipeline()
+    # Three towers exceed only one limit in each case, exposing either missing
+    # eviction check independently rather than letting the other mask it.
+    cache.max_entries = max_entries
+    cache.max_bytes = EMBEDDING_DIM * 8 * max_vector_slots
+    first = pipeline.embed_repository(_repository())
+    assert cache.snapshot()["entries"] == 2
+    assert cache.snapshot()["vector_bytes"] == EMBEDDING_DIM * 8 * 2
+    first.metadata_embedding[0] = 999.0
+    key = next(iter(cache._entries))
+    copied = cache.get(key, expected_size=EMBEDDING_DIM)
+    copied[0] = 999.0
+    assert cache.get(key, expected_size=EMBEDDING_DIM)[0] != 999.0
+
+
+def test_invalid_payload_does_not_populate_tower_cache():
+    pipeline, encoder, cache = _cached_tower_pipeline()
+    with pytest.raises(ValueError, match="content_version"):
+        pipeline.embed_repository(_repository(content_version=-1))
+    assert cache.snapshot()["entries"] == 0
