@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from itertools import chain
 import re
 from typing import Any
 
@@ -129,7 +130,7 @@ def _clean_line(line: str) -> str:
     return re.sub(r"\s+", " ", line).strip()
 
 
-def _analysis_lines(markdown: str, budget: _AnalysisBudget) -> Iterator[str]:
+def _analysis_lines(markdown: str, budget: _AnalysisBudget) -> Iterator[tuple[int, int]]:
     """Iterate splitlines-compatible boundaries with one line of lookahead."""
 
     start = 0
@@ -139,33 +140,38 @@ def _analysis_lines(markdown: str, budget: _AnalysisBudget) -> Iterator[str]:
         if count > MAX_SOURCE_ANALYSIS_LINES:
             raise _SourceLimitExceeded("source line budget exceeded")
         budget.spend(match.end() - start)
-        yield markdown[start:match.start()]
+        yield start, match.start()
         start = match.end()
     if start < len(markdown):
         if count >= MAX_SOURCE_ANALYSIS_LINES:
             raise _SourceLimitExceeded("source line budget exceeded")
         budget.spend(len(markdown) - start)
-        yield markdown[start:]
+        yield start, len(markdown)
 
 
 def _readme_sections(
-    markdown: str, *, max_chars: int, budget: _AnalysisBudget,
-) -> tuple[list[str], list[str], bool]:
-    """Return high-signal and neutral lines from a Markdown copy."""
+    markdown: str, *, budget: _AnalysisBudget,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Classify bounded line offsets without retaining cleaned text copies."""
 
-    high: list[str] = []
-    neutral: list[str] = []
+    high: list[tuple[int, int]] = []
+    neutral: list[tuple[int, int]] = []
     current = neutral
     blocked_depth: int | None = None
     in_fence = False
     previous_was_heading = False
-    retained = {True: 0, False: 0}
-    excerpts_truncated = False
     lines = iter(_analysis_lines(markdown, budget))
-    raw_line = next(lines, None)
-    while raw_line is not None:
-        next_line = next(lines, None)
-        line, raw_line = raw_line, next_line
+    position = next(lines, None)
+    pending_line = markdown[position[0]:position[1]] if position is not None else ""
+    while position is not None:
+        next_position = next(lines, None)
+        line = pending_line
+        next_line = (
+            markdown[next_position[0]:next_position[1]]
+            if next_position is not None else None
+        )
+        pending_line = next_line or ""
+        current_position, position = position, next_position
         if _FENCE.match(line):
             in_fence = not in_fence
             continue
@@ -202,34 +208,14 @@ def _readme_sections(
         previous_was_heading = False
         if blocked_depth is not None:
             continue
-        # Once a bucket can fill the provider input, keep reading only its
-        # structural boundaries. Later high-signal sections still take priority
-        # over earlier neutral material; discarded lines are not cleaned again.
-        high_signal = current is high
-        if retained[high_signal] >= max_chars:
-            excerpts_truncated = True
-            continue
         if line.count("|") >= 3:
             continue
         if "|" in line:
             cells = line.strip().strip("|").split("|")
             if all(_TABLE_CELL.fullmatch(cell.strip()) for cell in cells):
                 continue
-        cleaned = _clean_line(line)
-        if (
-            len(cleaned) < 24
-            or _COMMAND.search(cleaned)
-            or _BLOCKED_HEADING.fullmatch(cleaned.rstrip(":"))
-        ):
-            continue
-        # One boundary character preserves the existing word-boundary prompt
-        # clipping without retaining a potentially much longer cleaned line.
-        remaining = max_chars - retained[high_signal]
-        excerpt = cleaned[:remaining + 1]
-        excerpts_truncated |= len(excerpt) < len(cleaned)
-        current.append(excerpt)
-        retained[high_signal] += len(excerpt) + 2
-    return high, neutral, excerpts_truncated
+        current.append(current_position)
+    return high, neutral
 
 
 def build_summary_source(
@@ -246,9 +232,7 @@ def build_summary_source(
     try:
         variants = _source_variants(source, repo, budget)
         raw_markdown = variants[0] if variants else ""
-        high, neutral, excerpts_truncated = _readme_sections(
-            raw_markdown, max_chars=max_chars, budget=budget,
-        )
+        high, neutral = _readme_sections(raw_markdown, budget=budget)
     except _SourceLimitExceeded as exc:
         # A shortened prompt is fine; shortened validation evidence is not.
         # Without complete copy-check coverage, use only metadata fallback.
@@ -267,19 +251,34 @@ def build_summary_source(
         metadata.append(f"Languages: {', '.join(languages[:12])}")
 
     # A name alone does not justify asking the provider to invent a summary.
-    has_summary_evidence = bool(description or topics or languages or high or neutral)
-    chunks = metadata + ["README high-signal excerpts:"] + high + neutral
+    has_summary_evidence = bool(description or topics or languages)
+    excerpts_truncated = False
     selected: list[str] = []
     used = 0
+    chunks = chain(metadata, ("README high-signal excerpts:",), high, neutral)
     for chunk in chunks:
-        # Metadata and retained README lines were already normalized once.
-        normalized = chunk.strip()
-        if not normalized:
-            continue
         remaining = max_chars - used - (2 if selected else 0)
         if remaining <= 0:
             excerpts_truncated = True
             break
+        if isinstance(chunk, str):
+            # Metadata was already normalized once.
+            normalized = chunk.strip()
+        else:
+            # Only the final selector cleans README lines and accounts for
+            # usable clipped text. Raw line length must not consume a second
+            # allowance and suppress later high-signal candidates.
+            start, end = chunk
+            normalized = _clean_line(raw_markdown[start:end])
+            if (
+                len(normalized) < 24
+                or _COMMAND.search(normalized)
+                or _BLOCKED_HEADING.fullmatch(normalized.rstrip(":"))
+            ):
+                continue
+            has_summary_evidence = True
+        if not normalized:
+            continue
         if len(normalized) > remaining:
             excerpts_truncated = True
             normalized = normalized[:remaining].rsplit(" ", 1)[0].rstrip(" ,;:-")

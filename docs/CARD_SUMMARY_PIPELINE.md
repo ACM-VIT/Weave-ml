@@ -105,10 +105,12 @@ Provider input has an independent preprocessing budget, not just the
 - Source collection and the Markdown scan share a 512,000-character work budget.
   The scan visits at most 4,096 lines, using one-line lookahead rather than a
   full-file split. Metadata cleanup retains its existing independent bounds.
-- High-signal and neutral excerpts are cleaned once and each retain only enough
-  text to fill the prompt, plus one word-boundary character per bucket. Heading,
-  setext, nested excluded-section, and fenced-code handling are preserved;
-  later high-signal sections still outrank earlier neutral prose.
+- The structural scan retains only high-signal/neutral line offsets, bounded by
+  the line ceiling. One final selector cleans lines once in metadata, high-signal,
+  then neutral order and charges only clipped text actually appended. Retained
+  cleaned text is capped by the prompt budget, so a long unspaced line cannot
+  consume a separate excerpt allowance and hide later useful lines. Heading,
+  setext, nested excluded-section, and fenced-code handling are preserved.
 
 Prompt clipping never clips the copy-check evidence. Complete, in-budget
 variants, including excluded sections and text beyond the prompt, remain in
