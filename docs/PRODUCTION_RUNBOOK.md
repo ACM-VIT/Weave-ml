@@ -198,12 +198,46 @@ retryable rather than being acknowledged and lost.
 
 ## Recommendation determinism and call budget
 
-The default personalized hybrid path has a fixed upper budget of six Qdrant
+The default uncached personalized hybrid path uses six Qdrant
 round trips: one batched canonical/legacy user-profile retrieval, one semantic
 query, and four bounded discovery-channel scrolls. It performs no Redis call,
 online embedding, heavy-model inference, or repository-vector transfer.
-Missing-profile discovery uses five Qdrant calls. CI asserts this budget so a
-new per-item lookup cannot silently create an N+1 latency regression.
+Missing-profile discovery uses five Qdrant calls when the initial pool suffices.
+An authoritative shared discovery cache can serve its four discovery channels
+without those calls; an insufficient cached pool triggers request-local reads.
+CI asserts these fast-path budgets so a new per-item lookup cannot silently
+create an N+1 latency regression.
+
+When validation or duplicates leave fewer candidates than the requested batch,
+semantic and uncached discovery retrieval each allow at most two refill rounds.
+For a shared cache, the global pool remains unfiltered; an insufficient pool
+can trigger bounded request-local reads that never enter the shared cache. All
+candidate calls share a conservative read budget of six times `max_candidates`
+(900 candidate slots by default), including reservations for failed calls.
+Initial discovery still overlaps the profile lookup. Initial and refill reads
+use the same FIFO-admitted I/O pool and cooperative request deadline; the
+request worker validates results and drains all admitted children before exit.
+The worst case is 15 candidate calls plus the user lookup. Refills exclude raw
+point IDs already read, including rejected points, and stop on exhaustion or
+lack of progress. No further call starts after the absolute recommendation
+deadline, which includes executor queue time. An in-flight synchronous Qdrant
+call still runs to its client timeout and retains its worker slot. Batch output
+and ranker input bounds are unchanged; exhausted collections can return a
+short batch. Exclusions are local to the request; shared discovery caches must
+never hold personalized pools.
+
+The authenticated metrics endpoint exposes `ml_retrieval_calls_total`,
+`ml_retrieval_candidates_total`, `ml_retrieval_fresh_candidates_total`, and
+`ml_retrieval_rejected_candidates_total`, with only the five fixed retrieval
+channel labels. Rejected/fresh candidate rates give the rejection ratio;
+fresh/call rates give unseen yield per successful call. Fresh counts deduplicate
+within the request, including overlap with the semantic pool. They measure
+candidate acquisition, before final feed shaping.
+`ml_retrieval_candidate_bytes_estimate_total` estimates decoded candidate JSON
+bytes from one sampled point every 16 nonempty calls per channel/vector mode;
+`ml_retrieval_candidate_byte_samples_total` reports sample coverage. This is not
+a measurement of compressed wire bytes or HTTP framing. Metrics retain no
+repository or user identifiers.
 
 Freshness is evaluated at the UTC hour first observed for a generation. A
 process-local FIFO retains 65,536 generation anchors for up to six hours. This
