@@ -20,6 +20,10 @@ class CooperativeDeadlineExceeded(TimeoutError):
     """The request no longer has a budget for another stage."""
 
 
+class DependencyBudgetUnavailable(TimeoutError):
+    """One dependency call cannot fit a supported timeout in its budget."""
+
+
 class RequestDeadline:
     def __init__(
         self, seconds: float, *, clock: Callable[[], float] = time.monotonic,
@@ -54,11 +58,12 @@ class RequestDeadline:
         # Qdrant's public timeout contract is integer seconds >= 1. Rounding up
         # would exceed the remaining budget; do not launch a sub-second RPC.
         try:
-            timeout = math.floor(min(math.ceil(maximum), self.remaining()))
+            timeout = math.floor(min(maximum, self.remaining()))
             if timeout < 1:
-                self.cancel("timeout")
-                raise CooperativeDeadlineExceeded("insufficient budget for a Qdrant call")
-        except CooperativeDeadlineExceeded:
+                # A still-positive request budget can retain completed channels.
+                # Refuse this RPC without cancelling the shared request deadline.
+                raise DependencyBudgetUnavailable("insufficient budget for a Qdrant call")
+        except (CooperativeDeadlineExceeded, DependencyBudgetUnavailable):
             with self._lock:
                 self.prevented_calls += 1
             raise
