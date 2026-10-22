@@ -499,7 +499,9 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
                 retryable=False,
             )
         artifact = card_summary_from_payload(stored_payload)
-        if artifact is None or not pipeline.card_summarizer.is_current(artifact) or (
+        if artifact is None or not pipeline.card_summarizer.is_current(
+            artifact, repo=request.repository.model_dump(mode="json")
+        ) or (
             job_status != "duplicate"
             and pipeline.card_summarizer.should_upgrade(artifact)
             and _summary_upgrade_has_time(deadline)
@@ -529,7 +531,9 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
             stored_payload = dict(stored.payload or {})
             artifact = card_summary_from_payload(stored_payload)
             job_status = final_status
-        if artifact is None or not pipeline.card_summarizer.is_current(artifact):
+        if artifact is None or not pipeline.card_summarizer.is_current(
+            artifact, repo=request.repository.model_dump(mode="json")
+        ):
             raise V2ServiceHTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Repository summary state changed; retry the request.",
@@ -575,7 +579,9 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
         job_id=job_id,
     )
     stored_artifact = card_summary_from_payload(dict(stored.payload or {})) if stored else None
-    if stored_artifact is None:
+    if stored_artifact is None or not pipeline.card_summarizer.is_current(
+        stored_artifact, repo=request.repository.model_dump(mode="json")
+    ):
         raise V2ServiceHTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Repository summary was not durably stored; retry the request.",

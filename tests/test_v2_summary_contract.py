@@ -69,7 +69,7 @@ def _job(*, job_id: str | None = None, content_hash: str = "content-hash") -> Re
     )
 
 
-def _artifact(summary: str = "A concise discovery summary explains the repository to developer-tool maintainers. Its focused review workflow helps teams coordinate changes before they affect shared users.") -> CardSummaryArtifact:
+def _artifact(summary: str = "A concise discovery summary explains the repository to developer-tool maintainers. Its focused review workflow helps distributed teams coordinate changes before they affect shared users and downstream integrations.") -> CardSummaryArtifact:
     return CardSummaryArtifact(
         summary=summary,
         highlights=["Review workflow"],
@@ -400,7 +400,12 @@ def test_qdrant_summary_cas_fences_a_concurrent_highlight_update() -> None:
     assert card_summary_from_payload(losing.payload) == _artifact()
 
 
-def test_provider_outage_allows_first_duplicate_and_current_fallback_deliveries() -> None:
+@pytest.mark.parametrize('description', [
+    'A review workspace for teams maintaining shared developer tools.',
+    'It supports common formats, e.g. JSON and YAML. Developers can extend it, e.g. with custom parsers.',
+    'Tools detect GPL boundaries across projects. Teams can track policy changes.',
+])
+def test_provider_outage_allows_first_duplicate_and_current_fallback_deliveries(description) -> None:
     from summarization.provider import SummaryProviderError
 
     class UnavailableProvider:
@@ -417,6 +422,7 @@ def test_provider_outage_allows_first_duplicate_and_current_fallback_deliveries(
     )
     client, store = _qdrant_store()
     request = _job()
+    request.repository.description = description
     try:
         with patch("api.v2._repository_points", side_effect=lambda _id: client.retrieve(
             store.collection_name, [REPO_ID], with_payload=True
@@ -426,11 +432,137 @@ def test_provider_outage_allows_first_duplicate_and_current_fallback_deliveries(
             first = _embed_repository_job_locked(request, OwnedLock())
             duplicate = _embed_repository_job_locked(request, OwnedLock())
             assert provider.calls == 1, "duplicate delivery must replay its stored result"
-            current = _embed_repository_job_locked(_job(), OwnedLock())
+            next_request = _job()
+            next_request.repository.description = description
+            current = _embed_repository_job_locked(next_request, OwnedLock())
         assert [first["status"], duplicate["status"], current["status"]] == ["applied", "duplicate", "current"]
         assert first["card_summary"]["source"] == "description_fallback"
         assert first["card_summary"] == duplicate["card_summary"] == current["card_summary"]
         assert provider.calls == 2, "a separate delivery may attempt to upgrade a valid fallback"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('same_job', [True, False], ids=['duplicate', 'current'])
+def test_previously_saved_abbreviation_fallback_is_repaired(same_job):
+    request = _job()
+    request.repository.description = (
+        'It supports common formats, e.g. JSON and YAML. '
+        'Developers can extend it, e.g. with custom parsers.'
+    )
+    malformed = CardSummaryArtifact(**{
+        **_artifact('It supports common formats, e.g. JSON and YAML.').model_dump(),
+        'source': 'description_fallback',
+        'model_version': CARD_SUMMARY_FALLBACK_MODEL_VERSION,
+    })
+    point = _point(request, artifact=malformed,
+                   stored_job=str(request.job_id) if same_job else str(uuid.uuid4()))
+    pipeline = RepositoryEmbeddingPipeline(embedder=FakeEmbedder())
+
+    class Store:
+        def compare_and_set_card_summary(self, *, expected_point, artifact):
+            return SimpleNamespace(id=expected_point.id, payload={
+                **expected_point.payload, **card_summary_payload(artifact),
+            })
+
+    with patch('api.v2._repository_points', return_value=[point]), patch(
+        'api.v2.repository_embedding_pipeline', return_value=pipeline
+    ), patch('api.v2.repository_store', return_value=Store()):
+        response = _embed_repository_job_locked(request, OwnedLock())
+    assert response['status'] == ('duplicate' if same_job else 'current')
+    assert response['card_summary']['summary'] == request.repository.description
+
+
+@pytest.mark.parametrize('same_job', [True, False], ids=['duplicate', 'current'])
+@pytest.mark.parametrize('invalid_kind', ['GPL', 'quoted GPL', 'bracket GPL', 'highlight', 'unfinished', 'command', 'Markdown', 'copied'])
+def test_invalid_fingerprinted_artifact_is_repaired_in_real_qdrant(same_job, invalid_kind):
+    request = _job()
+    pipeline = RepositoryEmbeddingPipeline(embedder=FakeEmbedder())
+    repo = request.repository.model_dump(mode='json')
+    result = pipeline.embed_repository(repo)
+    old_artifact = pipeline.card_summarizer.summarize(repo, repo)
+    values = old_artifact.model_dump()
+    if invalid_kind == 'GPL':
+        values['summary'] = 'GPL. Teams can redistribute the software.'
+    elif invalid_kind in {'quoted GPL', 'bracket GPL'}:
+        closer = '"' if invalid_kind == 'quoted GPL' else ']'
+        values = _artifact(
+            f'Maintainers describe a shared workspace for inspecting ownership decisions and coordinating repository changes.{closer} '
+            'GPL. Teams can review package choices and keep their collaborative tooling aligned with project goals.'
+        ).model_dump()
+    elif invalid_kind == 'highlight':
+        values['highlights'] = ['GPL v3 or later']
+    elif invalid_kind == 'unfinished':
+        values['summary'] = 'It supports shared workflows. Teams can review changes. Users share updates. Formats include, e.g.'
+    elif invalid_kind == 'command':
+        values['summary'] = 'Run npm install to use the tool. Teams can review changes.'
+    elif invalid_kind == 'Markdown':
+        values['summary'] = '# Review workspace. Teams can review changes.'
+    else:
+        values = _artifact().model_dump()
+        request.repository.readme = values['summary']
+        # Keep the complete canonical payload consistent with the copied source.
+        result = pipeline.embed_repository(request.repository.model_dump(mode='json'))
+    malformed = CardSummaryArtifact.model_validate(values)
+    stored_job = str(request.job_id) if same_job else str(uuid.uuid4())
+    result.payload['content_version'] = request.content_version
+    result.payload['content_hash'] = request.repository.content_hash
+    result.payload['content_job_id'] = stored_job
+    result.payload.update(card_summary_payload(malformed))
+    client, store = _qdrant_store()
+    try:
+        store.upsert([result])
+        with patch('api.v2._repository_points', side_effect=lambda _id: client.retrieve(
+            store.collection_name, [REPO_ID], with_payload=True
+        )), patch('api.v2.repository_embedding_pipeline', return_value=pipeline), patch(
+            'api.v2.repository_store', return_value=store
+        ):
+            repaired = _embed_repository_job_locked(request, OwnedLock())
+            replayed = _embed_repository_job_locked(request, OwnedLock())
+        assert repaired['status'] == ('duplicate' if same_job else 'current')
+        assert repaired['card_summary'] != malformed.model_dump(mode='json')
+        assert replayed['card_summary'] == repaired['card_summary']
+        stored = client.retrieve(store.collection_name, [REPO_ID], with_payload=True)[0]
+        current = card_summary_from_payload(stored.payload)
+        assert current is not None
+        assert pipeline.card_summarizer.is_current(current, repo=request.repository.model_dump(mode='json'))
+        assert stored.payload['content_version'] == request.content_version
+        assert stored.payload['content_job_id'] == stored_job
+    finally:
+        client.close()
+
+
+def test_unicode_boundary_artifact_survives_qdrant_persistence_and_replay():
+    from pathlib import Path
+    case = next(case for case in json.loads(
+        Path('tests/fixtures/summary_compatibility.json').read_text()
+    ) if case['name'] == '360 codepoints')
+
+    class Provider:
+        def generate(self, *args, **kwargs):
+            return json.dumps({'summary': case['summary'], 'highlights': case['highlights']})
+
+    pipeline = RepositoryEmbeddingPipeline(
+        embedder=FakeEmbedder(), card_summarizer=CardSummaryPipeline(provider=Provider()),
+    )
+    client, store = _qdrant_store()
+    request = _job()
+    try:
+        with patch('api.v2._repository_points', side_effect=lambda _id: client.retrieve(
+            store.collection_name, [REPO_ID], with_payload=True
+        )), patch('api.v2.repository_embedding_pipeline', return_value=pipeline), patch(
+            'api.v2.repository_store', return_value=store
+        ):
+            responses = [
+                _embed_repository_job_locked(request, OwnedLock()),
+                _embed_repository_job_locked(request, OwnedLock()),
+                _embed_repository_job_locked(_job(), OwnedLock()),
+            ]
+        assert [response['status'] for response in responses] == ['applied', 'duplicate', 'current']
+        for response in responses:
+            assert response['card_summary']['source'] == 'generated'
+            assert response['card_summary']['summary'] == case['summary']
+            assert response['card_summary']['highlights'] == case['highlights']
     finally:
         client.close()
 
@@ -513,5 +645,33 @@ def test_paragraph_only_repository_job_supplies_readme_context_to_summary_provid
         assert result["status"] == "applied"
         assert result["card_summary"]["source"] == "generated"
         assert paragraphs[0] in captured[0]
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('metadata', [
+    {'full_name': 'acme/license-checker', 'primary_language': 'Python'},
+    {'full_name': 'acme/tool', 'primary_language': 'Unknown', 'topics': ['reference']},
+])
+def test_metadata_fallback_without_provider_persists_and_replays(metadata):
+    pipeline = RepositoryEmbeddingPipeline(embedder=FakeEmbedder(), card_summarizer=CardSummaryPipeline())
+    client, store = _qdrant_store()
+    request = _job()
+    request.repository.description = ''
+    for name, value in metadata.items():
+        setattr(request.repository, name, value)
+    try:
+        with patch('api.v2._repository_points', side_effect=lambda _id: client.retrieve(
+            store.collection_name, [REPO_ID], with_payload=True
+        )), patch('api.v2.repository_embedding_pipeline', return_value=pipeline), patch(
+            'api.v2.repository_store', return_value=store
+        ):
+            first = _embed_repository_job_locked(request, OwnedLock())
+            duplicate = _embed_repository_job_locked(request, OwnedLock())
+            request.job_id = uuid.uuid4()
+            current = _embed_repository_job_locked(request, OwnedLock())
+        assert [first['status'], duplicate['status'], current['status']] == ['applied', 'duplicate', 'current']
+        assert first['card_summary'] == duplicate['card_summary'] == current['card_summary']
+        assert pipeline.card_summarizer.is_current(CardSummaryArtifact.model_validate(first['card_summary']))
     finally:
         client.close()
