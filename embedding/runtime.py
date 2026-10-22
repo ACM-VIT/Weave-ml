@@ -16,6 +16,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from functools import lru_cache, wraps
 from typing import Any, Callable, TypeVar
 
@@ -30,6 +31,7 @@ from summarization.runtime import (
 )
 from utils.deadline import check_deadline, remaining_seconds
 from utils.runtime_lifecycle import runtime_admission
+from utils.observability import WorkObservation, span_scope
 
 
 T = TypeVar("T")
@@ -354,24 +356,44 @@ async def _run_embedding_job(
             raise EmbeddingCapacityError(
                 "the bounded embedding executor is at capacity"
             )
+        operation = "onboard" if executor_factory is onboarding_executor else "embedding"
+        observation = WorkObservation(operation)
         try:
-            future = executor_factory().submit(function, *args, **kwargs)
+            context = copy_context()
+            def invoke() -> T:
+                observation.start()
+                try:
+                    with span_scope(operation):
+                        return function(*args, **kwargs)
+                finally:
+                    observation.worker_stopped()
+            future = executor_factory().submit(context.run, invoke)
         except BaseException:
+            observation.finish("error")
             admission.release()
             raise
     # A cancelled HTTP request does not stop a function that is already running
     # in a ThreadPoolExecutor.  Tie admission to the worker future rather than
     # the awaiting coroutine so cancellation cannot free a slot prematurely and
     # allow the real number of outstanding embedding jobs to exceed the bound.
-    future.add_done_callback(lambda _future: admission.release())
+    def completed(_future) -> None:
+        try:
+            observation.complete_future(_future)
+        finally:
+            admission.release()
+    future.add_done_callback(completed)
     try:
         return await asyncio.wait_for(
             asyncio.wrap_future(future),
             timeout=embedding_timeout_seconds(),
         )
+    except asyncio.CancelledError:
+        observation.abandon("cancelled")
+        raise
     except asyncio.TimeoutError as exc:
         if future.done() and not future.cancelled():
             return future.result()
+        observation.abandon("timeout")
         raise EmbeddingDeadlineExceeded("the bounded embedding deadline was exceeded") from exc
 
 

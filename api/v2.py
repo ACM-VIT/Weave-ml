@@ -1340,6 +1340,9 @@ def _readiness_response(
         },
         "database_required": False,
     }
+    if tier == "deep":
+        from utils.observability import diagnostic_snapshot
+        result["observability"] = diagnostic_snapshot()
     if result["status"] != "healthy":
         raise V2ServiceHTTPException(
             status_code=503,

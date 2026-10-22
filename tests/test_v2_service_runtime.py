@@ -34,16 +34,32 @@ async def test_cancelled_service_job_retains_capacity_until_worker_exits(
     monkeypatch.setenv("V2_REFRESH_EXECUTOR_WORKERS", "1")
     monkeypatch.setenv("V2_REFRESH_MAX_OUTSTANDING", "1")
     monkeypatch.setenv("V2_REFRESH_TIMEOUT_SECONDS", "30")
+    from utils import observability
+    observations = []
+    original_observe = observability.observe_duration
+
+    def observe(operation, stage, outcome, elapsed):
+        observations.append((operation, stage, outcome, elapsed))
+        original_observe(operation, stage, outcome, elapsed)
+
+    monkeypatch.setattr(observability, "observe_duration", observe)
+    worker_context = []
     started = threading.Event()
     allow_finish = threading.Event()
 
     def blocking_job() -> str:
+        worker_context.append(observability.current_correlation())
         started.set()
         assert allow_finish.wait(timeout=2)
         return "finished"
 
-    task = asyncio.create_task(runtime.run_service_job("refresh", blocking_job))
+    with observability.span_scope("refresh", server=True) as _span:
+        server_context = observability.current_correlation()
+        task = asyncio.create_task(runtime.run_service_job("refresh", blocking_job))
     assert await asyncio.to_thread(started.wait, 2)
+    assert worker_context[0].trace_id == server_context.trace_id
+    assert worker_context[0].parent_span_id == server_context.span_id
+    assert not any(stage == "service" for _, stage, _, _ in observations)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -51,6 +67,7 @@ async def test_cancelled_service_job_retains_capacity_until_worker_exits(
     with pytest.raises(runtime.ServiceCapacityError):
         await runtime.run_service_job("refresh", lambda: "too-early")
 
+    assert not any(stage == "late_work" for _, stage, _, _ in observations)
     allow_finish.set()
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
@@ -58,6 +75,10 @@ async def test_cancelled_service_job_retains_capacity_until_worker_exits(
             break
         await asyncio.sleep(0.01)
     assert runtime.service_runtime_status()["refresh"]["outstanding"] == 0
+    assert any(stage == "queue" for _, stage, _, _ in observations)
+    assert any(stage == "service" for _, stage, _, _ in observations)
+    assert any(stage == "late_work" and outcome == "cancelled"
+               for _, stage, outcome, _ in observations)
     assert await runtime.run_service_job("refresh", lambda: "accepted") == "accepted"
 
 

@@ -20,6 +20,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from config import constant_time_secret_matches, internal_api_header_name
 from api.metrics import record_api_request
+from utils.observability import authenticated_request_id, operation_for_path, span_scope
 
 load_dotenv()
 
@@ -292,6 +293,8 @@ async def unhandled_service_error(request: Request, exc: Exception):
 @app.middleware("http")
 async def authenticate_non_health_routes(request: Request, call_next):
     """Fail closed for every route, including all health tiers."""
+    # Preserve the existing response/error request-id contract. Legacy values
+    # are never adopted by trace context or exported in diagnostic spans.
     supplied_request_id = request.headers.get("x-request-id", "").strip()
     request.state.request_id = (
         supplied_request_id
@@ -351,7 +354,20 @@ async def authenticate_non_health_routes(request: Request, call_next):
             message="Unauthorized.",
             retryable=False,
         )
-    response = await call_next(request)
+    request_ids = request.headers.getlist("x-request-id")
+    traceparents = request.headers.getlist("traceparent")
+    correlation_request_id = authenticated_request_id(
+        request_ids[0] if len(request_ids) == 1 else None,
+    )
+    # call_next returns a response object. This span does not establish full
+    # body delivery, client receipt, or frontend rendering completion.
+    with span_scope(
+        operation_for_path(request.url.path), server=True,
+        request_id=correlation_request_id,
+        authenticated_traceparent=traceparents[0] if len(traceparents) == 1 else None,
+    ) as span:
+        response = await call_next(request)
+        span.set_http_status(response.status_code)
     response.headers["x-request-id"] = request.state.request_id
     return response
 
