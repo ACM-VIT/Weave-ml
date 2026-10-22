@@ -111,8 +111,12 @@ current health worker. Queued cancellation does not count as an actual worker
 exit. An uninterruptible worker keeps retirement draining, and a failed drain
 blocks client/cache cleanup and runtime reuse. Failed close actions retain
 their captured resources for retry; startup resumes admission only after the
-entire cleanup plan completes. No running durable apply or summary completion
-reserve is shortened by a read-only request budget or the admission freeze.
+entire cleanup plan completes. The shared retrieval I/O pool is a second drain
+phase, reached only after every outer worker pool has settled; its captured
+children must finish before clients or caches can close. The same admission
+freeze rejects queued/new child submissions and pool replacement. No running
+durable apply or summary completion reserve is shortened by a read-only request
+budget or the admission freeze.
 
 ## Model cache and collection migration
 

@@ -7,6 +7,8 @@ import math
 import threading
 from typing import Mapping
 
+from retrieval.runtime import retrieval_runtime_status
+
 
 _ROUTES = {
     "/api/v2/search/repositories",
@@ -240,6 +242,23 @@ def render_prometheus(
             "ml_health_dependency_duration_seconds_sum"
             + _labels(dependency=dependency) + f" {duration:.9f}"
         )
+    retrieval = retrieval_runtime_status()
+    for name in ("workers", "capacity", "outstanding", "running", "peak_running", "waiting_submitters"):
+        lines.extend((
+            f"# HELP ml_retrieval_io_{name} Process-wide bounded retrieval I/O {name}.",
+            f"# TYPE ml_retrieval_io_{name} gauge",
+            f"ml_retrieval_io_{name} {retrieval[name]}",
+        ))
+    for name in ("calls_total", "completed_total", "errors_total", "queue_seconds_total", "duration_seconds_total"):
+        lines.extend((
+            f"# HELP ml_retrieval_io_{name} Raw retrieval stage {name}.",
+            f"# TYPE ml_retrieval_io_{name} counter",
+        ))
+        for stage, values in sorted(retrieval["stages"].items()):
+            lines.append(
+                f"ml_retrieval_io_{name}" + _labels(stage=stage)
+                + f" {values.get(name, 0)}"
+            )
     return "\n".join(lines) + "\n"
 
 

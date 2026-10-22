@@ -111,6 +111,8 @@ def valid_production_env() -> dict[str, str]:
         "V2_MAX_SAME_LANGUAGE": "5",
         "V2_RECOMMENDATION_TIMEOUT_SECONDS": "12",
         "V2_HEALTH_TIMEOUT_SECONDS": "5",
+        "V2_RETRIEVAL_IO_WORKERS": "4",
+        "V2_RETRIEVAL_IO_MAX_OUTSTANDING": "8",
         "V2_RECOMMENDATION_EXECUTOR_WORKERS": "4",
         "V2_RECOMMENDATION_MAX_OUTSTANDING": "8",
         "V2_FEEDBACK_EXECUTOR_WORKERS": "2",
@@ -285,6 +287,57 @@ def test_search_preflight_and_runtime_accept_defaults_and_bounds(workers, capaci
         monkeypatch.setenv(name, environment[name])
 
     assert _settings("search") == (int(workers), int(capacity), float(timeout))
+    assert validate_production_config(environment) == []
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("V2_RETRIEVAL_IO_WORKERS", "0"),
+    ("V2_RETRIEVAL_IO_WORKERS", "33"),
+    ("V2_RETRIEVAL_IO_WORKERS", "1.5"),
+    ("V2_RETRIEVAL_IO_WORKERS", ""),
+    ("V2_RETRIEVAL_IO_MAX_OUTSTANDING", "0"),
+    ("V2_RETRIEVAL_IO_MAX_OUTSTANDING", "129"),
+    ("V2_RETRIEVAL_IO_MAX_OUTSTANDING", "nan"),
+    ("V2_RETRIEVAL_IO_MAX_OUTSTANDING", ""),
+    ("V2_RETRIEVAL_IO_MAX_OUTSTANDING", "3"),
+])
+def test_retrieval_preflight_rejects_settings_that_fail_runtime_startup(field, value, monkeypatch):
+    from retrieval.runtime import _settings
+
+    environment = valid_production_env()
+    environment[field] = value
+    for name in ("V2_RETRIEVAL_IO_WORKERS", "V2_RETRIEVAL_IO_MAX_OUTSTANDING"):
+        monkeypatch.setenv(name, environment[name])
+
+    with pytest.raises(ValueError):
+        _settings()
+    assert field in issue_names(environment)
+
+
+@pytest.mark.parametrize(("workers", "capacity"), [
+    ("4", "8"), ("1", "1"), ("32", "128"),
+], ids=["defaults", "minimum", "maximum"])
+def test_retrieval_preflight_and_runtime_accept_defaults_and_bounds(workers, capacity, monkeypatch):
+    from retrieval.runtime import _settings
+
+    environment = valid_production_env()
+    environment.update(V2_RETRIEVAL_IO_WORKERS=workers, V2_RETRIEVAL_IO_MAX_OUTSTANDING=capacity)
+    for name in ("V2_RETRIEVAL_IO_WORKERS", "V2_RETRIEVAL_IO_MAX_OUTSTANDING"):
+        monkeypatch.setenv(name, environment[name])
+
+    assert _settings() == (int(workers), int(capacity))
+    assert validate_production_config(environment) == []
+
+
+def test_retrieval_preflight_and_runtime_use_the_same_absent_defaults(monkeypatch):
+    from retrieval.runtime import _settings
+
+    environment = valid_production_env()
+    for name in ("V2_RETRIEVAL_IO_WORKERS", "V2_RETRIEVAL_IO_MAX_OUTSTANDING"):
+        environment.pop(name)
+        monkeypatch.delenv(name, raising=False)
+
+    assert _settings() == (4, 8)
     assert validate_production_config(environment) == []
 
 

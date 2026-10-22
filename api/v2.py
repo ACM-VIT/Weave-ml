@@ -83,6 +83,9 @@ from inference.runtime import (
     validate_recommendation_runtime,
 )
 from retrieval.v2_retriever import QdrantV2Retriever, RetrievalDependencyError
+from retrieval.runtime import (
+    retrieval_runtime_cleanup_actions, retrieval_runtime_drain_actions,
+)
 from summarization.contracts import (
     CARD_SUMMARY_PAYLOAD_FIELDS,
     CardSummaryArtifact,
@@ -360,11 +363,14 @@ def shutdown_v2_runtime() -> None:
 
 def _runtime_drain_actions():
     """No model/client capture or close until all admitted workers settle."""
-    return [[
-        *service_runtime_drain_actions(),
-        *recommendation_runtime_drain_actions(),
-        *embedding_runtime_drain_actions(),
-    ]]
+    return [
+        [
+            *service_runtime_drain_actions(),
+            *recommendation_runtime_drain_actions(),
+            *embedding_runtime_drain_actions(),
+        ],
+        retrieval_runtime_drain_actions(),
+    ]
 
 
 def _runtime_cleanup_actions():
@@ -389,6 +395,7 @@ def _runtime_cleanup_actions():
         *recommendation_runtime_cleanup_actions(),
         *service_runtime_cleanup_actions(),
         *embedding_runtime_cleanup_actions(),
+        *retrieval_runtime_cleanup_actions(),
     ]
 
 
