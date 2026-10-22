@@ -7,7 +7,7 @@ import atexit
 import math
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable, TypeVar
@@ -118,7 +118,8 @@ class _BoundedExecutor:
         with _instances_lock:
             _instances.add(self)
 
-    async def run(self, function: Callable[..., T], *args: Any) -> T:
+    def submit(self, function: Callable[..., T], *args: Any) -> Future[T]:
+        """Retain admission until actual worker completion, including cancellation."""
         if not self.admission.acquire(blocking=False):
             with self._lock:
                 self._rejected += 1
@@ -131,6 +132,10 @@ class _BoundedExecutor:
             self._release()
             raise
         future.add_done_callback(lambda _future: self._release())
+        return future
+
+    async def run(self, function: Callable[..., T], *args: Any) -> T:
+        future = self.submit(function, *args)
         try:
             return await asyncio.wait_for(
                 asyncio.wrap_future(future),
@@ -139,9 +144,12 @@ class _BoundedExecutor:
         except asyncio.TimeoutError as exc:
             if future.done() and not future.cancelled():
                 return future.result()
-            with self._lock:
-                self._timed_out += 1
+            self.record_timeout()
             raise ServiceDeadlineExceeded(self.operation) from exc
+
+    def record_timeout(self) -> None:
+        with self._lock:
+            self._timed_out += 1
 
     def _release(self) -> None:
         with self._lock:
@@ -176,6 +184,20 @@ async def run_service_job(
     return await _runtime(operation).run(function, *args)
 
 
+def submit_service_job(
+    operation: str,
+    function: Callable[..., T],
+    *args: Any,
+) -> Future[T]:
+    """Submit bounded work for process-owned, single-flight diagnostics."""
+    return _runtime(operation).submit(function, *args)
+
+
+def record_service_job_timeout(operation: str) -> None:
+    """Record a deadline owned by a process-level single-flight coordinator."""
+    _runtime(operation).record_timeout()
+
+
 def service_timeout_seconds(operation: str) -> float:
     """Return the immutable deadline configured for this admitted worker pool."""
     return _runtime(operation).timeout
@@ -188,6 +210,22 @@ def validate_service_runtime() -> None:
 
 def service_runtime_status() -> dict[str, dict[str, int | float]]:
     return {operation: _runtime(operation).snapshot() for operation in _SPECS}
+
+
+def service_runtime_cleanup_actions():
+    """Capture every existing pool without allocating one during shutdown."""
+    with _instances_lock:
+        instances = tuple(_instances)
+
+    def forget_instances():
+        with _instances_lock:
+            _instances.difference_update(instances)
+
+    return [
+        *[(f"service.{instance.operation}.close", instance.close) for instance in instances],
+        ("service.instances.clear", forget_instances),
+        ("service.cache.clear", _runtime.cache_clear),
+    ]
 
 
 def shutdown_service_runtime() -> None:
