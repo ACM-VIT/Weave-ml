@@ -1559,6 +1559,44 @@ def test_cached_discovery_refill_failure_keeps_checked_missing_profile_results()
     assert retriever.discovery_cache_status()["entries"] == 1
 
 
+def test_oversized_shared_pool_preserves_owner_candidates_on_fallback():
+    client = HeavyRankerQdrant()
+    client.retrieve = Mock(return_value=[])
+    retriever = QdrantV2Retriever(
+        client=client, heavy_ranker_enabled=False,
+        discovery_revision_provider=lambda: DiscoveryRevision("corpus", "eligible"),
+        discovery_cache=SharedDiscoveryCache(max_bytes=1),
+    )
+
+    batch = retriever.recommend_batch(client.user_id, 3, [])
+
+    assert batch.retrieval_mode == "profile_missing_discovery"
+    assert {item.repo_id for item in batch.items} == set(client.repo_ids)
+    assert len(client.scroll_calls) == 8
+    assert retriever.discovery_cache_status()["entries"] == 0
+
+
+def test_revision_change_retries_without_stale_owner_exclusions():
+    client = HeavyRankerQdrant()
+    calls = [0]
+
+    def revision():
+        calls[0] += 1
+        return DiscoveryRevision("before" if calls[0] == 1 else "after", "eligible")
+
+    retriever = QdrantV2Retriever(
+        client=client, heavy_ranker_enabled=False,
+        discovery_revision_provider=revision,
+    )
+
+    points = retriever._discovery(3, include_vectors=False)
+
+    assert {point.repo_id for point, _source in points} == set(client.repo_ids)
+    assert len(client.scroll_calls) == 8
+    assert all(call["scroll_filter"].must_not is None for call in client.scroll_calls[4:])
+    assert retriever.discovery_cache_status()["entries"] == 0
+
+
 def test_successful_discovery_refill_merges_without_losing_checked_candidates():
     client = HeavyRankerQdrant()
     retriever = QdrantV2Retriever(

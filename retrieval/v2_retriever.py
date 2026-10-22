@@ -1236,11 +1236,13 @@ class QdrantV2Retriever:
                     exclude_repo_ids=exclude_repo_ids,
                     existing_repo_ids=existing,
                 )
+                # Keep validated request-local candidates if encoding or
+                # publishing the shared pool fails. They are never cached.
+                partial = self._merge_discovery_channels(
+                    channels, target, exclude_repo_ids,
+                )
                 if succeeded != len(_DISCOVERY_SOURCES):
                     self._discovery_cache.fail(lease)
-                    partial = self._merge_discovery_channels(
-                        channels, min(limit, self.max_candidates), exclude_repo_ids,
-                    )
                     if len(existing | {point.repo_id for point, _ in partial}) >= minimum:
                         return partial
                     raise RuntimeError("partial discovery refresh is not cacheable")
@@ -1299,6 +1301,11 @@ class QdrantV2Retriever:
                     except BaseException:
                         pass
                 self._discovery_cache.fail(lease)
+                # A changed authority invalidates the owner's initial points
+                # and their exclusions. The fallback must read the new corpus.
+                if self._discovery_revision() != plan.revision:
+                    partial = None
+                    plan.read_ids.clear()
         refill_exclusions: set[str | int] = set(exclude_repo_ids or ()) | plan.read_ids
         futures = self._start_discovery(
             work, limit, include_vectors=include_vectors, exclude_repo_ids=refill_exclusions,
