@@ -63,7 +63,7 @@ def _error_response(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start and validate the V2-only runtime."""
-    from api.v2 import shutdown_v2_runtime, validate_v2_runtime_configuration
+    from api.v2 import health_diagnostics, shutdown_v2_runtime, validate_v2_runtime_configuration
     from embedding.runtime import embedding_warmup_enabled, warm_embedding_runtime
     from scripts.validate_production_config import validate_production_config
 
@@ -85,9 +85,15 @@ async def lifespan(app: FastAPI):
     if warmup_enabled:
         app.state.embedding_runtime = await asyncio.to_thread(warm_embedding_runtime)
     app.state.feedback_settings = settings
+    diagnostic_task = asyncio.create_task(health_diagnostics().run_periodic())
     try:
         yield
     finally:
+        diagnostic_task.cancel()
+        try:
+            await diagnostic_task
+        except asyncio.CancelledError:
+            pass
         await asyncio.to_thread(shutdown_v2_runtime)
 
 
@@ -191,7 +197,7 @@ async def unhandled_service_error(request: Request, exc: Exception):
 
 @app.middleware("http")
 async def authenticate_non_health_routes(request: Request, call_next):
-    """Fail closed for every route except the single health endpoint."""
+    """Fail closed for every route, including all health tiers."""
     supplied_request_id = request.headers.get("x-request-id", "").strip()
     request.state.request_id = (
         supplied_request_id

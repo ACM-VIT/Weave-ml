@@ -161,9 +161,9 @@ class QdrantV2Retriever:
         minimum_eligible_repositories: int | None = None,
         allow_unqualified_ranker: bool | None = None,
     ) -> None:
-        self.qdrant_timeout_seconds = float(os.getenv("QDRANT_TIMEOUT_SECONDS", "10"))
-        if not math.isfinite(self.qdrant_timeout_seconds) or self.qdrant_timeout_seconds <= 0:
-            raise ValueError("QDRANT_TIMEOUT_SECONDS must be finite and positive")
+        self.qdrant_timeout_seconds = self._float_env(
+            "QDRANT_TIMEOUT_SECONDS", default=10.0, minimum=1.0, maximum=120.0,
+        )
         self.client = client or QdrantClient(
             url=QDRANT_URL,
             api_key=QDRANT_API_KEY,

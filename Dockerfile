@@ -64,6 +64,8 @@ ENV EMBEDDING_EXECUTOR_WORKERS=1
 ENV EMBEDDING_MAX_OUTSTANDING_JOBS=4
 ENV V2_RECOMMENDATION_TIMEOUT_SECONDS=12
 ENV V2_HEALTH_TIMEOUT_SECONDS=5
+ENV V2_HEALTH_REFRESH_SECONDS=15
+ENV V2_HEALTH_MAX_AGE_SECONDS=45
 ENV V2_RECOMMENDATION_EXECUTOR_WORKERS=4
 ENV V2_RECOMMENDATION_MAX_OUTSTANDING=8
 ENV V2_FEEDBACK_EXECUTOR_WORKERS=2
@@ -102,7 +104,7 @@ EXPOSE 8000
 # is embedded in an image layer or command. The feedback systemd unit disables
 # this API-specific image healthcheck.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-  CMD ["python", "-m", "scripts.production_smoke", "--health-only", "--timeout", "8"]
+  CMD ["python", "-m", "scripts.production_smoke", "--readiness-only", "--timeout", "8"]
 
 # Start the ML API server
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

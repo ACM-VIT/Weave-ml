@@ -6,6 +6,8 @@ import logging
 import math
 import os
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from functools import lru_cache
 from typing import Any
@@ -28,11 +30,13 @@ from api.runtime import (
     run_service_job,
     service_runtime_status,
     service_timeout_seconds,
-    shutdown_service_runtime,
+    service_runtime_cleanup_actions,
+    service_runtime_drain_actions,
     validate_service_runtime,
 )
 from api.request_budget import run_read_only_request
-from api.metrics import record_recommendation, render_prometheus
+from api.health import HealthDiagnostics, HealthSettings
+from api.metrics import record_health_dependency, record_recommendation, render_prometheus
 from config import constant_time_secret_matches, internal_api_header_name
 from embedding.qdrant_store import QdrantRepositoryStore
 from embedding.query_cache import CachedQueryEmbedder, QueryCacheCapacityError
@@ -46,7 +50,8 @@ from embedding.runtime import (
     shared_embedding_model,
     run_embedding_job,
     run_onboarding_job,
-    shutdown_embedding_runtime,
+    embedding_runtime_cleanup_actions,
+    embedding_runtime_drain_actions,
     user_onboarding_pipeline,
 )
 from embedding.user_profile_store import QdrantUserProfileStore
@@ -73,7 +78,8 @@ from inference.runtime import (
     run_recommendation_job,
     recommendation_runtime_status,
     recommendation_timeout_seconds,
-    shutdown_recommendation_runtime,
+    recommendation_runtime_cleanup_actions,
+    recommendation_runtime_drain_actions,
     validate_recommendation_runtime,
 )
 from retrieval.v2_retriever import QdrantV2Retriever, RetrievalDependencyError
@@ -86,9 +92,83 @@ from summarization.provider import SUMMARY_COMPLETION_RESERVE_SECONDS
 from summarization.settings import SummarySettings
 from utils.readme_processor import clean_markdown_copy, process_markdown
 from utils.deadline import check_deadline
+from utils.runtime_lifecycle import (
+    RuntimeRetiringError, resume_runtime_admission, stop_runtime_admission,
+)
 
 router = APIRouter(prefix="/api/v2", tags=["v2"])
 logger = logging.getLogger("pipeline.api.v2")
+
+
+class _RuntimeCleanupPlan:
+    """Retain only failed actions for existing process-owned resources."""
+
+    def __init__(self, capture_actions, capture_drains) -> None:
+        self._capture_actions = capture_actions
+        self._capture_drains = capture_drains
+        self._drains = None
+        self._pending = None
+        self._lock = threading.Lock()
+        self._status = {"state": "pending", "failed_steps": ()}
+
+    def status(self) -> dict[str, Any]:
+        status = self._status
+        return {"state": status["state"], "failed_steps": list(status["failed_steps"])}
+
+    def run(self) -> tuple[str, ...]:
+        with self._lock:
+            self._status = {"state": "draining", "failed_steps": ()}
+            if self._drains is None:
+                try:
+                    self._drains = [list(phase) for phase in self._capture_drains()]
+                except Exception:
+                    logger.error("V2 runtime cleanup failed step=drain_capture")
+                    self._status = {"state": "failed", "failed_steps": ("drain_capture",)}
+                    return ("drain_capture",)
+            for index, phase in enumerate(self._drains):
+                failed_drains = []
+                for name, action in phase:
+                    try:
+                        action()
+                    except Exception:
+                        logger.error("V2 runtime cleanup failed step=%s", name)
+                        failed_drains.append((name, action))
+                self._drains[index] = failed_drains
+                if failed_drains:
+                    failures = tuple(name for name, _action in failed_drains)
+                    self._status = {"state": "failed", "failed_steps": failures}
+                    return failures  # Do not advance to children or resource cleanup.
+            self._status = {"state": "running", "failed_steps": ()}
+            if self._pending is None:
+                try:
+                    # Capture only after real workers settle: any of them may
+                    # have published a lazy client while retirement began.
+                    self._pending = list(self._capture_actions())
+                except Exception:
+                    logger.error("V2 runtime cleanup failed step=cleanup_capture")
+                    self._status = {"state": "failed", "failed_steps": ("cleanup_capture",)}
+                    return ("cleanup_capture",)
+            failed = []
+            for name, action in self._pending:
+                try:
+                    action()
+                except Exception:
+                    # Source-defined names only: no exception text, dependency
+                    # URLs, credentials, or object reprs in callback logs.
+                    logger.error("V2 runtime cleanup failed step=%s", name)
+                    failed.append((name, action))
+            self._pending = failed
+            failures = tuple(name for name, _action in failed)
+            self._status = {
+                "state": "failed" if failures else "completed",
+                "failed_steps": failures,
+            }
+            return failures
+
+
+_shutdown_lock = threading.Lock()
+_shutdown_plan: _RuntimeCleanupPlan | None = None
+_retiring_diagnostics: HealthDiagnostics | None = None
 
 
 class V2ServiceHTTPException(HTTPException):
@@ -126,6 +206,7 @@ def _is_temporary_dependency_error(exc: Exception) -> bool:
             LockAcquisitionError,
             LockLostError,
             EmbeddingCapacityError,
+            RuntimeRetiringError,
         ),
     ):
         return True
@@ -257,24 +338,70 @@ def onboarding_pipeline():
 
 
 def shutdown_v2_runtime() -> None:
-    """Close process-scoped clients and executors without creating new ones."""
+    """Retire actual diagnostics and retry only captured failed cleanup actions."""
+    global _shutdown_plan, _retiring_diagnostics
+    with _shutdown_lock:
+        if _shutdown_plan is None:
+            if health_diagnostics.cache_info().currsize:
+                _retiring_diagnostics = health_diagnostics()
+            # Freeze every queue/factory before any executor can be captured or
+            # joined. Admitted workers retain their resources until real exit.
+            stop_runtime_admission()
+            _shutdown_plan = _RuntimeCleanupPlan(
+                _runtime_cleanup_actions, _runtime_drain_actions,
+            )
+        plan = _shutdown_plan
+        diagnostics = _retiring_diagnostics
+    if diagnostics is not None:
+        diagnostics.retire(plan.run)
+    else:
+        plan.run()
+
+
+def _runtime_drain_actions():
+    """No model/client capture or close until all admitted workers settle."""
+    return [[
+        *service_runtime_drain_actions(),
+        *recommendation_runtime_drain_actions(),
+        *embedding_runtime_drain_actions(),
+    ]]
+
+
+def _runtime_cleanup_actions():
+    """Capture close methods before cache clears can discard failed resources."""
+    actions = []
     if producer.cache_info().currsize:
-        redis = producer().redis
-        close = getattr(redis, "close", None)
-        if close:
-            close()
+        close = getattr(producer().redis, "close", None)
+        if callable(close):
+            actions.append(("redis.client.close", close))
     if retriever.cache_info().currsize:
         close = getattr(retriever().client, "close", None)
-        if close:
-            close()
-    repository_store.cache_clear()
-    user_profile_store.cache_clear()
-    producer.cache_clear()
-    retriever.cache_clear()
-    feedback_settings.cache_clear()
-    shutdown_recommendation_runtime()
-    shutdown_service_runtime()
-    shutdown_embedding_runtime()
+        if callable(close):
+            actions.append(("qdrant.client.close", close))
+    return [
+        *actions,
+        ("repository_store.cache.clear", repository_store.cache_clear),
+        ("user_profile_store.cache.clear", user_profile_store.cache_clear),
+        ("feedback_producer.cache.clear", producer.cache_clear),
+        ("retriever.cache.clear", retriever.cache_clear),
+        ("feedback_settings.cache.clear", feedback_settings.cache_clear),
+        ("health_diagnostics.cache.clear", health_diagnostics.cache_clear),
+        *recommendation_runtime_cleanup_actions(),
+        *service_runtime_cleanup_actions(),
+        *embedding_runtime_cleanup_actions(),
+    ]
+
+
+def _prepare_runtime_startup() -> None:
+    global _shutdown_plan, _retiring_diagnostics
+    with _shutdown_lock:
+        if _shutdown_plan is not None:
+            if _shutdown_plan.status()["state"] != "completed":
+                raise RuntimeError("Previous runtime cleanup is incomplete")
+            health_diagnostics.cache_clear()
+            _shutdown_plan = None
+            _retiring_diagnostics = None
+            resume_runtime_admission()
 
 
 def _repository_points(repo_id: str) -> list[Any]:
@@ -414,9 +541,11 @@ def _health_timeout_seconds() -> float:
 
 def validate_v2_runtime_configuration() -> V2FeedbackSettings:
     """Validate network-free v2 runtime settings during process startup."""
+    _prepare_runtime_startup()
     settings = feedback_settings()
     _repository_job_lock_settings()
     _health_timeout_seconds()
+    HealthSettings.from_env()
     embedding_timeout_seconds()
     embedding_warmup_enabled()
     # Constructing settings is network-free and catches malformed provider
@@ -1028,54 +1157,136 @@ async def onboard_user(request: OnboardingJob, http_request: Request):
         ) from exc
 
 
-@router.get("/health", dependencies=[Depends(require_internal_secret)])
-async def health(request: Request):
-    try:
-        qdrant, redis = await asyncio.gather(
-            run_service_job("health", _qdrant_health),
-            run_service_job("health", _feedback_health),
-        )
-        embedding = embedding_runtime_status()
-        consumer_required = os.getenv(
-            "V2_FEEDBACK_CONSUMER_REQUIRED",
-            "true",
-        ).strip().lower() in {"1", "true", "yes", "on"}
-        if consumer_required and not redis.get("feedback_consumer_active"):
-            raise RuntimeError("V2 feedback consumer heartbeat is missing")
-        if not redis.get("feedback_healthy", True):
-            raise RuntimeError("V2 feedback thresholds exceeded")
-        if (
-            os.getenv("APP_ENV", "development").strip().casefold() == "production"
-            and not embedding["embedding_runtime_ready"]
-        ):
-            raise RuntimeError("embedding runtime is not ready")
-        return {
-            "status": "healthy",
-            **qdrant,
-            **redis,
-            **embedding,
-            "service_executors": {
-                **service_runtime_status(),
-                "recommendation": recommendation_runtime_status(),
-            },
-            "database_required": False,
-        }
-    except Exception as exc:
-        logger.error(
-            "V2 dependency health check failed request_id=%s error_type=%s",
-            str(request.state.request_id),
-            type(exc).__name__,
-            extra={
-                "health_context": {
-                    "request_id": str(request.state.request_id),
-                    "error_type": type(exc).__name__,
-                }
-            },
-        )
-        raise HTTPException(
+def _collect_health_diagnostics(stop: threading.Event) -> tuple[bool, dict[str, Any]]:
+    """Own two bounded parallel checks until both actual child workers exit."""
+    payload: dict[str, Any] = {}
+    diagnostics: dict[str, Any] = {}
+    healthy = True
+    deadline = time.monotonic() + HealthSettings.from_env().timeout_seconds
+
+    def check_dependency(dependency: str, check) -> tuple[bool, dict[str, Any], dict[str, Any]]:
+        details: dict[str, Any] = {}
+        if stop.is_set() or time.monotonic() >= deadline:
+            return False, details, {
+                "status": "not_checked",
+                "reason": "stopping" if stop.is_set() else "deadline_exceeded",
+            }
+        started = time.monotonic()
+        outcome = "failed"
+        diagnostic: dict[str, Any] = {"status": "failed", "reason": "dependency_check_failed"}
+        try:
+            result = check()
+            details.update(result)
+            if dependency == "redis":
+                consumer_required = os.getenv(
+                    "V2_FEEDBACK_CONSUMER_REQUIRED", "true"
+                ).strip().lower() in {"1", "true", "yes", "on"}
+                if consumer_required and not result.get("feedback_consumer_active"):
+                    raise RuntimeError("feedback consumer heartbeat is missing")
+                if not result.get("feedback_healthy", True):
+                    raise RuntimeError("feedback thresholds exceeded")
+            outcome = "healthy"
+            diagnostic = {"status": "healthy"}
+        except Exception:
+            # Dependency exceptions can contain URLs/credentials. Keep only a
+            # fixed failure category, plus successfully returned diagnostics.
+            pass
+        finally:
+            duration = time.monotonic() - started
+            diagnostic["duration_seconds"] = duration
+            record_health_dependency(dependency, outcome, duration)
+        return outcome == "healthy", details, diagnostic
+
+    # Exactly two children belong to this admitted, single-flight coordinator.
+    # They never reenter its reserved pool (which may have only one worker).
+    # The context joins all submitted children even if submission/result handling
+    # fails, so retirement cannot close shared clients under an unfinished RPC.
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ml-health-dependency") as children:
+        checks = [
+            (dependency, children.submit(check_dependency, dependency, check))
+            for dependency, check in (("qdrant", _qdrant_health), ("redis", _feedback_health))
+        ]
+        for dependency, future in checks:
+            dependency_healthy, details, diagnostic = future.result()
+            healthy = healthy and dependency_healthy
+            payload.update(details)
+            diagnostics[dependency] = diagnostic
+    payload["dependency_diagnostics"] = diagnostics
+    return healthy, payload
+
+
+@lru_cache(maxsize=1)
+def health_diagnostics() -> HealthDiagnostics:
+    if _shutdown_plan is not None and _retiring_diagnostics is not None:
+        return _retiring_diagnostics
+    diagnostics = HealthDiagnostics(_collect_health_diagnostics, HealthSettings.from_env())
+    if _shutdown_plan is not None:
+        diagnostics.close()
+    return diagnostics
+
+
+def _readiness_response(
+    snapshot: dict[str, Any], *, tier: str = "readiness"
+) -> dict[str, Any]:
+    if _shutdown_plan is not None:
+        # Do not inspect lazy model/executor factories after shutdown has begun.
+        raise V2ServiceHTTPException(
             status_code=503,
             detail="Dependency health check failed.",
-        ) from exc
+            error_code="DEPENDENCY_UNAVAILABLE",
+            retryable=True,
+            details={
+                **snapshot, "status": "unhealthy", "tier": tier,
+                "runtime_failure": "runtime_stopping",
+                "runtime_cleanup": _shutdown_plan.status(),
+            },
+        )
+    embedding = embedding_runtime_status()
+    if (
+        os.getenv("APP_ENV", "development").strip().casefold() == "production"
+        and not embedding["embedding_runtime_ready"]
+    ):
+        snapshot["status"] = "unhealthy"
+        snapshot["runtime_failure"] = "embedding_runtime_not_ready"
+    result = {
+        **snapshot,
+        "runtime_cleanup": {"state": "not_started", "failed_steps": []},
+        **embedding,
+        "tier": tier,
+        "service_executors": {
+            **service_runtime_status(),
+            "recommendation": recommendation_runtime_status(),
+        },
+        "database_required": False,
+    }
+    if result["status"] != "healthy":
+        raise V2ServiceHTTPException(
+            status_code=503,
+            detail="Dependency health check failed.",
+            error_code="DEPENDENCY_UNAVAILABLE",
+            retryable=True,
+            details=result,
+        )
+    return result
+
+
+@router.get("/health/live", dependencies=[Depends(require_internal_secret)])
+async def liveness():
+    """Authenticated process liveness: no clients, model loads, or executor jobs."""
+    return {"status": "alive", "tier": "liveness"}
+
+
+@router.get("/health/ready", dependencies=[Depends(require_internal_secret)])
+@router.get("/health", dependencies=[Depends(require_internal_secret)])
+async def health(request: Request):
+    """Legacy-compatible detailed readiness from explicitly dated observations."""
+    return _readiness_response(health_diagnostics().snapshot())
+
+
+@router.get("/health/deep", dependencies=[Depends(require_internal_secret)])
+async def deep_health():
+    """Explicit bounded refresh, coalesced and rate-limited across all callers."""
+    return _readiness_response(await health_diagnostics().refresh(), tier="deep")
 
 
 @router.get(
