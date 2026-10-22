@@ -145,7 +145,7 @@ def description_fallback_artifact(
         summary = _bounded(summary + '.', CARD_SUMMARY_MAX_CHARS)
     # Truncation or unusual metadata must not create a permanently undeliverable
     # fallback. Keep the same sentence requirement as the canonical backend.
-    if not has_two_or_three_complete_sentences(summary):
+    if not has_two_or_three_complete_sentences(summary) or _unsafe_text(summary):
         summary = 'This is a GitHub repository. Its description does not yet provide more project details.'
     return CardSummaryArtifact(
         summary=summary,

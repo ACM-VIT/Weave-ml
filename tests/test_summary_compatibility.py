@@ -75,3 +75,18 @@ def test_fallback_keeps_both_semantic_sentences_and_their_punctuation(descriptio
     assert len(split_summary_sentences(description)) == 2
     repo = {'full_name': 'weave/compatibility', 'description': description}
     assert CardSummaryPipeline().summarize(repo, repo).summary == description
+
+
+@pytest.mark.parametrize('metadata', [
+    {'full_name': 'acme/license-checker', 'primary_language': 'Python'},
+    {'full_name': 'acme/tool', 'primary_language': 'Unknown', 'topics': ['reference']},
+    {'full_name': 'acme/tool', 'primary_language': 'reference'},
+    {'full_name': 'acme/license-checker', 'description': 'A useful repository for teams.'},
+])
+def test_metadata_fallback_is_accepted_by_its_own_replay_validator(metadata):
+    pipeline = CardSummaryPipeline()
+    repo = {'full_name': 'acme/tool', 'description': '', **metadata}
+    artifact = pipeline.summarize(repo, repo)
+    assert artifact.source == 'description_fallback'
+    assert not _unsafe_text(artifact.summary)
+    assert pipeline.is_current(artifact, repo=repo)

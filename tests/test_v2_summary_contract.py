@@ -641,3 +641,31 @@ def test_paragraph_only_repository_job_supplies_readme_context_to_summary_provid
         assert paragraphs[0] in captured[0]
     finally:
         client.close()
+
+
+@pytest.mark.parametrize('metadata', [
+    {'full_name': 'acme/license-checker', 'primary_language': 'Python'},
+    {'full_name': 'acme/tool', 'primary_language': 'Unknown', 'topics': ['reference']},
+])
+def test_metadata_fallback_without_provider_persists_and_replays(metadata):
+    pipeline = RepositoryEmbeddingPipeline(embedder=FakeEmbedder(), card_summarizer=CardSummaryPipeline())
+    client, store = _qdrant_store()
+    request = _job()
+    request.repository.description = ''
+    for name, value in metadata.items():
+        setattr(request.repository, name, value)
+    try:
+        with patch('api.v2._repository_points', side_effect=lambda _id: client.retrieve(
+            store.collection_name, [REPO_ID], with_payload=True
+        )), patch('api.v2.repository_embedding_pipeline', return_value=pipeline), patch(
+            'api.v2.repository_store', return_value=store
+        ):
+            first = _embed_repository_job_locked(request, OwnedLock())
+            duplicate = _embed_repository_job_locked(request, OwnedLock())
+            request.job_id = uuid.uuid4()
+            current = _embed_repository_job_locked(request, OwnedLock())
+        assert [first['status'], duplicate['status'], current['status']] == ['applied', 'duplicate', 'current']
+        assert first['card_summary'] == duplicate['card_summary'] == current['card_summary']
+        assert pipeline.card_summarizer.is_current(CardSummaryArtifact.model_validate(first['card_summary']))
+    finally:
+        client.close()
