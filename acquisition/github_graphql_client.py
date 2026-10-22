@@ -4,6 +4,14 @@ from __future__ import annotations
 
 import os
 import random
+import re
+import hashlib
+import json
+import math
+import threading
+from contextlib import contextmanager
+from concurrent.futures import CancelledError
+from collections.abc import Callable, Iterator
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -12,6 +20,10 @@ from pathlib import PurePosixPath
 from urllib.parse import quote
 
 import requests
+
+from .github_rate_limit import (
+    GitHubRequestBudget, GitHubRetryLater, github_coordination_key, shared_github_coordinator,
+)
 
 from .graphql_queries import (
     GET_README_QUERY,
@@ -34,6 +46,12 @@ class GitHubGraphQLClientError(RuntimeError):
             "response", "transport", "rate_limit", "server", "http", "invalid_json", "graphql",
         } else "response"
         self.status_code = status_code if type(status_code) is int and 100 <= status_code <= 599 else None
+
+    @property
+    def safe_diagnostic(self) -> str:
+        """Controlled fields only: safe to persist without response bodies."""
+        return f"GitHub request failed (category={self.category}, status={self.status_code or 'unknown'})"
+
 
 # Backwards-compatible alias so existing callers don't break
 GitHubClientError = GitHubGraphQLClientError
@@ -66,6 +84,89 @@ def _failed_repository_aliases(
             continue
         failed.add(path[0])
     return failed
+
+
+def _usable_throttled_data(query: str, variables: dict[str, Any] | None, data: Any, errors: list[dict[str, Any]]) -> bool:
+    """Require the selected operation's usable result, not arbitrary leaves."""
+    if not isinstance(data, dict):
+        return False
+    words = query.lstrip().split(None, 2)
+    operation = words[1].split("(", 1)[0] if len(words) > 1 and words[0] == "query" else ""
+    repo = data.get("repository")
+
+    def oid(value: Any) -> bool:
+        return isinstance(value, str) and len(value) in {40, 64} and all(c in "0123456789abcdef" for c in value)
+
+    def readme_text() -> bool:
+        return isinstance(repo, dict) and any(
+            isinstance(repo.get(alias), dict) and isinstance(repo[alias].get("text"), str) and bool(repo[alias]["text"])
+            for alias, _path in README_CANDIDATES
+        )
+
+    if operation == "GetBatchMetadata":
+        aliases = set(re.findall(r"\b(repo_\d+)\s*:\s*repository", query))
+        try:
+            failed = _failed_repository_aliases(errors, aliases)
+        except GitHubClientError:
+            return False
+        return any(
+            alias not in failed and isinstance(data.get(alias), dict)
+            and isinstance(data[alias].get("nameWithOwner"), str) and bool(data[alias]["nameWithOwner"])
+            and "description" in data[alias]
+            for alias in aliases
+        )
+    if operation == "SearchRepositories":
+        search = data.get("search")
+        nodes = search.get("nodes") if isinstance(search, dict) else None
+        return isinstance(nodes, list) and any(
+            isinstance(node, dict) and isinstance(node.get("nameWithOwner"), str) and bool(node["nameWithOwner"])
+            for node in nodes
+        )
+    if operation == "GetReadme":
+        return readme_text()
+    if operation == "GetRepository":
+        try:
+            failed = _failed_repository_aliases(errors, {"repository"}, ignored_child_fields={alias for alias, _ in README_CANDIDATES})
+            readme_failed = _failed_repository_aliases(errors, {"repository"})
+        except GitHubClientError:
+            return False
+        return not failed and isinstance(repo, dict) and isinstance(repo.get("nameWithOwner"), str) and bool(repo["nameWithOwner"]) and "description" in repo and (
+            readme_text() or (not readme_failed and all(
+                alias in repo and (repo[alias] is None or (
+                    isinstance(repo[alias], dict) and isinstance(repo[alias].get("text"), str)
+                )) for alias, _ in README_CANDIDATES
+            ))
+        )
+    if not isinstance(repo, dict):
+        return False
+    if operation == "GetReadmeRef":
+        ref = repo.get("defaultBranchRef")
+        target = ref.get("target") if isinstance(ref, dict) else None
+        return isinstance(target, dict) and oid(target.get("oid"))
+    if operation == "GetReadmeManifest":
+        return any(
+            isinstance(repo.get(alias), dict) and oid(repo[alias].get("oid"))
+            and type(repo[alias].get("byteSize")) is int and repo[alias]["byteSize"] > 0
+            and repo[alias].get("isBinary") is False
+            for alias, _path in README_CANDIDATES
+        )
+    if operation == "GetReadmeBlob":
+        blob = repo.get("object")
+        if not isinstance(blob, dict) or not oid(blob.get("oid")) or blob.get("oid") != (variables or {}).get("oid"):
+            return False
+        text = blob.get("text")
+        if not isinstance(text, str) or blob.get("isBinary") is not False:
+            return False
+        try:
+            raw = text.encode("utf-8")
+        except UnicodeError:
+            return False
+        digest = hashlib.sha1 if len(blob["oid"]) == 40 else hashlib.sha256
+        return type(blob.get("byteSize")) is int and len(raw) == blob["byteSize"] and digest(
+            b"blob " + str(len(raw)).encode() + b"\0" + raw
+        ).hexdigest() == blob["oid"]
+    # Unknown operations cannot prove that their required fields resolved.
+    return False
 
 
 class FetchedReadme(str):
@@ -139,8 +240,21 @@ class GitHubGraphQLClient:
         max_retries: int = 4,
         sleep_on_rate_limit: bool = True,
         session: requests.Session | None = None,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> None:
+        if type(max_retries) is not int or not 0 <= max_retries <= 10:
+            raise ValueError("GitHub max_retries must be between 0 and 10")
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("GitHub timeout_seconds must be positive")
+        if deadline is not None and not math.isfinite(deadline):
+            raise ValueError("GitHub deadline must be a finite monotonic time")
         self.url = base_url
+        self.deadline = deadline
+        self.cancel_event = cancel_event
+        self.cancel_check = cancel_check
+        self._retry_local = threading.local()
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.sleep_on_rate_limit = sleep_on_rate_limit
@@ -154,6 +268,9 @@ class GitHubGraphQLClient:
         )
         if token:
             self.session.headers["Authorization"] = f"Bearer {token}"
+        credential = self.session.headers.get("Authorization")
+        self.coordination_key = github_coordination_key(base_url, credential)
+        self.rate_limits = shared_github_coordinator(self.coordination_key)
 
     def get_repository(self, owner: str, name: str) -> dict[str, Any] | None:
         """Fetches a single repository using GraphQL."""
@@ -209,15 +326,9 @@ class GitHubGraphQLClient:
             if gql_errors:
                 if not isinstance(data, dict) or "repository" not in data:
                     raise GitHubClientError(
-                        f"README query returned GraphQL errors: {gql_errors}"
+                        "README query returned GraphQL errors"
                     )
-                logger.warning(
-                    "README query for %s/%s returned field-level errors alongside "
-                    "partial data — proceeding with available aliases. Errors: %s",
-                    owner,
-                    name,
-                    gql_errors,
-                )
+                logger.warning("README query returned partial field errors for %s/%s", owner, name)
             if not isinstance(data, dict) or "repository" not in data:
                 raise GitHubClientError("README query response is missing repository data")
             repo = data["repository"]
@@ -261,8 +372,10 @@ class GitHubGraphQLClient:
                 owner,
                 name,
             )
+        except (GitHubRetryLater, CancelledError, TimeoutError):
+            raise
         except Exception as exc:
-            logger.warning(f"README fetch failed for {owner}/{name}: {exc}", exc_info=True)
+            logger.warning("README fetch failed for %s/%s (type=%s)", owner, name, type(exc).__name__)
             # Missing READMEs are represented by an empty FetchedReadme above.
             # Transport/API failures must propagate so acquisition marks the
             # repository for retry instead of overwriting canonical content
@@ -281,7 +394,7 @@ class GitHubGraphQLClient:
             return {}
         if response.get("errors") and not response.get("data"):
             raise GitHubClientError(
-                f"batch metadata query returned GraphQL errors: {response['errors']}"
+                "batch metadata query returned GraphQL errors"
             )
 
         data = response.get("data", {})
@@ -305,46 +418,101 @@ class GitHubGraphQLClient:
                 results[f"{owner}/{name}"] = repo
         return results
 
+    @contextmanager
+    def retry_scope(self, budget: GitHubRequestBudget) -> Iterator[None]:
+        """Let the scheduler own waiting and preserve a logical job's budget."""
+        previous = getattr(self._retry_local, "budget", None)
+        self._retry_local.budget = budget
+        try:
+            yield
+        finally:
+            self._retry_local.budget = previous
+
+    def _wait_or_defer(self, ready_at: float, budget: GitHubRequestBudget, deferred: bool) -> None:
+        budget.check_wait(ready_at)
+        if deferred:
+            raise GitHubRetryLater(ready_at)
+        self.rate_limits.count("waiting")
+        while time.monotonic() < ready_at:
+            budget.check()
+            delay = min(0.05, ready_at - time.monotonic())
+            if delay > 0:
+                if self.cancel_event is not None:
+                    self.cancel_event.wait(delay)
+                else:
+                    time.sleep(delay)
+        budget.check()
+
     def execute(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any] | None:
-        """Executes a GraphQL query with retries and rate limit handling."""
+        """One bounded retry policy, shared quota admission and interruptible waits.
+
+        README scheduler scopes defer instead of sleeping in transport workers.
+        Standalone/metadata callers use the same admission and attempt policy,
+        but wait synchronously with cancellation/deadline checks every 50ms.
+        """
         payload = {"query": query}
         if variables:
             payload["variables"] = variables
-
-        for attempt in range(self.max_retries + 1):
+        identity = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        scheduled = getattr(self._retry_local, "budget", None)
+        budget = scheduled or GitHubRequestBudget(
+            deadline=self.deadline,
+            cancelled=lambda: bool(
+                (self.cancel_event is not None and self.cancel_event.is_set())
+                or (self.cancel_check is not None and self.cancel_check())
+            ),
+        )
+        budget.check()
+        if identity in budget.responses:
+            return budget.responses[identity]
+        while True:
+            budget.check()
+            ready_at = budget.not_before.get(identity, 0.0)
+            if ready_at > time.monotonic():
+                self._wait_or_defer(ready_at, budget, scheduled is not None)
+            ready_at = self.rate_limits.admit()
+            if ready_at is not None:
+                if not self.sleep_on_rate_limit:
+                    raise GitHubClientError("GitHub GraphQL quota admission deferred", category="rate_limit")
+                self._wait_or_defer(ready_at, budget, scheduled is not None)
+                continue
+            attempt = budget.attempts.get(identity, 0)
+            if attempt > self.max_retries:
+                raise GitHubClientError("GitHub GraphQL request exhausted retries")
+            budget.attempts[identity] = attempt + 1
+            timeout = self.timeout_seconds
+            if budget.deadline is not None:
+                timeout = min(timeout, max(0.001, budget.deadline - time.monotonic()))
             try:
-                response = self.session.post(
-                    self.url,
-                    json=payload,
-                    timeout=self.timeout_seconds,
-                )
+                response = self.session.post(self.url, json=payload, timeout=timeout)
             except requests.RequestException as exc:
                 if attempt >= self.max_retries:
-                    raise GitHubClientError(f"GitHub GraphQL request failed: {exc}", category="transport") from exc
-                self._sleep_backoff(attempt)
+                    raise GitHubClientError("GitHub GraphQL transport retries exhausted", category="transport") from exc
+                self._retry(identity, attempt, budget, scheduled is not None)
                 continue
 
-            if response.status_code == 403 and self._is_rate_limited(response):
+            self.rate_limits.observe(response.headers)
+            # IO has settled, so its worker/admission can now be released. A
+            # requests timeout is not a total deadline: reject late success
+            # before parsing, caching or returning canonical data.
+            budget.check()
+            if response.status_code == 429 or (response.status_code == 403 and self._is_rate_limited(response)):
+                ready_at = self.rate_limits.throttle(response.headers)
                 if attempt >= self.max_retries or not self.sleep_on_rate_limit:
                     raise GitHubClientError("GitHub GraphQL rate limit exceeded", category="rate_limit", status_code=response.status_code)
-                self._sleep_until_reset(response)
+                self._retry(identity, attempt, budget, scheduled is not None, ready_at=ready_at)
                 continue
-
             if response.status_code in {500, 502, 503, 504}:
                 if attempt >= self.max_retries:
-                    raise GitHubClientError(f"GitHub GraphQL transient failure {response.status_code}: {response.text[:300]}", category="server", status_code=response.status_code)
-                self._sleep_backoff(attempt)
+                    raise GitHubClientError("GitHub GraphQL server retries exhausted", category="server", status_code=response.status_code)
+                self._retry(identity, attempt, budget, scheduled is not None)
                 continue
-
             if response.status_code >= 400:
-                raise GitHubClientError(f"GitHub GraphQL error {response.status_code}: {response.text[:300]}", category="http", status_code=response.status_code)
-
+                raise GitHubClientError("GitHub GraphQL HTTP failure", category="http", status_code=response.status_code)
             try:
                 result = response.json()
             except ValueError as exc:
-                raise GitHubClientError(
-                    "GitHub GraphQL returned invalid JSON", category="invalid_json", status_code=response.status_code,
-                ) from exc
+                raise GitHubClientError("GitHub GraphQL returned invalid JSON", category="invalid_json", status_code=response.status_code) from exc
             if not isinstance(result, dict):
                 raise GitHubClientError("GitHub GraphQL returned an invalid response envelope", status_code=response.status_code)
             errors = result.get("errors")
@@ -357,51 +525,52 @@ class GitHubGraphQLClient:
                 not isinstance(data_field, dict) and not errors
             ):
                 raise GitHubClientError("GitHub GraphQL returned an invalid data envelope", status_code=response.status_code)
-            
-            # Rate limit tracking from GraphQL payload
             rl = data_field.get("rateLimit") if isinstance(data_field, dict) else None
-            if isinstance(rl, dict):
-                logger.debug("GraphQL rate limit: %s remaining", rl.get("remaining"))
-            
-            if "errors" in result:
-                if result.get("data"):
-                    logger.warning(
-                        "GitHub GraphQL returned partial errors: %s",
-                        result["errors"],
-                    )
-                    return result
-                if any(
+            self.rate_limits.observe(response.headers, rl)
+            rate_limited = any(
+                error.get("type") == "RATE_LIMITED"
+                or (isinstance(error.get("extensions"), dict) and error["extensions"].get("code") == "RATE_LIMITED")
+                for error in errors or []
+            )
+            if rate_limited:
+                ready_at = self.rate_limits.throttle(response.headers)
+                if not _usable_throttled_data(query, variables, data_field, errors or []):
+                    if attempt >= self.max_retries or not self.sleep_on_rate_limit:
+                        raise GitHubClientError("GitHub GraphQL rate limit exceeded", category="rate_limit", status_code=response.status_code)
+                    self._retry(identity, attempt, budget, scheduled is not None, ready_at=ready_at)
+                    continue
+            if errors:
+                if data_field:
+                    logger.warning("GitHub GraphQL returned partial errors (count=%d)", len(errors))
+                elif any(
                     isinstance(error.get("message"), str)
                     and "Could not resolve to a Repository" in error["message"]
-                    for error in result["errors"]
+                    for error in errors
                 ):
-                    logger.warning(
-                        "GitHub GraphQL could not resolve repository: %s",
-                        result["errors"],
-                    )
+                    budget.responses[identity] = None
                     return None
-                raise GitHubClientError(
-                    f"GitHub GraphQL returned errors: {result['errors']}", category="graphql", status_code=response.status_code,
-                )
-
+                else:
+                    raise GitHubClientError("GitHub GraphQL returned errors", category="graphql", status_code=response.status_code)
+            budget.check()
+            budget.responses[identity] = result
             return result
 
-        raise GitHubClientError("GitHub GraphQL request exhausted retries")
+    def _retry(
+        self, identity: str, attempt: int, budget: GitHubRequestBudget,
+        deferred: bool, *, ready_at: float | None = None,
+    ) -> None:
+        self.rate_limits.count("retries")
+        if ready_at is None:
+            ready_at = time.monotonic() + min((2 ** attempt) + random.random(), 30.0)
+        budget.not_before[identity] = ready_at
+        self._wait_or_defer(ready_at, budget, deferred)
 
     @staticmethod
     def _is_rate_limited(response: requests.Response) -> bool:
         remaining = response.headers.get("X-RateLimit-Remaining")
-        return remaining == "0" or "rate limit" in response.text.lower()
-
-    def _sleep_until_reset(self, response: requests.Response) -> None:
-        reset = response.headers.get("X-RateLimit-Reset")
-        if reset and reset.isdigit():
-            sleep_for = max(int(reset) - int(time.time()) + 2, 1)
-        else:
-            retry_after = response.headers.get("Retry-After")
-            sleep_for = int(retry_after) if retry_after and retry_after.isdigit() else 60
-        time.sleep(min(sleep_for, 300))
-
-    @staticmethod
-    def _sleep_backoff(attempt: int) -> None:
-        time.sleep(min((2**attempt) + random.random(), 30.0))
+        return (
+            remaining == "0"
+            or "retry-after" in {key.lower() for key in response.headers}
+            or "rate limit exceeded" in response.text.lower()
+            or "secondary rate limit" in response.text.lower()
+        )

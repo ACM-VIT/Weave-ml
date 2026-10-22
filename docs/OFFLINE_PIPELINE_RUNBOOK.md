@@ -134,3 +134,51 @@ same validated reindex must stamp
 never backfill that marker with a payload-only patch. See the production
 runbook for the coordinated cutover and the limits of write-time vector
 certification.
+
+## GitHub quota and retry coordination
+
+Acquisition clients in one Python process coordinate by endpoint and an opaque,
+process-keyed credential fingerprint. Tokens and authorization headers are not
+stored in the registry, counters or logs. Separate processes, different tokens
+sharing an account, and other consumers are not coordinated; use an external
+quota service if a deployment needs account-wide admission.
+
+Known remaining quota is reserved conservatively. HTTP 429, rate-limited 403,
+and GraphQL RATE_LIMITED responses honor both Retry-After (seconds or HTTP date)
+and reset signals. Resumption is jittered and staggered. Auth/permission and
+other permanent HTTP errors do not retry. A request allows at most max_retries
+additional attempts (default four), including scheduler resumptions. Exhausted
+transport/server/rate-limit failures do not start new singleton fallback loops.
+
+README delay queues retain the original logical future, repository identity and
+attempt budget, with at most twice GITHUB_README_WORKERS admitted jobs. They do
+not occupy transport workers while backing off. Live IO retains its worker and
+admission until completion, including during cancellation. Metadata/discovery
+callers share quota but wait synchronously; their waits check cancellation and
+deadlines every 50ms. A running requests call is bounded by its transport timeout
+and cannot be forcibly interrupted by Python. The optional acquisition deadline
+is an absolute time.monotonic() value, propagated to admission, retry waits and
+request timeouts. It is not a hard wall-clock bound on socket trickle reads.
+
+GitHubGraphQLClient.rate_limits.snapshot() exposes process-shared requests,
+admission_deferred, throttled, retries, waiting and remaining counters without
+credential labels. These are admission/attempt counters, not measured throughput
+or proof of bytes saved. Fake-clock concurrency/cancellation and injected-throttle
+throughput measurements remain required before claiming runtime acceptance.
+
+Quota state survives client collection through its known reset/cooldown/stagger
+horizon and a five-minute idle retention period. At most 256 live or retained
+credential scopes are admitted. Expired idle pins can be removed, but live
+coordinators remain discoverable; a full registry rejects new scopes rather
+than dropping a live/cooling limit. Registry pruning and quota updates share a
+consistent lock order to avoid losing a concurrently extended cooldown.
+
+RATE_LIMITED replies retry when the selected operation's required result is
+unresolved: an unrelated repository name or rateLimit object is not usable
+README ref/blob content. Healthy resolved partial metadata rows are retained.
+Metadata chunk failures carry their exact repository identities and controlled
+GitHub category/status diagnostics while earlier successful chunks continue to
+README enrichment. Exhausted transport/auth/rate failures do not trigger new
+singleton retry loops. Response bodies and token-bearing messages are not used
+for these GitHub failure records. These paths still require deferred fake-clock,
+chunk-preservation and diagnostics acceptance coverage.

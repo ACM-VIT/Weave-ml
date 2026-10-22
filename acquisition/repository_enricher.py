@@ -13,9 +13,11 @@ import logging
 from .github_graphql_client import (
     FetchedReadme,
     GitHubGraphQLClient,
+    GitHubGraphQLClientError,
     build_readme_base_url,
 )
 from .graphql_queries import README_CANDIDATES
+from .models import AcquisitionFailure
 from utils.readme_processor import ReadmeDocument, process_markdown
 from .identity import normalize_repository_name, repository_identity_key
 from .config import metadata_batch_size as validated_metadata_batch_size
@@ -34,6 +36,14 @@ class EnrichmentResult:
     topics: list[str]
     languages: dict[str, int]
     warnings: list[str] = field(default_factory=list)
+
+
+class EnrichmentBatch(list[EnrichmentResult]):
+    """List-compatible successful results with explicit failed identities."""
+
+    def __init__(self, *, failures: list[AcquisitionFailure]) -> None:
+        super().__init__()
+        self.failures = failures
 
 
 class RepositoryEnricher:
@@ -76,6 +86,8 @@ class RepositoryEnricher:
                 result = self._enrich_graphql(owner, name, discovery_category, discovery_band)
                 if result:
                     return result
+            except (CancelledError, TimeoutError):
+                raise
             except Exception as e:
                 logger.warning(f"GraphQL enrichment failed for {full_name}: {e}.")
 
@@ -102,6 +114,15 @@ class RepositoryEnricher:
                     }
         
         results = []
+        metadata_failures: list[AcquisitionFailure] = []
+
+        def failed_rows(rows: list[tuple[str, str]], error: GitHubGraphQLClientError) -> None:
+            metadata_failures.extend(
+                AcquisitionFailure(f"{owner}/{name}", "metadata_enrichment", error.safe_diagnostic)
+                for owner, name in rows
+            )
+            logger.warning("Metadata chunk failed: %s", error.safe_diagnostic)
+
         # Pass 1: batch metadata (no readme — avoids 502 on large repos)
         for i in range(0, len(targets), self.metadata_batch_size):
             self._check_cancelled()
@@ -114,26 +135,30 @@ class RepositoryEnricher:
                     batch_res = self.graphql_client.get_repositories_batch(batch, projection=self.metadata_projection)
             except CancelledError:
                 raise
-            except Exception as e:
-                logger.warning(f"Batch {i//self.metadata_batch_size + 1} failed, retrying one-by-one: {e}")
-                # Retry the batch one repo at a time
-                for owner, name in batch:
+            except GitHubGraphQLClientError as exc:
+                # The client already exhausted/classified this request. Keep
+                # prior chunks and record only the failed identities; never
+                # fan out a transport/auth/rate failure into new retry loops.
+                if exc.category != "response" or len(batch) == 1:
+                    failed_rows(batch, exc)
+                    continue
+                logger.warning("Metadata response failed; isolating repository rows")
+                for position, (owner, name) in enumerate(batch):
                     self._check_cancelled()
                     try:
-                        # Reuse the lean query for singleton retries too. The
-                        # full repository query includes README blobs, which
-                        # Pass 2 would immediately fetch a second time.
-                        if self.metadata_projection == "legacy":
-                            retry_res = self.graphql_client.get_repositories_batch([(owner, name)])
-                        else:
-                            retry_res = self.graphql_client.get_repositories_batch(
-                                [(owner, name)], projection=self.metadata_projection
-                            )
+                        retry_res = self.graphql_client.get_repositories_batch(
+                            [(owner, name)], projection=self.metadata_projection,
+                        )
                         batch_res.update(retry_res)
                     except CancelledError:
                         raise
-                    except Exception as e2:
-                        logger.warning(f"Individual fetch failed for {owner}/{name}: {e2}")
+                    except GitHubGraphQLClientError as retry_exc:
+                        if retry_exc.category != "response":
+                            # Preserve already resolved singleton rows too;
+                            # unqueried siblings stay retryable, not amplified.
+                            failed_rows(batch[position:], retry_exc)
+                            break
+                        failed_rows([(owner, name)], retry_exc)
 
             for full_name, data in batch_res.items():
                 if not data:
@@ -156,7 +181,7 @@ class RepositoryEnricher:
             r.repo_id: tuple(r.repo_id.split("/", 1))
             for r in results
         }
-        enriched = []
+        enriched = EnrichmentBatch(failures=metadata_failures)
         readme_futures = (
             self.readme_scheduler.ordered(owner_name_map[result.repo_id] for result in results)
             if self.readme_scheduler is not None else None
@@ -175,9 +200,10 @@ class RepositoryEnricher:
                 except CancelledError:
                     raise
                 except Exception as exc:
-                    warning = f"README fetch failed: {type(exc).__name__}: {exc}"
+                    diagnostic = exc.safe_diagnostic if isinstance(exc, GitHubGraphQLClientError) else str(exc)
+                    warning = f"README fetch failed: {type(exc).__name__}: {diagnostic}"
                     result.warnings.append(warning[:500])
-                    logger.warning("README fetch failed for %s: %s", repo_id, exc)
+                    logger.warning("README fetch failed for %s: %s", repo_id, diagnostic)
 
             if readme_text:
                 source_path = getattr(readme_text, "source_path", None)
