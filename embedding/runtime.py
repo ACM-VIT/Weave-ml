@@ -13,12 +13,13 @@ import atexit
 import math
 import os
 import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache, wraps
 from typing import Any, Callable, TypeVar
 
-from config import EMBEDDING_MODEL_REVISION, REPOSITORY_EMBEDDING_MODEL
+from config import EMBEDDING_MODEL_REVISION, REPOSITORY_EMBEDDING_DIM, REPOSITORY_EMBEDDING_MODEL
 from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
 from embedding.embeddings import SentenceTransformerEmbedder
 from embedding.query_cache import QueryEmbeddingCache
@@ -30,6 +31,7 @@ from summarization.runtime import (
 
 T = TypeVar("T")
 DEFAULT_EMBEDDING_MODEL_REVISION = EMBEDDING_MODEL_REVISION
+_warmup_loading = threading.local()
 
 
 class EmbeddingCapacityError(RuntimeError):
@@ -87,6 +89,16 @@ def embedding_warmup_enabled() -> bool:
     raise ValueError("EMBEDDING_WARMUP_ON_STARTUP must be a boolean")
 
 
+def inference_warmup_timeout_seconds() -> float:
+    try:
+        value = float(os.getenv("INFERENCE_WARMUP_TIMEOUT_SECONDS", "120").strip() or "120")
+    except ValueError as exc:
+        raise ValueError("INFERENCE_WARMUP_TIMEOUT_SECONDS must be a number") from exc
+    if not math.isfinite(value) or not 0.1 <= value <= 300:
+        raise ValueError("INFERENCE_WARMUP_TIMEOUT_SECONDS must be between 0.1 and 300")
+    return value
+
+
 def _configure_cpu_threads() -> int:
     threads = _positive_int("EMBEDDING_CPU_THREADS", 1, maximum=64)
     for name in (
@@ -125,7 +137,7 @@ def _load_sentence_transformer() -> Any:
         raise RuntimeError("sentence-transformers is required for embedding jobs") from exc
 
     kwargs: dict[str, Any] = {"revision": embedding_model_revision()}
-    if _production():
+    if _production() or getattr(_warmup_loading, "local_files_only", False):
         kwargs["local_files_only"] = True
     return SentenceTransformer(REPOSITORY_EMBEDDING_MODEL, **kwargs)
 
@@ -144,6 +156,8 @@ class BoundedEmbeddingModel:
         self._condition = threading.Condition()
         self._waiting: deque[object] = deque()
         self._active = 0
+        self._warmup_lock = threading.Lock()
+        self._warmup_status = {"state": "not_started", "duration_seconds": None}
 
     @property
     def max_seq_length(self) -> int:
@@ -172,14 +186,53 @@ class BoundedEmbeddingModel:
                 self._active -= 1
                 self._condition.notify_all()
 
+    def warmup(self, *, stop: threading.Event | None = None) -> dict[str, Any]:
+        """Execute one tiny real encode per loaded model, without persisted data."""
+        import numpy as np
+
+        with self._warmup_lock:
+            state = self._warmup_status["state"]
+            if state == "ready":
+                return self.identity()
+            if state == "failed":
+                raise RuntimeError("Embedding inference warmup previously failed")
+            started = time.monotonic()
+            self._warmup_status = {"state": "warming", "duration_seconds": None}
+            try:
+                if stop is not None and stop.is_set():
+                    raise RuntimeError("Inference warmup was stopped")
+                vectors = np.asarray(self.encode(
+                    ["Python developer interested in tools.", "Repository for developer tools."],
+                    convert_to_numpy=True, normalize_embeddings=True,
+                    show_progress_bar=False,
+                ), dtype=np.float32)
+                if vectors.shape != (2, REPOSITORY_EMBEDDING_DIM):
+                    raise ValueError("Encoder warmup returned incompatible dimensions")
+                if not np.all(np.isfinite(vectors)) or np.any(np.linalg.norm(vectors, axis=1) <= 0):
+                    raise ValueError("Encoder warmup returned invalid vectors")
+                if stop is not None and stop.is_set():
+                    raise RuntimeError("Inference warmup was stopped")
+            except Exception:
+                self._warmup_status = {
+                    "state": "failed", "duration_seconds": time.monotonic() - started,
+                }
+                raise
+            self._warmup_status = {
+                "state": "ready", "duration_seconds": time.monotonic() - started,
+            }
+            return self.identity()
+
     def identity(self) -> dict[str, Any]:
+        status = self._warmup_status
         return {
             "embedding_model": REPOSITORY_EMBEDDING_MODEL,
             "embedding_model_revision": embedding_model_revision(),
             "embedding_max_concurrency": _positive_int(
                 "EMBEDDING_MAX_CONCURRENCY", 1, maximum=8
             ),
-            "embedding_runtime_ready": True,
+            "embedding_runtime_ready": status["state"] == "ready",
+            "embedding_warmup_state": status["state"],
+            "embedding_warmup_duration_seconds": status["duration_seconds"],
             "embedding_cpu_threads": _positive_int(
                 "EMBEDDING_CPU_THREADS", 1, maximum=64
             ),
@@ -192,16 +245,26 @@ def _single_model_cache(factory):
     # lookup as well as construction so first search jobs share one query cache.
     cached = lru_cache(maxsize=1)(factory)
     lock = threading.Lock()
+    current = [None]
 
     @wraps(factory)
     def resolve():
         with lock:
-            return cached()
+            model = cached()
+            current[0] = model
+            return model
 
-    # Preserve the existing runtime status/reset and introspection contract.
+    def clear():
+        with lock:
+            cached.cache_clear()
+            current[0] = None
+
     resolve.cache_info = cached.cache_info
-    resolve.cache_clear = cached.cache_clear
+    resolve.cache_clear = clear
     resolve.cache_parameters = cached.cache_parameters
+    # Reading one published reference never waits behind model construction and
+    # cannot turn an inspection/clear race into a model load on a probe thread.
+    resolve.peek = lambda: current[0]
     return resolve
 
 
@@ -301,20 +364,32 @@ async def _run_embedding_job(
         raise EmbeddingDeadlineExceeded("the bounded embedding deadline was exceeded") from exc
 
 
-def warm_embedding_runtime() -> dict[str, Any]:
-    """Load and validate both frozen online embedding pipelines network-free."""
-    model = shared_embedding_model()
-    # Construction validates model aliases, dimensions, chunk settings, and the
-    # shared user/repository vector contract without opening Redis or Qdrant.
-    repository_embedding_pipeline()
-    user_onboarding_pipeline()
-    return model.identity()
+def warm_embedding_runtime(stop: threading.Event | None = None) -> dict[str, Any]:
+    """Validate pipelines and execute real inference using local artifacts only."""
+    previous = getattr(_warmup_loading, "local_files_only", False)
+    _warmup_loading.local_files_only = True
+    try:
+        if stop is not None and stop.is_set():
+            raise RuntimeError("Inference warmup was stopped")
+        model = shared_embedding_model()
+        if stop is not None and stop.is_set():
+            raise RuntimeError("Inference warmup was stopped")
+        # Construction validates contracts without opening Redis/Qdrant or
+        # calling summary providers. No user or corpus data enters warmup.
+        pipeline = repository_embedding_pipeline()
+        user_onboarding_pipeline()
+        if pipeline.config.embedding_dim != REPOSITORY_EMBEDDING_DIM:
+            raise ValueError("Repository pipeline warmup dimensions are incompatible")
+        return model.warmup(stop=stop)
+    finally:
+        _warmup_loading.local_files_only = previous
 
 
 def embedding_runtime_status() -> dict[str, Any]:
     """Return model identity without loading a model on a health-check thread."""
-    if shared_embedding_model.cache_info().currsize:
-        return shared_embedding_model().identity()
+    model = shared_embedding_model.peek()
+    if model is not None:
+        return model.identity()
     return {
         "embedding_model": REPOSITORY_EMBEDDING_MODEL,
         "embedding_model_revision": embedding_model_revision(),
@@ -322,6 +397,8 @@ def embedding_runtime_status() -> dict[str, Any]:
             "EMBEDDING_MAX_CONCURRENCY", 1, maximum=8
         ),
         "embedding_runtime_ready": False,
+        "embedding_warmup_state": "not_started",
+        "embedding_warmup_duration_seconds": None,
         "embedding_cpu_threads": _positive_int(
             "EMBEDDING_CPU_THREADS", 1, maximum=64
         ),
