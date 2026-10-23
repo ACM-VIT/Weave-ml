@@ -84,7 +84,7 @@ purpose and production rule.
 | Embedding | `EMBEDDING_MODEL`, `EMBEDDING_MODEL_REVISION`, `REPOSITORY_EMBEDDING_VERSION`, `V2_COMPATIBLE_EMBEDDING_VERSIONS`, `REPOSITORY_FEATURE_SPEC_VERSION`, `V2_REQUIRED_FEATURE_SPEC_VERSION`, `V2_REQUIRED_CONTENT_VERSION`, `V2_ALLOW_MISSING_EMBEDDING_REVISION`, `README_CHUNK_CHARS`, `README_CHUNK_OVERLAP_CHARS` | Exact baked model/revision; explicit compatible versions; missing revision is forbidden in production; chunking is bounded. |
 | Card summary | `SUMMARY_PROVIDER`, `SUMMARY_API_URL`, `SUMMARY_API_KEY`, `SUMMARY_MODEL_ID`, `SUMMARY_PROMPT_VERSION`, `SUMMARY_FORMAT_VERSION`, `SUMMARY_INPUT_MAX_CHARS`, `SUMMARY_TEMPERATURE`, `SUMMARY_MAX_OUTPUT_TOKENS`, `SUMMARY_REQUEST_TIMEOUT_SECONDS`, `SUMMARY_RPM_LIMIT`, `SUMMARY_MAX_RETRIES`, `SUMMARY_RETRY_BASE_SECONDS` | Dedicated least-privilege provider key; HTTPS transport; frozen prompt/schema identity; low temperature; bounded input, output, timeout, retries, and request rate. |
 | Readiness | `MIN_ELIGIBLE_REPOSITORIES` | Must be a positive capacity chosen for the launch market, not merely `1` for convenience. |
-| Model runtime | `EMBEDDING_WARMUP_ON_STARTUP`, `EMBEDDING_MAX_CONCURRENCY`, `EMBEDDING_EXECUTOR_WORKERS`, `EMBEDDING_CPU_THREADS`, `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE` | Warmup and offline flags are true; concurrency is bounded. |
+| Model runtime | `INFERENCE_WARMUP_TIMEOUT_SECONDS`, `EMBEDDING_WARMUP_ON_STARTUP`, `EMBEDDING_MAX_CONCURRENCY`, `EMBEDDING_EXECUTOR_WORKERS`, `EMBEDDING_CPU_THREADS`, `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE` | Warmup and offline flags are true; concurrency is bounded. |
 | Ranking | `ML_MODEL_VERSION`, `V2_HEAVY_RANKER_ENABLED`, `V2_HEAVY_RANKER_REQUIRED`, `V2_HEAVY_RANKER_TRAFFIC_PERCENT`, `V2_HEAVY_RANKER_CANARY_SALT`, `V2_ALLOW_UNQUALIFIED_HEAVY_RANKER`, `V2_EXPLORATION_FRACTION`, `V2_MAX_SAME_LANGUAGE` | Unqualified artifacts are forbidden. Required-heavy mode mandates 100% traffic and fails closed rather than serving the hybrid ranker. |
 | Service isolation | `V2_RECOMMENDATION_TIMEOUT_SECONDS`, `V2_RECOMMENDATION_EXECUTOR_WORKERS`, `V2_RECOMMENDATION_MAX_OUTSTANDING`; the `V2_FEEDBACK_*`, `V2_REFRESH_*`, `V2_SEARCH_*`, and `V2_HEALTH_*` executor-worker, max-outstanding, and timeout variables | Recommendations, feedback mutation, repository refresh, semantic search, and health work use separate bounded executors with fail-fast admission. Search shares the frozen encoder with indexing but does not queue behind summary-provider waits. Capacity includes running and queued work. Timed-out work retains capacity until it really exits; do not raise limits without host-specific load and dependency-failure tests. |
 | Repository jobs | `REPOSITORY_JOB_LOCK_TTL_MS`, `REPOSITORY_JOB_LOCK_WAIT_SECONDS` | Renewable lock TTL exceeds wait time. |
@@ -198,12 +198,46 @@ retryable rather than being acknowledged and lost.
 
 ## Recommendation determinism and call budget
 
-The default personalized hybrid path has a fixed upper budget of six Qdrant
+The default uncached personalized hybrid path uses six Qdrant
 round trips: one batched canonical/legacy user-profile retrieval, one semantic
 query, and four bounded discovery-channel scrolls. It performs no Redis call,
 online embedding, heavy-model inference, or repository-vector transfer.
-Missing-profile discovery uses five Qdrant calls. CI asserts this budget so a
-new per-item lookup cannot silently create an N+1 latency regression.
+Missing-profile discovery uses five Qdrant calls when the initial pool suffices.
+An authoritative shared discovery cache can serve its four discovery channels
+without those calls; an insufficient cached pool triggers request-local reads.
+CI asserts these fast-path budgets so a new per-item lookup cannot silently
+create an N+1 latency regression.
+
+When validation or duplicates leave fewer candidates than the requested batch,
+semantic and uncached discovery retrieval each allow at most two refill rounds.
+For a shared cache, the global pool remains unfiltered; an insufficient pool
+can trigger bounded request-local reads that never enter the shared cache. All
+candidate calls share a conservative read budget of six times `max_candidates`
+(900 candidate slots by default), including reservations for failed calls.
+Initial discovery still overlaps the profile lookup. Initial and refill reads
+use the same FIFO-admitted I/O pool and cooperative request deadline; the
+request worker validates results and drains all admitted children before exit.
+The worst case is 15 candidate calls plus the user lookup. Refills exclude raw
+point IDs already read, including rejected points, and stop on exhaustion or
+lack of progress. No further call starts after the absolute recommendation
+deadline, which includes executor queue time. An in-flight synchronous Qdrant
+call still runs to its client timeout and retains its worker slot. Batch output
+and ranker input bounds are unchanged; exhausted collections can return a
+short batch. Exclusions are local to the request; shared discovery caches must
+never hold personalized pools.
+
+The authenticated metrics endpoint exposes `ml_retrieval_calls_total`,
+`ml_retrieval_candidates_total`, `ml_retrieval_fresh_candidates_total`, and
+`ml_retrieval_rejected_candidates_total`, with only the five fixed retrieval
+channel labels. Rejected/fresh candidate rates give the rejection ratio;
+fresh/call rates give unseen yield per successful call. Fresh counts deduplicate
+within the request, including overlap with the semantic pool. They measure
+candidate acquisition, before final feed shaping.
+`ml_retrieval_candidate_bytes_estimate_total` estimates decoded candidate JSON
+bytes from one sampled point every 16 nonempty calls per channel/vector mode;
+`ml_retrieval_candidate_byte_samples_total` reports sample coverage. This is not
+a measurement of compressed wire bytes or HTTP framing. Metrics retain no
+repository or user identifiers.
 
 Freshness is evaluated at the UTC hour first observed for a generation. A
 process-local FIFO retains 65,536 generation anchors for up to six hours. This
@@ -263,6 +297,58 @@ transfer deletes the resolved source entry. Record the incident, source ID,
 repair, and result.
 
 ## Health and smoke checks
+
+Startup warmup executes real inference, not just model loading. The shared
+encoder runs one two-text synthetic encode with the configured 384-dimensional
+contract; the enabled heavy ranker runs one synthetic candidate through its
+serving input preparation and five-head forward path. Both validate finite
+outputs and latch success/failure once per loaded process model. Repeated
+readiness or
+deep probes never execute warmup. Production still requires warmup enabled and
+all existing model revision, artifact hash, and provenance checks.
+
+Warmup loading uses local cached encoder artifacts only, including explicitly
+enabled development warmup. Provision artifacts during the image build or
+approved offline setup, never through a readiness request. Synthetic warmup
+does not call summary providers or write user/corpus vectors. The startup wait
+is bounded by `INFERENCE_WARMUP_TIMEOUT_SECONDS` (default 120, range 0.1–300)
+once the inference-warmup worker is submitted. This is not a whole-startup
+deadline: earlier synchronous configuration validation and ranker artifact
+loading/provenance checks run before that timer starts.
+Deployment has a separate 600-second total API-start/readiness ceiling beginning
+before the API restart, including pre-start checks, old-container stop, model
+loading and the configured warmup. The ceiling leaves a finite allowance beyond
+the maximum 300-second inference warmup; it does not guarantee arbitrary artifact
+or model-loading time. Authenticated health attempts have an eight-second HTTP
+timeout and a command limit of at most 15 seconds, capped by the remaining total
+budget; retry sleeps also consume that budget. Final full smoke verification is
+command-bounded to 30 seconds. Rollback gets its own fresh 600-second startup
+window and 30-second verification. Both windows and verifications fit within
+21 minutes, below the existing 35-minute SSH and 60-minute workflow limits;
+staging/bootstrap and all other deployment work still consume those outer
+limits. A startup that exceeds the total ceiling fails deployment and enters
+the existing rollback path rather than extending readiness indefinitely.
+A missing or failed required ranker, encoder failure, startup timeout, or
+cancellation prevents readiness. Non-strict deployments that explicitly set
+`V2_HEAVY_RANKER_REQUIRED=false` preserve hybrid fallback if the optional ranker
+is missing or fails warmup; warmup status and diagnostic failure remain visible.
+Strict production still requires the heavy ranker and cannot take that fallback.
+Timeout cannot kill an already-running native inference call, but the stop/failure latch prevents late completion from
+opening readiness or starting the subsequent warmup stage. Model/client cleanup
+is deferred until the actual warmup worker exits. Retirement is marked
+synchronously before the failed lifespan returns, so another lifespan cannot
+reuse those resources while the old worker is still running. Its one completion
+callback is bound to the retired cleanup plan, never a future runtime's state.
+Before the lifespan first awaits shutdown, a live native startup Future owns
+a synchronously registered, generation-bound cleanup callback. If there is no
+live startup worker, cleanup is synchronously submitted to the executor instead.
+Neither path depends on an asyncio Task surviving long enough to submit work.
+The waiter is shielded; warmup-executor shutdown still runs in finally.
+Timeout/cancellation therefore cannot clear and recreate model caches under the
+worker or let a late callback close a restarted runtime. Readiness exposes
+encoder/ranker warmup state, individual inference durations, and overall startup
+warmup duration. These are observation hooks, not measured cold-start gains;
+startup and first-request/steady-state latency measurements remain required.
 
 All health tiers retain internal authentication:
 

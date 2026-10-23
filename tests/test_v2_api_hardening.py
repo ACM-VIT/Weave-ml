@@ -495,3 +495,58 @@ async def test_production_lifespan_fails_before_network_on_invalid_config(
     with pytest.raises(RuntimeError, match="Production configuration is invalid"):
         async with api_main.lifespan(api_main.app):
             pytest.fail("invalid production configuration reached application startup")
+
+
+def test_trace_context_is_adopted_only_after_internal_auth(monkeypatch) -> None:
+    from utils import observability
+
+    monkeypatch.setenv("INTERNAL_API_SECRET", "test-internal-secret")
+    captured = []
+    real_scope = observability.span_scope
+
+    @contextmanager
+    def capture_scope(*args, **kwargs):
+        with real_scope(*args, **kwargs) as span:
+            captured.append(observability.current_correlation())
+            yield span
+
+    monkeypatch.setattr(api_main, "span_scope", capture_scope)
+    parent = "00-1234567890abcdef1234567890abcdef-1234567890abcdef-01"
+    headers = {"traceparent": parent, "x-request-id": "legacy-request-id"}
+    client = TestClient(api_main.app)
+    assert client.get("/api/v2/health/live", headers=headers).status_code == 401
+    assert captured == []
+    response = client.get("/api/v2/health/live", headers={
+        **headers, "x-internal-secret": "test-internal-secret",
+    })
+    assert response.status_code == 200
+    assert response.headers["x-request-id"] == "legacy-request-id"
+    assert captured[0].trace_id == "1234567890abcdef1234567890abcdef"
+    assert captured[0].parent_span_id == "1234567890abcdef"
+    assert captured[0].span_id != captured[0].parent_span_id
+    assert captured[0].sampled is True
+    assert str(uuid.UUID(captured[0].request_id)) == captured[0].request_id
+    assert observability.current_correlation() is None
+
+
+@pytest.mark.parametrize("header", [
+    "00-00000000000000000000000000000000-1234567890abcdef-01",
+    "00-1234567890abcdef1234567890abcdef-0000000000000000-01",
+    "00-1234567890ABCDEF1234567890abcdef-1234567890abcdef-01",
+    "00-1234567890abcdef1234567890abcdef-1234567890abcdef-03",
+    "00-1234567890abcdef1234567890abcdef-1234567890abcdef-01-extra",
+    " " * 10000,
+])
+def test_invalid_traceparent_starts_independent_root(header) -> None:
+    from utils.observability import current_correlation, span_scope
+
+    with span_scope("search", server=True, authenticated_traceparent=header):
+        server = current_correlation()
+        assert server.parent_span_id is None
+        with span_scope("search"):
+            child = current_correlation()
+            assert child.trace_id == server.trace_id
+            assert child.parent_span_id == server.span_id
+            assert child.sampled == server.sampled
+        assert current_correlation() is server
+    assert current_correlation() is None

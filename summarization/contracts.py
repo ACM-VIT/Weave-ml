@@ -7,7 +7,7 @@ import hmac
 import json
 from typing import Annotated, Any, Literal, Mapping
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, StringConstraints, field_validator
 
 
 CARD_SUMMARY_PROMPT_VERSION = "repo-card-summary-v1"
@@ -53,6 +53,8 @@ class CardSummaryArtifact(CardSummaryContent):
     model_version: str = Field(min_length=1, max_length=256)
     format_version: str = Field(min_length=1, max_length=128)
     source: Literal["generated", "description_fallback"]
+    # Internal Qdrant provenance, deliberately absent from the backend JSON.
+    _reuse_key: str | None = PrivateAttr(default=None)
 
 
 CARD_SUMMARY_PAYLOAD_FIELDS = (
@@ -63,14 +65,18 @@ CARD_SUMMARY_PAYLOAD_FIELDS = (
     "card_summary_format_version",
     "card_summary_source",
     "card_summary_artifact_hash",
+    "card_summary_reuse_key",
 )
 
 
 def card_summary_artifact_hash(artifact: CardSummaryArtifact) -> str:
     """Fingerprint every artifact field so summary-only CAS writes are complete."""
 
+    content = artifact.model_dump(mode="json")
+    if artifact._reuse_key is not None:
+        content = {**content, "reuse_key": artifact._reuse_key}
     serialized = json.dumps(
-        artifact.model_dump(mode="json"),
+        content,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -89,6 +95,7 @@ def card_summary_payload(artifact: CardSummaryArtifact) -> dict[str, Any]:
         "card_summary_format_version": artifact.format_version,
         "card_summary_source": artifact.source,
         "card_summary_artifact_hash": card_summary_artifact_hash(artifact),
+        "card_summary_reuse_key": artifact._reuse_key,
     }
 
 
@@ -97,9 +104,12 @@ def card_summary_from_payload(
 ) -> CardSummaryArtifact | None:
     """Read a complete artifact from Qdrant, treating partial legacy data as absent."""
 
-    if not all(field in payload for field in CARD_SUMMARY_PAYLOAD_FIELDS):
+    # Legacy payloads can still be parsed, but generated artifacts without
+    # provenance require regeneration before current-source replay.
+    required_fields = CARD_SUMMARY_PAYLOAD_FIELDS[:-1]
+    if not all(field in payload for field in required_fields):
         return None
-    if any(payload.get(field) is None for field in CARD_SUMMARY_PAYLOAD_FIELDS):
+    if any(payload.get(field) is None for field in required_fields):
         return None
     try:
         artifact = CardSummaryArtifact.model_validate(
@@ -112,6 +122,13 @@ def card_summary_from_payload(
                 "source": payload["card_summary_source"],
             }
         )
+        reuse_key = payload.get("card_summary_reuse_key")
+        if reuse_key is not None:
+            if not isinstance(reuse_key, str) or len(reuse_key) != 64 or any(
+                char not in "0123456789abcdef" for char in reuse_key
+            ):
+                return None
+            artifact._reuse_key = reuse_key
         stored_hash = payload["card_summary_artifact_hash"]
         if not isinstance(stored_hash, str) or not hmac.compare_digest(
             stored_hash,

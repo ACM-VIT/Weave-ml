@@ -24,6 +24,7 @@ from utils.deadline import (
     deadline_scope, deadline_status,
 )
 from utils.runtime_lifecycle import runtime_admission
+from utils.observability import WorkObservation, span_scope
 
 
 T = TypeVar("T")
@@ -116,19 +117,27 @@ async def run_recommendation_job(function: Callable[..., T], *args: object) -> T
             )
         with _counter_lock:
             _outstanding += 1
+        observation = WorkObservation("recommendation")
         try:
             # A fresh Context belongs to this task, never shared across workers.
             with deadline_scope(deadline):
                 context = copy_context()
             def invoke() -> T:
-                check_deadline()  # Queue time consumes the same response budget.
-                return function(*args)
+                observation.start()
+                try:
+                    with span_scope("recommendation"):
+                        check_deadline()  # Queue time consumes the same response budget.
+                        return function(*args)
+                finally:
+                    observation.worker_stopped()
             future = recommendation_executor().submit(context.run, invoke)
         except BaseException:
+            observation.finish("error")
             _release_recommendation(admission)
             raise
     def completed(_future) -> None:
         try:
+            observation.complete_future(_future)
             if not _future.cancelled():
                 deadline.finish("recommendation")
         finally:
@@ -140,12 +149,14 @@ async def run_recommendation_job(function: Callable[..., T], *args: object) -> T
             timeout=deadline.remaining(),
         )
     except CooperativeDeadlineExceeded as exc:
+        observation.abandon("timeout")
         deadline.cancel("timeout")
         future.cancel()  # Running work retains admission; only queued work stops.
         with _counter_lock:
             _timed_out = min(_COUNTER_LIMIT, _timed_out + 1)
         raise RecommendationDeadlineExceeded("the cooperative recommendation deadline was exceeded") from exc
     except asyncio.CancelledError:
+        observation.abandon("cancelled")
         deadline.cancel()
         future.cancel()  # Only queued work can actually be cancelled.
         raise
@@ -156,6 +167,7 @@ async def run_recommendation_job(function: Callable[..., T], *args: object) -> T
         # into the request-level deadline code.
         if future.done() and not future.cancelled():
             raise
+        observation.abandon("timeout")
         deadline.cancel("timeout")
         with _counter_lock:
             _timed_out = min(_COUNTER_LIMIT, _timed_out + 1)

@@ -14,7 +14,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
 from api.contracts import RepositoryJob, RepositoryRefreshJob
-from api.v2 import _embed_repository_job_locked, _refresh_repository_job_locked
+from api.v2 import _embed_repository_job_locked, _refresh_repository_job_locked, _repository_embedding_payload
 from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
 from embedding.qdrant_store import QdrantRepositoryStore
 from summarization.contracts import (
@@ -96,8 +96,11 @@ def _point(job: RepositoryJob, *, artifact: CardSummaryArtifact | None, stored_j
 def test_duplicate_and_current_jobs_replay_the_durable_artifact(same_job: bool) -> None:
     request = _job()
     stored_job = str(request.job_id) if same_job else str(uuid.uuid4())
-    point = _point(request, artifact=_artifact(), stored_job=stored_job)
     pipeline = RepositoryEmbeddingPipeline(embedder=FakeEmbedder())
+    artifact = _artifact()
+    payload = _repository_embedding_payload(request)
+    artifact._reuse_key = pipeline.card_summarizer._reuse_key(payload, payload).hex()
+    point = _point(request, artifact=artifact, stored_job=stored_job)
     store = MagicMock()
 
     with patch("api.v2._repository_points", return_value=[point]), patch(
@@ -525,7 +528,7 @@ def test_invalid_fingerprinted_artifact_is_repaired_in_real_qdrant(same_job, inv
         stored = client.retrieve(store.collection_name, [REPO_ID], with_payload=True)[0]
         current = card_summary_from_payload(stored.payload)
         assert current is not None
-        assert pipeline.card_summarizer.is_current(current, repo=request.repository.model_dump(mode='json'))
+        assert pipeline.card_summarizer.is_current(current, repo=_repository_embedding_payload(request))
         assert stored.payload['content_version'] == request.content_version
         assert stored.payload['content_job_id'] == stored_job
     finally:

@@ -80,3 +80,40 @@ def test_search_success_and_failure_have_their_own_fixed_metric_route() -> None:
     assert 'route="/api/v2/search/repositories",status_class="5xx"' in rendered
     assert 'route="/api/v2/search/repositories",le="+Inf"} 2' in rendered
     assert '/api/v2/other' not in rendered
+
+
+def test_candidate_metrics_measure_yield_and_json_bytes_without_ids() -> None:
+    import json
+    from types import SimpleNamespace
+    from retrieval.metrics import record_candidate_read
+
+    point = SimpleNamespace(
+        id="private-repository-id", payload={"description": "private text"},
+        vector=None, score=0.8,
+    )
+    record_candidate_read("semantic", [point, point], fresh=1)
+    record_candidate_read("semantic", [], fresh=0)
+    record_candidate_read("private-user-id", [point], fresh=1)
+    rendered = metrics.render_prometheus({})
+    size = len(json.dumps([
+        vars(point), vars(point)
+    ], separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+    assert 'ml_retrieval_calls_total{channel="semantic"} 2' in rendered
+    assert 'ml_retrieval_candidates_total{channel="semantic"} 2' in rendered
+    assert 'ml_retrieval_fresh_candidates_total{channel="semantic"} 1' in rendered
+    assert 'ml_retrieval_rejected_candidates_total{channel="semantic"} 1' in rendered
+    assert f'ml_retrieval_candidate_bytes_estimate_total{{channel="semantic"}} {size}' in rendered
+    assert 'ml_retrieval_candidate_byte_samples_total{channel="semantic"} 1' in rendered
+    assert "private-repository-id" not in rendered
+    assert "private-user-id" not in rendered
+    assert "private text" not in rendered
+    # Sampling stays bounded across repeated calls and immediately samples a
+    # different transport mode, rather than estimating vectors as payload-only.
+    for _ in range(16):
+        record_candidate_read("semantic", [point], fresh=1)
+    point.vector = {"repo_embedding": [0.5, 0.5]}
+    record_candidate_read("semantic", [point], fresh=1)
+    assert 'ml_retrieval_candidate_byte_samples_total{channel="semantic"} 3' in metrics.render_prometheus({})
+    metrics.reset_metrics_for_tests()
+    assert 'ml_retrieval_calls_total{channel="semantic"} 0' in metrics.render_prometheus({})

@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import threading
+from types import SimpleNamespace
 
 import pytest
 
 from inference import runtime
+from utils.deadline import RequestDeadline
 
 
 def test_recommendation_runtime_rejects_an_undersized_capacity(monkeypatch) -> None:
@@ -19,9 +21,11 @@ def test_recommendation_runtime_rejects_an_undersized_capacity(monkeypatch) -> N
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("anyio_backend", ["asyncio"])
-async def test_cancelled_recommendation_keeps_admission_until_worker_exits(
+@pytest.mark.parametrize("interruption", ["cancel", "timeout"])
+async def test_interrupted_recommendation_keeps_admission_until_worker_exits(
     monkeypatch,
     anyio_backend,
+    interruption,
 ) -> None:
     class RecordingAdmission:
         def __init__(self) -> None:
@@ -54,13 +58,17 @@ async def test_cancelled_recommendation_keeps_admission_until_worker_exits(
 
     monkeypatch.setattr(runtime, "recommendation_admission", lambda: admission)
     monkeypatch.setattr(runtime, "recommendation_executor", lambda: executor)
-    monkeypatch.setattr(runtime, "recommendation_timeout_seconds", lambda: 120.0)
+    monkeypatch.setattr(runtime, "recommendation_timeout_seconds", lambda: 0.1 if interruption == "timeout" else 120.0)
     task = asyncio.create_task(runtime.run_recommendation_job(blocking_job))
     try:
         assert await asyncio.to_thread(started.wait, 2)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        if interruption == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(runtime.RecommendationDeadlineExceeded):
+                await task
 
         assert admission.releases == 0
         with pytest.raises(runtime.RecommendationCapacityError):
@@ -77,4 +85,56 @@ async def test_cancelled_recommendation_keeps_admission_until_worker_exits(
         assert admission.releases == 2
     finally:
         allow_finish.set()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+@pytest.mark.anyio
+async def test_recommendation_deadline_includes_queue_time_and_is_request_local(monkeypatch):
+    executor = ThreadPoolExecutor(max_workers=1)
+    admission = threading.BoundedSemaphore(2)
+    started, release, queued = (threading.Event() for _ in range(3))
+    clock = SimpleNamespace(now=100.0)
+    submissions = []
+
+    def submit(*args):
+        future = executor.submit(*args)
+        submissions.append(future)
+        if len(submissions) == 2:
+            queued.set()
+        return future
+
+    # Only the request budget uses this clock; asyncio retains its real clock.
+    monkeypatch.setattr(
+        runtime, "RequestDeadline",
+        lambda seconds: RequestDeadline(seconds, clock=lambda: clock.now),
+    )
+    monkeypatch.setattr(runtime, "recommendation_admission", lambda: admission)
+    monkeypatch.setattr(runtime, "recommendation_executor", lambda: SimpleNamespace(submit=submit))
+    monkeypatch.setattr(runtime, "recommendation_timeout_seconds", lambda: 2.0)
+
+    def block():
+        started.set()
+        assert release.wait(2)
+
+    first = asyncio.create_task(runtime.run_recommendation_job(block))
+    second = None
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        second = asyncio.create_task(runtime.run_recommendation_job(
+            lambda: (runtime.current_deadline().expires_at, clock.now)
+        ))
+        assert await asyncio.to_thread(queued.wait, 1)
+        # Advance time only after the second job is queued behind the blocker.
+        clock.now = 100.5
+        release.set()
+        deadline, worker_started = await second
+        await first
+        assert deadline == 102.0
+        assert worker_started == 100.5
+        assert deadline - worker_started == 1.5
+        assert runtime.current_deadline() is None
+        assert executor.submit(runtime.current_deadline).result(1) is None
+    finally:
+        release.set()
+        await asyncio.gather(*([first, second] if second else [first]), return_exceptions=True)
         executor.shutdown(wait=True, cancel_futures=True)

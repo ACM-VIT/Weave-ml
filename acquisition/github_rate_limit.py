@@ -150,7 +150,10 @@ class GitHubRateLimitCoordinator:
         now, wall_now = time.monotonic(), time.time()
         delays = []
         reset = _number(headers.get("X-RateLimit-Reset"))
-        if reset is not None:
+        # A secondary limit may leave primary quota available. Its reset is
+        # not a retry instruction unless that primary quota is exhausted.
+        remaining = _nonnegative_int(headers.get("X-RateLimit-Remaining"))
+        if remaining == 0 and reset is not None:
             delays.append(max(0.0, reset - wall_now))
         retry_after = headers.get("Retry-After")
         seconds = _number(retry_after)

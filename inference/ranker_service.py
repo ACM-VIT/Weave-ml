@@ -3,6 +3,8 @@ import hashlib
 import logging
 import math
 import os
+import threading
+import time
 from collections.abc import Iterable
 from datetime import datetime
 from functools import lru_cache
@@ -154,6 +156,8 @@ class RankerService:
         expected_embedding_model_revision=None,
         require_production_manifest=False,
     ):
+        self._warmup_lock = threading.Lock()
+        self._warmup_status = {"state": "not_started", "duration_seconds": None}
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.emb_dim = EMBEDDING_DIM
         self.model_version = RANKER_MODEL_VERSION
@@ -450,6 +454,60 @@ class RankerService:
     @property
     def ready(self) -> bool:
         return self._model_loaded
+
+    def warmup_status(self) -> dict:
+        """Read warmup state without acquiring the inference/warmup lock."""
+        status = self._warmup_status
+        return {
+            "heavy_ranker_warmup_ready": status["state"] == "ready",
+            "heavy_ranker_warmup_state": status["state"],
+            "heavy_ranker_warmup_duration_seconds": status["duration_seconds"],
+        }
+
+    def warmup(self, *, stop: threading.Event | None = None) -> dict:
+        """Warm real serving input preparation and forward once per model."""
+        with self._warmup_lock:
+            if self._warmup_status["state"] == "ready":
+                return self.warmup_status()
+            if self._warmup_status["state"] == "failed":
+                raise RuntimeError("Heavy ranker inference warmup previously failed")
+            started = time.monotonic()
+            self._warmup_status = {"state": "warming", "duration_seconds": None}
+            try:
+                if not self.ready:
+                    raise RuntimeError("Heavy ranker artifact is not loaded")
+                if stop is not None and stop.is_set():
+                    raise RuntimeError("Inference warmup was stopped")
+                # A normalized, fixed synthetic embedding and one candidate.
+                # No retriever, storage, real IDs, or user/corpus writes occur.
+                vector = np.zeros(EMBEDDING_DIM, dtype=np.float32)
+                vector[0] = 1.0
+                inputs = self._input_tensor(
+                    vector, [{"id": "runtime-warmup", "embedding": vector}],
+                    np.zeros((1, FEATURE_COUNT), dtype=np.float32),
+                )
+                with torch.inference_mode():
+                    outputs = self.model(inputs)
+                    if len(outputs) != 5 or any(output.numel() != 1 for output in outputs):
+                        raise ValueError("Heavy ranker warmup returned invalid prediction shapes")
+                    # Transfer/synchronize the real device work before declaring
+                    # ready; inspect raw outputs before serving's clipping step.
+                    predictions = torch.stack([
+                        output.reshape(-1) for output in outputs
+                    ], dim=1).cpu().numpy()
+                if predictions.shape != (1, 5) or not np.all(np.isfinite(predictions)):
+                    raise ValueError("Heavy ranker warmup returned non-finite predictions")
+                if stop is not None and stop.is_set():
+                    raise RuntimeError("Inference warmup was stopped")
+            except Exception:
+                self._warmup_status = {
+                    "state": "failed", "duration_seconds": time.monotonic() - started,
+                }
+                raise
+            self._warmup_status = {
+                "state": "ready", "duration_seconds": time.monotonic() - started,
+            }
+            return self.warmup_status()
 
     def score_batch(self, user_embedding, user_skills, candidate_repos):
         """Compatibility diagnostic API, including skill match and predictions.

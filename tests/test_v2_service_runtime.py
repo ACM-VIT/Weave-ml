@@ -34,16 +34,32 @@ async def test_cancelled_service_job_retains_capacity_until_worker_exits(
     monkeypatch.setenv("V2_REFRESH_EXECUTOR_WORKERS", "1")
     monkeypatch.setenv("V2_REFRESH_MAX_OUTSTANDING", "1")
     monkeypatch.setenv("V2_REFRESH_TIMEOUT_SECONDS", "30")
+    from utils import observability
+    observations = []
+    original_observe = observability.observe_duration
+
+    def observe(operation, stage, outcome, elapsed):
+        observations.append((operation, stage, outcome, elapsed))
+        original_observe(operation, stage, outcome, elapsed)
+
+    monkeypatch.setattr(observability, "observe_duration", observe)
+    worker_context = []
     started = threading.Event()
     allow_finish = threading.Event()
 
     def blocking_job() -> str:
+        worker_context.append(observability.current_correlation())
         started.set()
         assert allow_finish.wait(timeout=2)
         return "finished"
 
-    task = asyncio.create_task(runtime.run_service_job("refresh", blocking_job))
+    with observability.span_scope("refresh", server=True) as _span:
+        server_context = observability.current_correlation()
+        task = asyncio.create_task(runtime.run_service_job("refresh", blocking_job))
     assert await asyncio.to_thread(started.wait, 2)
+    assert worker_context[0].trace_id == server_context.trace_id
+    assert worker_context[0].parent_span_id == server_context.span_id
+    assert not any(stage == "service" for _, stage, _, _ in observations)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -51,6 +67,7 @@ async def test_cancelled_service_job_retains_capacity_until_worker_exits(
     with pytest.raises(runtime.ServiceCapacityError):
         await runtime.run_service_job("refresh", lambda: "too-early")
 
+    assert not any(stage == "late_work" for _, stage, _, _ in observations)
     allow_finish.set()
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
@@ -58,6 +75,10 @@ async def test_cancelled_service_job_retains_capacity_until_worker_exits(
             break
         await asyncio.sleep(0.01)
     assert runtime.service_runtime_status()["refresh"]["outstanding"] == 0
+    assert any(stage == "queue" for _, stage, _, _ in observations)
+    assert any(stage == "service" for _, stage, _, _ in observations)
+    assert any(stage == "late_work" and outcome == "cancelled"
+               for _, stage, outcome, _ in observations)
     assert await runtime.run_service_job("refresh", lambda: "accepted") == "accepted"
 
 
@@ -252,7 +273,7 @@ async def test_shared_query_flight_preserves_search_admission_during_http_interr
     monkeypatch.setenv('INTERNAL_API_SECRET', 'isolated-query-cache-secret')
     monkeypatch.setenv('V2_SEARCH_EXECUTOR_WORKERS', '2')
     monkeypatch.setenv('V2_SEARCH_MAX_OUTSTANDING', '2')
-    timeout = '.1' if interruption == 'timeout' else ('6' if interruption == 'configured_timeout' else '5')
+    timeout = '6' if interruption == 'configured_timeout' else '5'
     monkeypatch.setenv('V2_SEARCH_TIMEOUT_SECONDS', timeout)
     started, release = threading.Event(), threading.Event()
     calls = []
@@ -282,20 +303,23 @@ async def test_shared_query_flight_preserves_search_admission_during_http_interr
             await asyncio.sleep(.001)
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://isolated.test') as client:
-        def submit():
+        def submit(*, short_budget=False):
+            headers = {'X-Internal-Secret': 'isolated-query-cache-secret'}
+            if short_budget:
+                headers['X-Request-Timeout-Ms'] = '100'
             return asyncio.create_task(client.post(
-                '/api/v2/search/repositories', headers={'X-Internal-Secret': 'isolated-query-cache-secret'},
+                '/api/v2/search/repositories', headers=headers,
                 json={'schema_version': 2, 'search_id': str(uuid.uuid4()), 'query': 'private matching query', 'limit': 5},
             ))
 
         try:
-            tasks.append(submit())
+            tasks.append(submit(short_budget=interruption == 'timeout'))
             assert await asyncio.to_thread(started.wait, 2)
             if interruption == 'configured_timeout':
                 # The already-created pool keeps its six-second deadline even
                 # if the process environment changes before a matching job.
                 monkeypatch.setenv('V2_SEARCH_TIMEOUT_SECONDS', '.1')
-            tasks.append(submit())
+            tasks.append(submit(short_budget=interruption == 'timeout'))
             await until(lambda: model.query_embedding_cache.snapshot()['waiters'] == 1)
             if interruption == 'configured_timeout':
                 await asyncio.sleep(4.2)
