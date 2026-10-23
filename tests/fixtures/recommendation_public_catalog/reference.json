@@ -9,9 +9,9 @@
     "scaler_sha256": "3c168432741b1e58877692f9cd116a7362bc3a902e63154b88be5e0c2009c5ee",
     "timing_kind": "measured"
   },
-  "bundle_sha256": "2de2df535cfd9eae33d8a04df7c41ca9e8a84a6aa4dea4a3b26585f09eb8faa0",
+  "bundle_sha256": "2b02e07882671102509a8c03fc9c117bee3527352987dfbc52b623bab62c8d0c",
   "embedding_sha256": "35756e8a6f8e3fa31d5968e2742355bc9e75a1c5b7952b63e5b11c66a92c2665",
-  "evaluation_dataset_sha256": "ed7bc05e87031ac103e38dc31105e31237cd861599e2c4e793f89d240400c389",
+  "evaluation_dataset_sha256": "d3c90c60ccbe61eed83f7d9d2adcbd2099b17f2be687244a61f84ba2bb9b1d20",
   "format": "curated-metric-reference-v1",
   "k": 5,
   "policy_sha256": "dedee8072463a848ab51492e7264159d455235616fcc5e0382f9eb036475c853",
