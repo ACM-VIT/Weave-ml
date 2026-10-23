@@ -121,6 +121,7 @@
           "feedback_version": {
             "anyOf": [
               {
+                "minimum": 1.0,
                 "type": "integer"
               },
               {
@@ -528,7 +529,7 @@
             "$ref": "#/components/schemas/RecommendationContextStatus"
           },
           "embedding_version": {
-            "maxLength": 512,
+            "maxLength": 1048,
             "minLength": 1,
             "title": "Embedding Version",
             "type": "string"

@@ -130,7 +130,7 @@ class FeedbackEvent(StrictModel):
     dwell_ms: int | None = None
     occurred_at: datetime
 
-    @field_validator("feedback_version", mode="before", json_schema_input_type=int | Annotated[str, StringConstraints(pattern=r"^[1-9][0-9]*$")])
+    @field_validator("feedback_version", mode="before", json_schema_input_type=Annotated[int, Field(ge=1)] | Annotated[str, StringConstraints(pattern=r"^[1-9][0-9]*$")])
     @classmethod
     def feedback_version_wire(cls, value):
         # Node sends decimal strings to avoid losing 64-bit version precision.
@@ -415,7 +415,9 @@ class RecommendationResponse(StrictModel):
     user_id: uuid.UUID
     feed_version: int = Field(ge=1)
     model_version: str = Field(min_length=1, max_length=512)
-    embedding_version: str = Field(min_length=1, max_length=512)
+    # Retrieval supports eight compatible 128-character identities plus the
+    # mixed-version prefix and seven separating commas.
+    embedding_version: str = Field(min_length=1, max_length=len("compatible-mixed:") + 8 * 128 + 7)
     embedding_versions: list[str]
     served_ranker: Literal["heavy", "hybrid"]
     heavy_ranker_selected: bool
