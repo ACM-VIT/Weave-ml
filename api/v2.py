@@ -91,6 +91,11 @@ from inference.runtime import (
     recommendation_runtime_drain_actions,
     validate_recommendation_runtime,
 )
+from ingestion.features import (
+    activity_score as calculate_activity_score,
+    score_code_health,
+    trend_velocity as calculate_trend_velocity,
+)
 from retrieval.v2_retriever import QdrantV2Retriever, RetrievalDependencyError
 from retrieval.runtime import (
     retrieval_runtime_cleanup_actions, retrieval_runtime_drain_actions,
@@ -113,6 +118,21 @@ router = APIRouter(prefix="/api/v2", tags=["v2"], responses={
     422: {"model": RequestValidationResponse, "description": "Request validation failed"},
 })
 logger = logging.getLogger("pipeline.api.v2")
+
+_DERIVED_REPOSITORY_FEATURES = (
+    "code_health",
+    "activity_score",
+    "trend_velocity",
+)
+_REPOSITORY_FEATURE_DEPENDENCIES = {
+    "code_health": frozenset(
+        {"fork_count", "open_issues_count", "pushed_days_ago"}
+    ),
+    "activity_score": frozenset(
+        {"pushed_days_ago", "mentionable_users_count"}
+    ),
+    "trend_velocity": frozenset({"delta_3d", "delta_7d", "delta_30d"}),
+}
 
 
 class _RuntimeCleanupPlan:
@@ -248,7 +268,7 @@ class V2ServiceHTTPException(HTTPException):
         error_code: str,
         retryable: bool,
         headers: dict[str, str] | None = None,
-        details: dict[str, Any] | None = None,
+        details: dict[str, Any] | list[dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(status_code=status_code, detail=detail, headers=headers)
         self.error_code = error_code
@@ -954,7 +974,82 @@ def _refresh_repository_job_locked(
             "feature_version": current,
         }
 
-    features = request.features.model_dump(mode="json", exclude_none=True)
+    requested_features = request.features.model_dump(mode="json", exclude_none=True)
+    observed_features = {
+        field: value
+        for field, value in requested_features.items()
+        if field not in _DERIVED_REPOSITORY_FEATURES
+    }
+    resulting_observation = {
+        **dict(expected_point.payload or {}),
+        **observed_features,
+    }
+    stored_observation = dict(expected_point.payload or {})
+    changed_observed_features = {
+        field
+        for field, value in observed_features.items()
+        if stored_observation.get(field) != value
+    }
+    affected_derived_features = {
+        field
+        for field, dependencies in _REPOSITORY_FEATURE_DEPENDENCIES.items()
+        if dependencies.intersection(changed_observed_features)
+    }
+    derived_features: dict[str, float] = {}
+    if "code_health" in affected_derived_features:
+        derived_features["code_health"] = score_code_health(resulting_observation)
+    if "activity_score" in affected_derived_features:
+        # Feature refreshes do not retain recent commit timestamps in Qdrant.
+        # When an activity dependency changes, use the documented persisted
+        # fallback and producer-anchored push age. Unrelated patches preserve a
+        # score originally derived from richer recent-commit observations.
+        derived_features["activity_score"] = calculate_activity_score(
+            {**resulting_observation, "recent_commits": []}
+        )
+    if "trend_velocity" in affected_derived_features:
+        derived_features["trend_velocity"] = calculate_trend_velocity(
+            resulting_observation
+        )
+    expected_derived_features = {
+        field: (
+            derived_features[field]
+            if field in affected_derived_features
+            else resulting_observation[field]
+        )
+        for field in _DERIVED_REPOSITORY_FEATURES
+    }
+    inconsistent = [
+        field
+        for field in _DERIVED_REPOSITORY_FEATURES
+        if field in requested_features
+        and requested_features[field] != expected_derived_features[field]
+    ]
+    if inconsistent:
+        expected = ", ".join(
+            f"{field}={expected_derived_features[field]}" for field in inconsistent
+        )
+        detail = (
+            "Repository derived features are inconsistent with the resulting "
+            f"observation; expected {expected}."
+        )
+        raise V2ServiceHTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=detail,
+            error_code="REQUEST_VALIDATION_FAILED",
+            retryable=False,
+            details=[
+                {
+                    "path": f"body.features.{field}",
+                    "message": (
+                        "Value must match the effective server-owned score "
+                        f"{expected_derived_features[field]}."
+                    ),
+                    "type": "value_error.derived_feature_mismatch",
+                }
+                for field in inconsistent
+            ],
+        )
+    features = {**observed_features, **derived_features}
     updated = {
         **dict(expected_point.payload or {}),
         **features,

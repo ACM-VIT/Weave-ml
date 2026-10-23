@@ -287,7 +287,7 @@ def test_repository_refresh_benchmark(benchmark, monkeypatch) -> None:
         job_id=uuid.uuid4(),
         repo_id=uuid.UUID(repo_id),
         feature_version=1,
-        features={"star_count": 10_001, "activity_score": 0.75},
+        features={"star_count": 10_001},
     )
     lock = SimpleNamespace(assert_owned=lambda: None)
     result = benchmark(_refresh_repository_job_locked, request, lock)
