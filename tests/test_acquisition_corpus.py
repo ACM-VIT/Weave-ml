@@ -620,3 +620,35 @@ def test_rejection_overflow_retains_every_received_batch_identity(tmp_path, stre
     with pytest.raises(RuntimeError, match='rejection history capacity'):
         _run_pipeline(pipeline)
     assert set(CorpusCheckpoint(path).pending_persistence) == {value.repo_id for value in values}
+
+
+@pytest.mark.parametrize('streaming', [False, True])
+@pytest.mark.parametrize('partial_failure', [False, True])
+def test_local_only_indexing_releases_successful_work_and_preserves_failures(tmp_path, streaming, partial_failure):
+    path = tmp_path / 'checkpoint.json'
+    sources = [_source('owner/good'), _source('owner/retry')]
+    def acquire(**kwargs):
+        result = AcquisitionRunResult(repositories=sources)
+        if streaming:
+            kwargs['on_targets']([source.repo_id for source in sources])
+            kwargs['on_batch'](result)
+            return AcquisitionRunResult()
+        return result
+    def index(values):
+        if partial_failure and any(source.repo_id == 'owner/retry' for source in values):
+            raise RuntimeError('local index unavailable')
+        return values
+    pipeline = _ownership_pipeline(
+        path, database=SimpleNamespace(enabled=False),
+        indexing_ownership='local_immediate', allow_qdrant_without_postgres=True,
+        acquire=acquire, indexer=index, streaming=streaming,
+    )
+    report = _run_pipeline(pipeline)
+    checkpoint = CorpusCheckpoint(path)
+    expected = ['owner/retry'] if partial_failure else []
+    assert checkpoint.pending_persistence == expected
+    assert checkpoint.pending_index == []
+    assert set(checkpoint.data['failures']) == set(expected)
+    assert checkpoint.excluded_names() == set(expected)
+    assert report.indexed == (1 if partial_failure else 2)
+    assert report.persisted == report.backend_handoffs == 0

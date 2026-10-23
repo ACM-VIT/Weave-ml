@@ -397,8 +397,15 @@ class CorpusPipeline:
             self.checkpoint.save()
         succeeded, failed = self._index_sources(persisted)
         self.checkpoint.clear_pending_index(succeeded)
+        if not database_ready:
+            # Explicit local-only runs finish at the local index boundary.
+            # Retain failed identities for recovery, without inventing a
+            # backend acknowledgement for work that never used the backend.
+            self.checkpoint.clear_pending_persistence(succeeded)
         for name in succeeded:
             self.checkpoint.clear_failure(name)
+            if not database_ready:
+                self.checkpoint.clear_rejection(name)
         for name, error in failed.items():
             report.failures[name] = f"indexing: {error}"
             self.checkpoint.record_failure(name, "indexing", error)
