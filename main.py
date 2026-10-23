@@ -115,6 +115,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--corpus-target", type=_positive_int, default=None)
     parser.add_argument("--max-cycles", type=_positive_int, default=None)
     parser.add_argument("--checkpoint-path", type=Path, default=None)
+    parser.add_argument("--recovery-batch-size", type=_positive_int, default=None)
     parser.add_argument(
         "--validate-config",
         action="store_true",
@@ -122,6 +123,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
+    if args.recovery_batch_size is None:
+        args.recovery_batch_size = positive_int(
+            os.getenv("ACQUISITION_RECOVERY_BATCH_SIZE", "100"),
+            name="ACQUISITION_RECOVERY_BATCH_SIZE",
+        )
     if args.corpus_target is None:
         args.corpus_target = positive_int(
             os.getenv("CORPUS_TARGET_COUNT", "50000"),
@@ -196,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         target_count=args.corpus_target,
         max_cycles=args.max_cycles,
         checkpoint_path=args.checkpoint_path,
+        recovery_batch_size=args.recovery_batch_size,
     ).validated()
 
     def acquire(**kwargs: Any):
@@ -224,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
         settings=settings,
         checkpoint=CorpusCheckpoint(settings.checkpoint_path),
         allow_qdrant_without_postgres=False,
-        indexing_enabled=False,
+        indexing_ownership="backend_outbox",
         streaming=True,
     )
     try:
@@ -239,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     logger.info("Corpus run report: %s", report.as_dict())
-    return 2 if report.failures and not (report.persisted or report.indexed) else 0
+    return 2 if (report.failures or report.quarantined) and not (report.persisted or report.indexed) else 0
 
 
 if __name__ == "__main__":

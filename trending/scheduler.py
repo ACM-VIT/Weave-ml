@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import logging
 import signal
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 try:
     import schedule
@@ -35,6 +36,7 @@ class TrendingScheduler:
         self,
         fetcher: TrendingFetcher | None = None,
         storage: Any | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         """Initialize the trending scheduler.
 
@@ -53,6 +55,7 @@ class TrendingScheduler:
 
         self.fetcher = fetcher or TrendingFetcher()
         self.storage = storage or TrendingStorage()
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.running = False
         self.scheduler = schedule.Scheduler()
 
@@ -75,6 +78,23 @@ class TrendingScheduler:
         self.stop()
 
     def refresh_trending_repositories(self, force: bool = False) -> bool:
+        """Claim singleton ownership before freshness checks or discovery."""
+        try:
+            errors = config.validate_config()
+            if errors:
+                logger.error("Trending configuration errors: %s", "; ".join(errors))
+                return False
+            session = getattr(self.storage, "refresh_session", None)
+            with (session(force=force, refresh_hours=config.TRENDING_REFRESH_HOURS)
+                  if callable(session) else nullcontext(True)) as eligible:
+                if not eligible:
+                    return True
+                return self._refresh_trending_repositories(force=force)
+        except Exception:
+            logger.exception("Trending refresh coordination failed")
+            return False
+
+    def _refresh_trending_repositories(self, force: bool = False) -> bool:
         """Fetch trending repositories and publish one complete snapshot.
 
         This is the main refresh operation that:
@@ -103,7 +123,7 @@ class TrendingScheduler:
             if not force:
                 last_refresh = self.storage.get_last_refresh_time()
                 if last_refresh:
-                    time_since_refresh = datetime.now(timezone.utc) - last_refresh
+                    time_since_refresh = self._clock() - last_refresh
                     hours_since_refresh = time_since_refresh.total_seconds() / 3600
                     if hours_since_refresh < config.TRENDING_REFRESH_HOURS:
                         logger.info(
@@ -130,7 +150,7 @@ class TrendingScheduler:
             logger.info(f"Fetched {len(repositories)} repositories from GitHub.")
 
             # The production adapter publishes one atomic backend-v2 snapshot.
-            refresh_timestamp = datetime.now(timezone.utc)
+            refresh_timestamp = self._clock()
             # Bound retry starts, not the duration of already-active HTTP calls.
             retry_deadline = time.monotonic() + 120
             for attempt in range(3):
@@ -202,7 +222,7 @@ class TrendingScheduler:
 
         # Run once immediately on startup
         logger.info("Running initial refresh on startup...")
-        self.refresh_trending_repositories(force=True)
+        self.refresh_trending_repositories(force=False)
 
         # Main scheduling loop
         try:

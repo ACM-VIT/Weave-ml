@@ -48,6 +48,7 @@ class CorpusPipelineSettings:
     target_count: int = 50_000
     max_cycles: int = 1
     checkpoint_path: Path = Path(".cache/acquisition_checkpoint.json")
+    recovery_batch_size: int = 100
 
     @classmethod
     def from_environment(cls) -> "CorpusPipelineSettings":
@@ -65,6 +66,10 @@ class CorpusPipelineSettings:
                     "ACQUISITION_CHECKPOINT_PATH", ".cache/acquisition_checkpoint.json"
                 )
             ),
+            recovery_batch_size=positive_int(
+                os.getenv("ACQUISITION_RECOVERY_BATCH_SIZE", "100"),
+                name="ACQUISITION_RECOVERY_BATCH_SIZE",
+            ),
         )
 
     def validated(self) -> "CorpusPipelineSettings":
@@ -76,4 +81,5 @@ class CorpusPipelineSettings:
             target_count=target_count,
             max_cycles=max_cycles,
             checkpoint_path=Path(self.checkpoint_path),
+            recovery_batch_size=positive_int(self.recovery_batch_size, name="recovery_batch_size"),
         )

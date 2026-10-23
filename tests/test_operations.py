@@ -60,12 +60,14 @@ def test_corpus_config_validation_reports_missing_required_values(monkeypatch) -
     assert corpus_main(["--validate-config"]) == 1
 
 
-def test_trending_config_validation_does_not_start_worker(monkeypatch) -> None:
+def test_trending_config_validation_does_not_start_worker(monkeypatch, tmp_path) -> None:
     import trending.config as config
 
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     monkeypatch.setenv("BACKEND_URL", "http://backend.test")
     monkeypatch.setenv("INTERNAL_API_SECRET", "test-secret")
+    monkeypatch.setenv("TRENDING_COORDINATION_MODE", "singleton_file")
+    monkeypatch.setenv("TRENDING_STATE_PATH", str(tmp_path / "trending.json"))
     with patch(
         "trending_service.run_once",
         side_effect=AssertionError("trending worker started"),
