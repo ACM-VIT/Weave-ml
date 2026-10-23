@@ -91,3 +91,33 @@ def test_offline_cli_import_ignores_serving_collection_configuration():
         env=env, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     assert '--registry' in result.stdout
+
+
+def test_import_help_and_memory_unknown_without_unix_resource():
+    # A fresh interpreter prevents an already-imported resource module masking
+    # the native-Windows failure during test collection and CLI startup.
+    code = """
+import builtins
+real_import = builtins.__import__
+def without_resource(name, *args, **kwargs):
+    if name == 'resource':
+        raise ModuleNotFoundError("No module named 'resource'")
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = without_resource
+from scripts import compare_embedding_models as comparison
+assert comparison._peak_process_rss_bytes() is None
+comparison.main(['--help'])
+"""
+    result = subprocess.run([sys.executable, '-c', code], capture_output=True,
+                            text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert '--registry' in result.stdout
+
+
+@pytest.mark.parametrize('platform_name, expected', [('linux', 128 * 1024), ('darwin', 128)])
+def test_peak_rss_retains_actual_platform_units(monkeypatch, platform_name, expected):
+    fake = SimpleNamespace(RUSAGE_SELF=0,
+                           getrusage=lambda who: SimpleNamespace(ru_maxrss=128))
+    monkeypatch.setitem(sys.modules, 'resource', fake)
+    monkeypatch.setattr(comparison.sys, 'platform', platform_name)
+    assert comparison._peak_process_rss_bytes() == expected

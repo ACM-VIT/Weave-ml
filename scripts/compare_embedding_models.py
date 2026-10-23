@@ -11,7 +11,6 @@ import json
 import os
 from pathlib import Path
 import platform
-import resource
 import subprocess
 import sys
 import tempfile
@@ -85,6 +84,16 @@ def _percentile(samples, fraction):
     return sorted(samples)[max(0, math.ceil(len(samples) * fraction) - 1)]
 
 
+def _peak_process_rss_bytes():
+    # resource is Unix-only. Keep import/help/collection portable and report an
+    # unavailable measurement as unknown rather than fabricating a zero peak.
+    try:
+        import resource
+    except ImportError:
+        return None
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == 'darwin' else 1024)
+
+
 def run_worker(args):
     import torch
     import sentence_transformers
@@ -144,7 +153,7 @@ def run_worker(args):
     with shadow.open('wb') as output:
         np.savez_compressed(output, queries=queries_batch.values, documents=documents_batch.values,
                             metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)))
-    peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1024 if sys.platform != 'darwin' else 1)
+    peak_rss = _peak_process_rss_bytes()
     mean_documents = sum(document_samples) / len(document_samples)
     source_hashes = {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
                      for path in (Path(__file__), ROOT / 'evaluation/embedding_registry.py', ROOT / 'evaluation/retrieval_metrics.py')}
