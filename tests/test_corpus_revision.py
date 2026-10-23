@@ -279,5 +279,3 @@ def test_enabled_production_authority_rejects_unscoped_transport_before_client_c
     monkeypatch.setattr(redis,'from_url',lambda *a,**k: pytest.fail('invalid config must not connect'))
     with pytest.raises(ValueError,match='production ACL'):
         authority_from_environment(collection='corpus',vector='repo_embedding')
-
-

@@ -40,7 +40,12 @@ from api.runtime import (
 from api.request_budget import run_read_only_request
 from api.health import HealthDiagnostics, HealthSettings
 from api.metrics import record_health_dependency, record_recommendation, render_prometheus
-from config import constant_time_secret_matches, internal_api_header_name
+from config import (
+    QDRANT_COLLECTION_NAME, QDRANT_VECTOR_NAME,
+    constant_time_secret_matches, internal_api_header_name,
+)
+from embedding.corpus_revision import authority_from_environment
+from retrieval.discovery_cache import DiscoveryRevision
 from embedding.qdrant_store import QdrantRepositoryStore
 from embedding.query_cache import CachedQueryEmbedder, QueryCacheCapacityError
 from embedding.runtime import (
@@ -346,8 +351,22 @@ async def require_internal_secret(
 
 
 @lru_cache(maxsize=1)
+def corpus_authority():
+    return authority_from_environment(collection=QDRANT_COLLECTION_NAME, vector=QDRANT_VECTOR_NAME)
+
+
+def _corpus_discovery_revision():
+    authority = corpus_authority()
+    current = authority.read() if authority is not None else None
+    return DiscoveryRevision(*current) if current is not None else None
+
+
+@lru_cache(maxsize=1)
 def retriever() -> QdrantV2Retriever:
-    return QdrantV2Retriever()
+    authority = corpus_authority()
+    return QdrantV2Retriever(
+        discovery_revision_provider=_corpus_discovery_revision if authority is not None else None,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -379,6 +398,7 @@ def repository_store() -> QdrantRepositoryStore:
     store = QdrantRepositoryStore(
         vector_size=pipeline.config.embedding_dim,
         client=retriever().client,
+        corpus_authority=corpus_authority(),
     )
     store.ensure_collection()
     return store
@@ -444,6 +464,8 @@ def _runtime_cleanup_actions():
         close = getattr(producer().redis, "close", None)
         if callable(close):
             actions.append(("redis.client.close", close))
+    if corpus_authority.cache_info().currsize and corpus_authority() is not None:
+        actions.append(("corpus.authority.close", corpus_authority().close))
     if retriever.cache_info().currsize:
         close = getattr(retriever().client, "close", None)
         if callable(close):
@@ -451,6 +473,7 @@ def _runtime_cleanup_actions():
     return [
         *actions,
         ("repository_store.cache.clear", repository_store.cache_clear),
+        ("corpus_authority.cache.clear", corpus_authority.cache_clear),
         ("user_profile_store.cache.clear", user_profile_store.cache_clear),
         ("feedback_producer.cache.clear", producer.cache_clear),
         ("retriever.cache.clear", retriever.cache_clear),
