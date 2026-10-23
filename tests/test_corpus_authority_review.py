@@ -59,3 +59,39 @@ def test_enabled_bootstrap_supplies_matching_authority_and_closes_owned_clients(
         authority.close()
         for client in created:
             client.close()
+
+
+@pytest.mark.integration
+def test_actual_scoped_factory_survives_reconnect_and_overdue_idle_probe(
+    owned_authority_services, monkeypatch,
+):
+    import redis
+    from urllib.parse import urlsplit
+    redis_url, qdrant_url = owned_authority_services
+    user = 'corpus_' + uuid4().hex[:8]
+    password = 'owned-fixture-password-only'
+    endpoint = urlsplit(redis_url)
+    scoped_url = f'redis://{user}:{password}@{endpoint.netloc}'
+    configure(monkeypatch, scoped_url, qdrant_url)
+    with closing(redis.from_url(redis_url)) as admin:
+        admin.execute_command('ACL', 'SETUSER', user, 'on', '>' + password,
+            '~weave:corpus-authority:v1:*', '+eval', '+info', '+hget', '+hset')
+        guarded = authority_from_environment(collection='owned-corpus', vector='repo_embedding', endpoint=qdrant_url)
+        try:
+            guarded.bootstrap(proof())
+            assert guarded.status()['state'] == 'READY'
+            connection = guarded.client.connection_pool.get_connection()
+            connection.next_health_check = 0  # An overdue idle probe, without a 30s sleep.
+            guarded.client.connection_pool.release(connection)
+            assert guarded.read() is not None
+            guarded.client.connection_pool.disconnect()
+            token = guarded.begin()
+            assert guarded.status()['state'] == 'DIRTY'
+            guarded.finish(token, completed=True)
+            assert guarded.status()['state'] == 'READY'
+            # The actual scoped user does not have PING; protocol reads still work.
+            with pytest.raises(redis.ResponseError):
+                guarded.client.ping()
+            assert guarded.read() is not None
+        finally:
+            guarded.close()
