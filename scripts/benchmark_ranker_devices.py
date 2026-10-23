@@ -7,7 +7,6 @@ import hashlib
 import json
 from pathlib import Path
 import platform
-import resource
 import subprocess
 import sys
 import time
@@ -90,6 +89,17 @@ def summary(samples: list[float]) -> dict:
         raise ValueError("Invalid timing samples")
     return {"samples": len(samples), "p50_ms": float(np.percentile(values, 50)),
             "p95_ms": float(np.percentile(values, 95))}
+
+
+def _peak_process_rss_bytes():
+    # Match the existing comparison diagnostic: unsupported RSS is unknown,
+    # Darwin reports bytes and Linux reports KiB. This is whole-process peak,
+    # including imports, fixtures and both headline/instrumented calls.
+    try:
+        import resource
+    except ImportError:
+        return None
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024)
 
 
 def _sync(device: str) -> None:
@@ -222,7 +232,7 @@ def _run_case(device: str, count: int, repeats: int, threads: int, directory: Pa
         samples.append(duration)
         timed_outputs.append(tuple((row['repo_id'], float(row['final_score'])) for row in actual))
     stages = profile_stages(service, user, skills, candidates, repeats, device)
-    rss_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss_bytes = _peak_process_rss_bytes()
     cuda_peak = torch.cuda.max_memory_allocated() if device == "cuda" else None
     # Reference/parity work follows measurements and memory accounting.
     diagnostic = service.score_batch(user, skills, candidates)
@@ -249,7 +259,9 @@ def _run_case(device: str, count: int, repeats: int, threads: int, directory: Pa
             "artifact_load_cpu_ms": load_ms, "model_placement_ms": placement_ms,
             "first_serving_call_ms": first_ms, "warm_serving": times,
             "candidates_per_second": count * repeats * 1000 / sum(samples),
-            "instrumented_stages": stages, "process_peak_rss_kib": rss_kib,
+            "instrumented_stages": stages, "process_peak_rss_kib": rss_bytes / 1024 if rss_bytes is not None else None,
+            "process_peak_rss_bytes": rss_bytes,
+            "process_peak_rss_scope": "whole_process_imports_fixtures_headline_and_instrumented_calls",
             "cuda_peak_allocated_bytes": cuda_peak,
             "cuda_peak_allocated_bytes_scope": "post_warmup_headline_and_instrumented_calls",
             "timed_compact_max_abs_error": compact_error,
