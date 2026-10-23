@@ -513,7 +513,7 @@ def test_version_gap_remains_pending_without_acknowledgement():
 
     assert consumer._process_message("3-0", _event(user_id, repo_id, 3)) is False
     assert redis.acks == []
-    assert next(iter(redis.attempts.values())) == 1
+    assert redis.attempts == {}, "ordering waits must not exhaust dependency-failure retries"
 
 
 def test_terminal_invalid_event_advances_only_next_cursor_and_unblocks_followup():

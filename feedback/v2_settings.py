@@ -158,6 +158,8 @@ class V2FeedbackSettings:
     health_warn_dead_letter: int
     health_max_dead_letter: int
 
+    consumer_workers: int = 4
+
     @property
     def production(self) -> bool:
         return self.environment in _PRODUCTION_ENVIRONMENTS
@@ -330,6 +332,7 @@ class V2FeedbackSettings:
 
         runtime = cls(
             environment=environment,
+            consumer_workers=_integer("FEEDBACK_CONSUMER_WORKERS", default=4, minimum=1, maximum=16),
             redis_url=redis_url,
             stream_name=stream_name,
             stream_maxlen=stream_maxlen,

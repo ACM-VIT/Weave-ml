@@ -205,6 +205,7 @@ def _csv(value: str | None) -> list[str]:
 
 
 def _validate_feedback(v: _Validator) -> None:
+    v.integer("FEEDBACK_CONSUMER_WORKERS", minimum=1, maximum=16, required=False)
     redis_url = v.url("REDIS_URL", schemes={"redis", "rediss"})
     auth_mode = v.raw("REDIS_AUTH_MODE", required=True)
     if auth_mode is not None and auth_mode != "acl_url":

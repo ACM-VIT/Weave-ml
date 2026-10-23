@@ -61,6 +61,7 @@ from feedback.interactions import get_interaction
 from feedback.safe_logging import configure_feedback_worker_logging
 from feedback.user_lock import LockAcquisitionError, LockLostError, user_vector_lock
 from feedback.v2_settings import V2FeedbackSettings
+from feedback.user_scheduler import UserFeedbackScheduler, Work
 
 
 logger = logging.getLogger(__name__)
@@ -1318,6 +1319,10 @@ class OrderedFeedbackConsumer:
         self.release_id = _runtime_release_id(production=self.settings.production)
         self.heartbeat_value = f"{self.release_id}|{self.consumer}"
         self._reclaim_cursor = "0-0"
+        self._scheduler: UserFeedbackScheduler | None = None
+        self._poll_lock = threading.Lock()
+        self._closed = False
+        self._admission_stop = threading.Event()
         try:
             self.redis.xgroup_create(
                 self.settings.stream_name,
@@ -1336,7 +1341,14 @@ class OrderedFeedbackConsumer:
             return CONSUMER_HEARTBEAT_TTL_SECONDS
         return float(self.settings.heartbeat_ttl_seconds)
 
+    def _read_capacity(self) -> int:
+        return self.settings.read_batch_size if self._scheduler is None else min(
+            self.settings.read_batch_size, self._scheduler.capacity - self._scheduler.pending)
+
     def _messages(self):
+        count = self._read_capacity()
+        if count <= 0:
+            return
         try:
             claimed = self.redis.xautoclaim(
                 self.settings.stream_name,
@@ -1344,7 +1356,7 @@ class OrderedFeedbackConsumer:
                 self.consumer,
                 self.settings.reclaim_idle_ms,
                 self._reclaim_cursor,
-                count=self.settings.read_batch_size,
+                count=count,
             )
             if claimed:
                 raw_cursor = claimed[0]
@@ -1361,11 +1373,14 @@ class OrderedFeedbackConsumer:
                 "pending feedback reclaim failed",
                 extra={"feedback_context": {"status": "reclaim_failed"}},
             )
+        count = self._read_capacity()
+        if count <= 0:
+            return
         response = self.redis.xreadgroup(
             self.settings.consumer_group,
             self.consumer,
             {self.settings.stream_name: ">"},
-            count=self.settings.read_batch_size,
+            count=count,
             block=self.settings.read_block_ms,
         )
         for _, messages in response or []:
@@ -1515,6 +1530,15 @@ class OrderedFeedbackConsumer:
         code: str,
         reason: str,
     ) -> bool:
+        if code == "VERSION_GAP":
+            # Reordering from live/reclaim/capacity deferral is not a failed
+            # dependency attempt. Preserve the event until its predecessor is
+            # applied or explicitly reconciled; never move healthy successors
+            # to DLQ solely because scheduling changed their arrival order.
+            logger.info("feedback ordering gap remains pending",
+                extra={"feedback_context": self._context(message_id, payload,
+                    status="retry_pending", code=code)})
+            return False
         attempts_key = self._attempt_key(payload, message_id)
         attempts = int(self.redis.incr(attempts_key))
         self.redis.expire(attempts_key, self.settings.idempotency_ttl_seconds)
@@ -1574,6 +1598,9 @@ class OrderedFeedbackConsumer:
                 code=error.code,
                 reason=error.public_message,
             )
+            if result.status == "rejected_gap":
+                return self._retry(message_id, payload, code="VERSION_GAP",
+                    reason="an earlier feedback version has not been applied")
             cursor_advanced = result.cursor_advanced or result.status == "rejected_duplicate"
             terminal_status = result.status
         except MissingVectorError as exc:
@@ -1786,28 +1813,83 @@ class OrderedFeedbackConsumer:
                 reason="user-vector lock ownership was lost",
             )
 
-    def run_once(self) -> int:
-        self._refresh_heartbeat()
-        heartbeat_stop = threading.Event()
-        heartbeat_thread = threading.Thread(
-            target=self._heartbeat_loop,
-            args=(heartbeat_stop,),
-            name="feedback-v2-heartbeat",
-            daemon=True,
-        )
-        heartbeat_thread.start()
-        try:
-            processed = 0
-            for message_id, payload in self._messages():
-                if self._process_message(message_id, payload):
-                    processed += 1
-            return processed
-        finally:
-            heartbeat_stop.set()
-            heartbeat_thread.join(timeout=1)
+    def _scheduled_message(self, work: Work) -> bool:
+        if self._admission_stop.is_set():
+            return False
+        if isinstance(self.applier, OrderedFeedbackApplier):
+            # Read snapshots are immutable and scoped to their Redis response;
+            # install them on the actual worker thread, never user-ledger state.
+            previous = getattr(self.applier._repository_batches, "points", None)
+            self.applier._repository_batches.points = work.snapshot
+            try:
+                return self._process_message(work.message_id, work.payload)
+            finally:
+                self.applier._repository_batches.points = previous
+        return self._process_message(work.message_id, work.payload)
+
+    def run_once(self, *, wait: bool = True) -> int:
+        # Default drains for CLI/tests. The production loop keeps bounded lanes
+        # alive across live/reclaim polls, so one slow user does not hold a batch.
+        with self._poll_lock:
+            if self._closed or self._admission_stop.is_set():
+                return 0
             self._refresh_heartbeat()
+            heartbeat_stop = threading.Event()
+            heartbeat_thread = threading.Thread(target=self._heartbeat_loop,
+                args=(heartbeat_stop,), name="feedback-v2-heartbeat", daemon=True)
+            heartbeat_thread.start()
+            if self._scheduler is None:
+                self._scheduler = UserFeedbackScheduler(self._scheduled_message,
+                    workers=self.settings.consumer_workers,
+                    capacity=max(self.settings.consumer_workers, self.settings.read_batch_size))
+            scheduler = self._scheduler
+            try:
+                if scheduler.wait_capacity():
+                    for message_id, payload in self._messages():
+                        if self._admission_stop.is_set():
+                            break
+                        try:
+                            user_id = str(uuid.UUID(str(payload.get("user_id"))))
+                        except (TypeError, ValueError, AttributeError):
+                            user_id = f"invalid:{message_id}"
+                        snapshot = (getattr(self.applier._repository_batches, "points", None)
+                            if isinstance(self.applier, OrderedFeedbackApplier) else None)
+                        # Excess deliveries stay unacknowledged in Redis; no
+                        # unbounded executor or local backlog is created.
+                        work = Work(message_id, user_id, payload, snapshot)
+                        if wait:
+                            scheduler.wait_user(user_id)
+                        scheduler.submit(work)
+                if wait:
+                    scheduler.drain()
+                return scheduler.completed()
+            finally:
+                if wait:
+                    scheduler.close()
+                    self._scheduler = None
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1)
+                self._refresh_heartbeat()
+
+    def stop_admission(self) -> None:
+        self._admission_stop.set()
 
     def close(self) -> None:
+        self.stop_admission()
+        # Serialize close against polling. Keep heartbeats and dependency clients
+        # alive while already executing synchronous vector writes drain.
+        with self._poll_lock:
+            self._closed = True
+            if self._scheduler is not None:
+                stop = threading.Event()
+                heartbeat = threading.Thread(target=self._heartbeat_loop, args=(stop,), daemon=True)
+                heartbeat.start()
+                try:
+                    self._scheduler.close()
+                finally:
+                    stop.set()
+                    heartbeat.join(timeout=1)
+                    self._scheduler = None
         try:
             self.redis.eval(
                 HEARTBEAT_DELETE_LUA,
@@ -1836,13 +1918,14 @@ def main() -> None:
             "feedback consumer shutdown requested",
             extra={"feedback_context": {"status": "shutdown_requested", "signal": signum}},
         )
+        consumer.stop_admission()
         stop.set()
 
     signal.signal(signal.SIGTERM, request_shutdown)
     signal.signal(signal.SIGINT, request_shutdown)
     try:
         while not stop.is_set():
-            consumer.run_once()
+            consumer.run_once(wait=False)
     finally:
         consumer.close()
 
