@@ -1164,7 +1164,12 @@ async def submit_feedback(request: FeedbackBatch, http_request: Request):
             retryable=True,
             headers={"Retry-After": "1"},
         ) from exc
-    return {"accepted": accepted, "duplicates": duplicates, "durable": True}
+    # A completed producer call proves every requested event is durably accepted
+    # or already present. Error/timeout paths above must not infer partial ACKs.
+    return {
+        "accepted": accepted, "duplicates": duplicates, "durable": True,
+        "acknowledged_event_ids": [str(event.event_id) for event in request.events],
+    }
 
 
 @router.post("/repositories/embed", response_model=RepositoryIndexResponse, dependencies=[Depends(require_internal_secret)])
