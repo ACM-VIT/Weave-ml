@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 import tempfile
 
-from evaluation.benchmark_gates import Baseline, Policy, assess, qualification_manifest
+from evaluation.benchmark_gates import Baseline, Policy, assess, qualification_manifest, load_baseline
 from evaluation.embedding_artifacts import read_regular, decode_json
 from evaluation.recommendation_benchmark import Bundle, Run, evaluate
 
@@ -89,7 +89,7 @@ def main(argv=None):
             local_stage_replay = True
         else:
             run = Run.model_validate(raw_run)
-        baseline = Baseline.model_validate(read_json(args.baseline))
+        baseline = load_baseline(read_json(args.baseline))
         policy = Policy.model_validate(read_json(args.policy))
         report = evaluate(bundle, run, k=policy.k)
         assessment = assess(report, baseline, policy, qualify=args.qualify)
@@ -119,6 +119,13 @@ def main(argv=None):
                         from inference.feature_spec import EMBEDDING_DIM, FEATURE_COUNT, FEATURE_SPEC_VERSION, INPUT_DIM
                         expected_embedding = run.embedding.model_dump(mode='json')
                         if (manifest.get('embedding_identity') != expected_embedding
+                                or manifest.get('embedding_model') != run.embedding.model
+                                or manifest.get('embedding_model_revision') != run.embedding.revision
+                                or manifest.get('embedding_version') != run.embedding.recipe
+                                or not isinstance(manifest.get('compatible_embedding_versions'), list)
+                                or not manifest.get('compatible_embedding_versions')
+                                or any(not isinstance(version, str) or not version.strip() for version in manifest.get('compatible_embedding_versions', []))
+                                or run.embedding.recipe not in manifest.get('compatible_embedding_versions', [])
                                 or manifest.get('model_sha256') != run.model_sha256
                                 or manifest.get('scaler_sha256') != run.scaler_sha256
                                 or manifest.get('feature_spec_version') != run.feature_schema
