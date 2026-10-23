@@ -56,3 +56,40 @@ def test_actual_production_stages_compare_same_history_and_parent_refuses_forger
     with pytest.raises(ValueError):validate_model_comparison(cumulative,value)
     forged=deepcopy(result);forged['storage'][next(iter(forged['storage']))]['feedback_version']='9'
     with pytest.raises(ValueError):validate_model_comparison(forged,value)
+
+
+def test_new_dislike_updates_both_common_source_and_bundle_exclusions(tmp_path):
+    value=experiment();raw=value.model_dump(mode='json')
+    owner=raw['snapshot']['profiles'][0]['profile_id']
+    target=next(r['repo_id'] for r in raw['snapshot']['repositories'] if r['repo_id'] not in set(raw['snapshot']['bundle']['profiles'][0]['disliked'])|set(raw['snapshot']['bundle']['profiles'][0]['seen']))
+    for index,original in enumerate(raw['operations']):
+        operation=json.loads(original)
+        if operation['user_id']==owner and operation['kind']=='feedback':
+            event=json.loads(operation['operation']['original_feedback_json'])
+            event.update(repo_id=target,event_type='dislike')
+            operation['operation']['original_feedback_json']=canonical_json(event)
+            raw['operations'][index]=canonical_json(operation)
+            break
+    snapshots,_=derive_snapshots(FrozenModelHistory.model_validate(raw))
+    for snapshot in snapshots.values():
+        assert target in snapshot.bundle.profiles[0].disliked
+        assert snapshot.bundle.profiles[0].disliked==snapshot.bundle.dataset.profiles[0].disliked
+    assert snapshots['single_vector'].bundle==snapshots['long_session'].bundle
+
+    # Run the actual parent/worker CLI, preserving the immutable source history
+    # and requiring the newly disliked repository to disappear in both models.
+    import os,subprocess,sys
+    changed=FrozenModelHistory.model_validate(raw);before=changed.model_dump(mode='json')
+    source=tmp_path/'history.json';source.write_text(changed.model_dump_json())
+    output=tmp_path/'comparison.json'
+    result=subprocess.run([sys.executable,'-B','-m','scripts.compare_user_models',
+        '--experiment',str(source),'--output',str(output)],cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ,'OPENBLAS_NUM_THREADS':'1','OMP_NUM_THREADS':'1','MKL_NUM_THREADS':'1'},
+        capture_output=True,text=True,timeout=60)
+    assert result.returncode==0,result.stdout+result.stderr
+    assert changed.model_dump(mode='json')==before
+    report=json.loads(output.read_text());assert report['qualified'] is False
+    for condition in report['results'].values():
+        for profile in condition['execution']['run']['outputs']:
+            if profile['profile_id']==owner:
+                assert all(target not in [row['repo_id'] for row in rows] for rows in profile['stages'].values())

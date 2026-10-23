@@ -143,6 +143,10 @@ def derive_snapshots(experiment):
             for profile in snapshot['bundle']['profiles']:
                 if profile['profile_id'] == owner:
                     profile['disliked'] = sorted(set(profile['disliked']) | set(view.explicit_negative_repo_ids))
+                    if snapshot['bundle'].get('dataset') is not None:
+                        for source in snapshot['bundle']['dataset']['profiles']:
+                            if source['profile_id'] == owner:
+                                source['disliked'] = list(profile['disliked'])
             storage[owner] = {'legacy_bytes': len(model.canonical({'vector':list(legacy[owner].vector),'payload':dict(legacy[owner].payload)})),
                               'model_state_bytes': len(model.state_bytes(state)), 'feedback_version': str(state.feedback_version),
                               'operation_version': str(state.operation_version), 'state_sha256': model.state_sha256(state)}
