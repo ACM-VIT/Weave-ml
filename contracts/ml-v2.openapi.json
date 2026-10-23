@@ -2325,6 +2325,12 @@
         "in": "header",
         "name": "x-internal-secret",
         "type": "apiKey"
+      },
+      "ScoringCaptureCapability": {
+        "description": "Required in addition to InternalSecret only for explicitly negotiated scoring_capture requests.",
+        "in": "header",
+        "name": "x-scoring-capture-capability",
+        "type": "apiKey"
       }
     }
   },
@@ -2452,7 +2458,16 @@
         "summary": "Generate Recommendations",
         "tags": [
           "v2"
-        ]
+        ],
+        "x-scoring-capture-security": {
+          "required_when": "scoring_capture is provided",
+          "security": [
+            {
+              "InternalSecret": [],
+              "ScoringCaptureCapability": []
+            }
+          ]
+        }
       }
     },
     "/api/v2/repositories/embed": {

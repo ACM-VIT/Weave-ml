@@ -33,6 +33,12 @@ def test_export_is_deterministic_and_does_not_enter_runtime():
         assert schema['info']['x-online-product-database-access'] is False
         for path in PRODUCT_PATHS:
             assert schema['paths'][path]['post']['security'] == [{'InternalSecret': []}]
+        operation = schema['paths']['/api/v2/recommendations/generate']['post']
+        capability = [p for p in operation['parameters'] if p['name'] == 'x-scoring-capture-capability']
+        assert len(capability) == 1 and capability[0]['required'] is False
+        assert operation['x-scoring-capture-security']['security'] == [
+            {'InternalSecret': [], 'ScoringCaptureCapability': []}]
+        assert set(schema['components']['schemas']['ScoringCaptureRequest']['required']) == {'schema_version', 'encoding'}
     ''')
     subprocess.run(
         [sys.executable, '-c', guarded_export], check=True,
