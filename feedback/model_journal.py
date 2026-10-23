@@ -208,11 +208,26 @@ class Coordinator:
             'state_sha256': reducer.state_sha256(snapshot.state), 'state': _pack(snapshot.state),
             'complete_base64': base64.b64encode(snapshot.complete).decode(), 'policy_sha256': self.policy.sha256})
 
+    def _complete_for(self, state, legacy_bytes):
+        limit = self.journal.limits.combined_user_bytes
+        if type(legacy_bytes) is bytes and len(legacy_bytes) > limit:
+            raise reducer.StateOverflow('combined compatibility state exceeds byte budget')
+        legacy = _json(legacy_bytes, limit)
+        complete = _canonical({'schema_version': 1, 'user_id': state.user_id, 'state': _pack(state), 'legacy': legacy})
+        if len(complete) > limit:
+            raise reducer.StateOverflow('combined complete state exceeds byte budget')
+        _json(complete, limit)
+        validator = getattr(self.users, 'validate_desired', None)
+        if validator is not None:
+            # A real SHA256 head always has exactly these 64 unescaped bytes.
+            # It is not committed authority; this IO-free probe checks the SAME
+            # full vector/payload/base64 encoding used by the final CAS.
+            validator(Snapshot(state.user_id, state, '0' * 64, complete))
+        return complete
+
     def _commit_transition(self, before, operation, input_sha, legacy, assert_lock, *, insert=False, disposition='applied'):
         after = reducer.reduce_operation(before.state, operation, self.policy)
-        complete = _canonical({'schema_version': 1, 'user_id': before.user_id, 'state': _pack(after),
-                               'legacy': _json(legacy, self.journal.limits.combined_user_bytes)})
-        _json(complete, self.journal.limits.combined_user_bytes)
+        complete = self._complete_for(after, legacy)
         complete_sha = self.journal.put('complete', json.loads(complete))
         row = {'user_id': before.user_id, 'previous_head': before.head,
             'previous_state_sha256': reducer.state_sha256(before.state), 'operation_version': after.operation_version,
@@ -318,19 +333,18 @@ class Coordinator:
         if header.operation_version<=before.state.operation_version:
             committed=self._prove_committed(before,input_sha,header.operation_version)
             return 'rejected_duplicate' if committed.get('disposition')=='rejected' else 'duplicate'
-        disposition='applied'
+        disposition = 'applied'
         try:
-            after_state=reducer.reduce_operation(before.state,operation,self.policy)
+            after_state = reducer.reduce_operation(before.state, operation, self.policy)
+            complete = self._complete_for(after_state, legacy_prepare(before.complete, operation))
         except reducer.StateOverflow:
-            if not self.reject_capacity:raise
-            after_state=reducer.reject_capacity(before.state,operation,self.policy)
-            disposition='rejected'
-        # Pure callback must return ALL compatibility vector/profile/feedback
-        # payloads. Integration must not call the old mutating applier here.
-        callback=self.legacy_reject if disposition=='rejected' else legacy_prepare
-        legacy=_json(callback(before.complete,operation),self.journal.limits.combined_user_bytes)
-        complete=_canonical({'schema_version':1,'user_id':header.user_id,'state':_pack(after_state),'legacy':legacy})
-        _json(complete,self.journal.limits.combined_user_bytes)
+            if not self.reject_capacity:
+                raise
+            after_state = reducer.reject_capacity(before.state, operation, self.policy)
+            # This rejection is checked against the very same complete/persisted
+            # byte bound. If it cannot fit, no prepare/DLQ/CAS/ACK is authorized.
+            complete = self._complete_for(after_state, self.legacy_reject(before.complete, operation))
+            disposition = 'rejected'
         complete_sha=self.journal.put('complete',json.loads(complete))
         prepared={'user_id':header.user_id,'previous_head':before.head,
                   'previous_state_sha256':reducer.state_sha256(before.state),
@@ -365,14 +379,14 @@ class Coordinator:
     def rejection_status(self, prepare_sha):
         """A DLQ prepare has no authority until reachable from the user head."""
         prepared = self.journal.get(prepare_sha, 'prepare')
-        if prepared.get('disposition') != 'rejected':
+        if prepared.get('disposition') not in {'rejected', 'withdrawn_profile'}:
             raise JournalConflict('requested prepare is not a rejection')
         snapshot = self.users.read(prepared['user_id'])
         self._validate_snapshot(snapshot)
         if snapshot.state.operation_version < prepared['operation_version']:
             return 'prepared_not_committed'
         committed = self._prove_committed(snapshot, prepared['input_sha256'], prepared['operation_version'])
-        return 'committed_rejection' if committed == prepared else 'prepared_not_committed'
+        return ('committed_withdrawal' if prepared['disposition'] == 'withdrawn_profile' else 'committed_rejection') if committed == prepared else 'prepared_not_committed'
 
     def checkpoint(self,user_id):
         return self._checkpoint_snapshot(self.users.read(_uuid(user_id)))
@@ -492,6 +506,9 @@ class QdrantAtomicUsers:
         # and base64 expansion, against the one shared user-state budget.
         if len(_canonical({'vector':vector,'payload':payload}))>self.limit: raise reducer.StateOverflow('combined persisted user point exceeds byte budget')
         return vector,payload
+    def validate_desired(self, snapshot):
+        self._point(snapshot)
+
     def read_optional(self, user_id):
         rows = self.client.retrieve(collection_name=self.collection, ids=[_uuid(user_id)], with_payload=True, with_vectors=True)
         if not rows:

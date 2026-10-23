@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from feedback import long_session as model
 from feedback.model_journal import Coordinator, JournalConflict, OriginalIdentityConflict, _canonical, _json
 from feedback.model_wire import decimal, WireWithdrawal
-from feedback.v2 import FeedbackStateError, MissingVectorError
+from feedback.v2 import FeedbackStateError, MissingVectorError, FeedbackStateLimitError, TrackedRepositoryLimitError
 from scripts.user_onboarding import _has_feedback_state, _is_feedback_payload_key
 from config import REPOSITORY_EMBEDDING_MODEL, EMBEDDING_MODEL_REVISION
 
@@ -93,7 +93,10 @@ class ModelProcessor:
                 if operation.repository is None or repo_id != operation.repository.subject_id or dimension != 384:
                     raise JournalConflict('legacy computation requested an unpinned repository')
                 return operation.repository.vector
-            result, point = self.legacy.prepare(wire.feedback, user=user, repository_vector=pinned_vector)
+            try:
+                result, point = self.legacy.prepare(wire.feedback, user=user, repository_vector=pinned_vector)
+            except (FeedbackStateLimitError, TrackedRepositoryLimitError) as exc:
+                raise model.StateOverflow('legacy compatibility capacity exceeded') from exc
             if result.status != 'applied' or point is None:
                 raise FeedbackStateError('legacy feedback predecessor was not applied')
             legacy = {'vector': list(point.vector), 'payload': dict(point.payload)}

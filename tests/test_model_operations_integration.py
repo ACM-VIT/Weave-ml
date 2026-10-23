@@ -552,3 +552,68 @@ def test_registered_withdrawal_and_status_report_only_committed_proof(runtime,mo
     wrong=client.post('/api/v2/model-operation-status',headers=headers,json={**request,'source_envelope_sha256':'f'*64})
     assert wrong.status_code==409
     assert client.post('/api/v2/model-operation-withdrawals',json={'schema_version':1,'withdrawals':[{'withdrawal_json':attestation}]}).status_code==401
+
+
+def test_full_persisted_point_capacity_rejects_once_and_unblocks_next_feedback(runtime):
+    from feedback.model_journal import Snapshot,_canonical,_pack
+    initialize(runtime);p=runtime.policy;before=runtime.users.read(uid(1))
+    raw=wire(p,'feedback',3,feedback_payload());incoming=parse(raw,p);operation=runtime.processor._resolve(incoming)
+    after_state=model.reduce_operation(before.state,operation,p)
+    legacy=json.loads(runtime.processor._legacy_prepare(incoming,before.complete,operation))
+    complete=_canonical({'schema_version':1,'user_id':uid(1),'state':_pack(after_state),'legacy':legacy})
+    probe=Snapshot(uid(1),after_state,'0'*64,complete)
+    rejected=model.reject_capacity(before.state,operation,p)
+    reject_complete=_canonical({'schema_version':1,'user_id':uid(1),'state':_pack(rejected),
+        'legacy':json.loads(runtime.processor._legacy_reject(before.complete,operation))})
+    def size(snapshot):
+        vector,payload=runtime.users._point(snapshot)
+        return len(_canonical({'vector':vector,'payload':payload}))
+    prior_bytes,applied_bytes,reject_bytes=size(before),size(probe),size(Snapshot(uid(1),rejected,'0'*64,reject_complete))
+    tight=max(prior_bytes,reject_bytes,len(complete))+128
+    assert tight<applied_bytes and len(model.state_bytes(after_state))<p.max_state_bytes
+    print({'prior_point_bytes':prior_bytes,'applied_complete_bytes':len(complete),'applied_point_bytes':applied_bytes,
+           'rejected_point_bytes':reject_bytes,'configured_combined_limit':tight})
+    runtime.users.limit=tight
+    runtime.journal.limits=replace(runtime.journal.limits,combined_user_bytes=tight)
+    runtime.stream.admit(raw)
+    assert runtime.consumer().run_once()==1
+    actual=runtime.users.read(uid(1))
+    assert actual.state.feedback_version==1 and actual.state.long_entries==before.state.long_entries
+    row=runtime.journal.get(actual.head,'prepare');assert row['disposition']=='rejected'
+    assert runtime.processor.coordinator.rejection_status(actual.head)=='committed_rejection'
+    assert runtime.redis.xlen(runtime.stream.limits.namespace+':dlq')==1
+    assert size(actual)<=tight
+    # A duplicate never mutates again, and the next valid small inverse moves
+    # the lane forward instead of remaining behind the rejected large event.
+    assert runtime.processor(incoming,lambda:None)=='rejected_duplicate'
+    apply(runtime,wire(p,'feedback',4,feedback_payload(2,kind='unsave')))
+    assert runtime.users.read(uid(1)).state.feedback_version==2
+
+
+def test_rejection_that_cannot_fit_stays_pending_without_dlq_cas_or_ack(runtime):
+    from feedback.model_journal import _canonical
+    initialize(runtime);before=runtime.users.read(uid(1))
+    vector,payload=runtime.users._point(before);tight=len(_canonical({'vector':vector,'payload':payload}))
+    runtime.users.limit=tight;runtime.journal.limits=replace(runtime.journal.limits,combined_user_bytes=tight)
+    raw=wire(runtime.policy,'feedback',3,feedback_payload());runtime.stream.admit(raw)
+    with pytest.raises(model.StateOverflow):runtime.consumer().run_once()
+    assert runtime.users.read(uid(1))==before
+    assert runtime.redis.xlen(runtime.stream.stream)==1
+    assert runtime.redis.xpending(runtime.stream.stream,runtime.stream.group)['pending']==1
+    assert runtime.redis.xlen(runtime.stream.limits.namespace+':dlq')==0
+
+
+def test_known_legacy_capacity_is_terminal_but_corruption_is_not_misclassified(runtime):
+    initialize(runtime);before=runtime.users.read(uid(1));legacy=json.loads(before.complete)['legacy']
+    runtime.legacy.settings=replace(runtime.legacy.settings,max_user_state_bytes=runtime.legacy._feedback_state_bytes(legacy['payload'])+1)
+    apply(runtime,wire(runtime.policy,'feedback',3,feedback_payload()))
+    after=runtime.users.read(uid(1));assert after.state.feedback_version==1 and not after.state.long_entries
+    assert runtime.journal.get(after.head,'prepare')['disposition']=='rejected'
+    # A corrupt persisted complete-point relationship is an unavailable
+    # dependency, not another capacity rejection or an implicit cursor skip.
+    runtime.qdrant.set_payload(runtime.settings.user_collection,payload={'feedback_latent_vector':['corrupt']},points=[uid(1)],wait=True)
+    runtime.stream.admit(wire(runtime.policy,'feedback',4,feedback_payload(2,kind='unsave')))
+    with pytest.raises(JournalConflict):runtime.consumer().run_once()
+    assert runtime.redis.xlen(runtime.stream.limits.namespace+':dlq')==1
+    raw=runtime.qdrant.retrieve(runtime.settings.user_collection,ids=[uid(1)],with_payload=True,with_vectors=False)[0]
+    assert raw.payload['model_operation_version']==3
