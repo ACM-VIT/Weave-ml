@@ -30,6 +30,8 @@ dev = [
 
 [tool.uv]
 package = false
+# GHSA-6q48-6c7w-9gw2: exclude compromised emSign ECC G3 from runtime TLS.
+constraint-dependencies = ["certifi>=2026.10.19"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
