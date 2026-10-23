@@ -6,7 +6,8 @@ Candidate scores/support are derived upstream; no social records are invented.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import hashlib
 import math
 from typing import Annotated, Literal
 import uuid
@@ -62,6 +63,7 @@ class SocialPolicy:
     max_per_owner: int = 2
     max_per_source: int = 8
     minimum_collaborative_support: int = 2
+    traffic_percent: float = 100.
 
     def __post_init__(self):
         if self.mode not in {'disabled', 'shadow', 'enabled'}:
@@ -72,8 +74,18 @@ class SocialPolicy:
                 raise ValueError(f'{name} must be an integer from 1 to 100')
         if self.max_candidates > self.max_lookup:
             raise ValueError('selection quota cannot exceed lookup budget')
+        if isinstance(self.traffic_percent, bool) or not isinstance(self.traffic_percent, (int, float)) or not math.isfinite(self.traffic_percent) or not 0 <= self.traffic_percent <= 100:
+            raise ValueError('social traffic percentage must be between zero and 100')
         if self.minimum_collaborative_support < 2:
             raise ValueError('collaborative candidates need at least two supporters')
+
+    def for_user(self, user_id: str):
+        if self.mode == 'disabled' or self.traffic_percent >= 100:
+            return self
+        canonical = str(uuid.UUID(user_id))
+        digest = hashlib.blake2b(f'social-candidate-v1:{canonical}'.encode(), digest_size=8).digest()
+        included = int.from_bytes(digest, 'big') % 10000 < round(self.traffic_percent * 100)
+        return self if included else replace(self, mode='disabled')
 
     @property
     def injects(self):

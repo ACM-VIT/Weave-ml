@@ -185,3 +185,17 @@ def test_registered_http_contract_accepts_backend_evidence_and_returns_source_sc
     body['social_candidates'].append(row.model_dump())
     assert client.post('/api/v2/recommendations/generate', headers={'x-internal-secret':'isolated-social-contract'}, json=body).status_code == 422
     assert len(seen) == 1
+
+
+def test_rollout_cohort_is_stable_request_local_and_can_be_disabled_without_reads():
+    policy = SocialPolicy(mode='enabled', traffic_percent=50.)
+    users = [str(uuid.UUID(int=i)) for i in range(1, 101)]
+    decisions = [policy.for_user(user).injects for user in users]
+    assert any(decisions) and not all(decisions)
+    assert decisions == [policy.for_user(user.upper()).injects for user in users]
+    assert policy.mode == 'enabled'  # No previous user's decision mutates shared state.
+    off = replace(policy, traffic_percent=0.)
+    for user in users[:5]:
+        assert lookup_social_ids([candidate(1)], off.for_user(user), set()) == []
+    for invalid in [True, -1., 101., float('nan')]:
+        with pytest.raises(ValueError): replace(policy, traffic_percent=invalid)

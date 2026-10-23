@@ -244,6 +244,7 @@ class QdrantV2Retriever:
         self.max_candidates = max(50, min(max_candidates, 2_000))
         self.social_policy = social_policy or SocialPolicy(
             mode=os.getenv("V2_SOCIAL_CANDIDATE_MODE", "disabled").strip().casefold(),
+            traffic_percent=self._float_env("V2_SOCIAL_CANDIDATE_TRAFFIC_PERCENT", default=100., minimum=0., maximum=100.),
         )
         self.app_env = os.getenv("APP_ENV", "development").strip().casefold()
         if assembler is None:
@@ -1630,8 +1631,9 @@ class QdrantV2Retriever:
         ] = {}
         budget = self._candidate_read_budget()
         heavy_selected = self._heavy_ranker_selected(user_id)
+        social_policy = self.social_policy.for_user(user_id)
         social_rows = social_candidates or []
-        social_ids = lookup_social_ids(social_rows, self.social_policy, excluded)
+        social_ids = lookup_social_ids(social_rows, social_policy, excluded)
         social_ids = social_ids[:budget.reserve(len(social_ids))] if social_ids else []
         social_points: dict[str, _EligibleRepositoryPoint] = {}
         discovery_plan = _DiscoveryPlan(budget=budget)
@@ -1731,7 +1733,7 @@ class QdrantV2Retriever:
                         minimum_candidates=limit, existing_repo_ids=set(candidates),
                     )
                 except RetrievalDependencyError:
-                    if not candidates and not (self.social_policy.injects and social_points):
+                    if not candidates and not (social_policy.injects and social_points):
                         raise
                     discovery_points = []
         finally:
@@ -1780,14 +1782,14 @@ class QdrantV2Retriever:
             )
         }
         selected_social = select_social_candidates(
-            social_rows, self.social_policy, eligible_repo_ids=compatible_social, excluded=excluded,
+            social_rows, social_policy, eligible_repo_ids=compatible_social, excluded=excluded,
         )[:self.max_candidates]
         reserved_social = set()
         if selected_social:
-            key = "social_injected_candidates" if self.social_policy.injects else "social_shadow_candidates"
+            key = "social_injected_candidates" if social_policy.injects else "social_shadow_candidates"
             with self._counter_lock:
                 self._ranking_counters[key] = min(_COUNTER_LIMIT, self._ranking_counters[key] + len(selected_social))
-        if self.social_policy.injects:
+        if social_policy.injects:
             maximum = max((row.fusion_score for row in selected_social), default=1.)
             for row in selected_social:
                 current = candidates.get(row.repo_id)
@@ -2078,6 +2080,7 @@ class QdrantV2Retriever:
             "hybrid_fallback_model_version": self.hybrid_model_version,
             "ranking_counters": self._ranking_counter_snapshot(),
             "social_candidate_mode": self.social_policy.mode,
+            "social_candidate_traffic_percent": self.social_policy.traffic_percent,
         }
         if self.ranker_error:
             health["heavy_ranker_error"] = self.ranker_error
