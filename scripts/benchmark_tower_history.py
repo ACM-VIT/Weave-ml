@@ -36,8 +36,15 @@ class ControlEncoder:
 
 
 def git(repository, *args, input=None):
-    return subprocess.run(['git', '-C', str(repository), *args], input=input,
-                          check=True, capture_output=True).stdout
+    # Git subprocess transports bypass Python socket guards. Missing promisor
+    # objects must fail locally, not trigger a hidden partial-clone fetch.
+    # Unsupported Git versions reject the option rather than trying a fetch.
+    try:
+        return subprocess.run(['git', '--no-lazy-fetch', '--no-pager', '-C', str(repository), *args], input=input,
+            env={**os.environ, 'GIT_NO_LAZY_FETCH': '1', 'GIT_TERMINAL_PROMPT': '0'},
+            check=True, capture_output=True, timeout=15).stdout
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError('local-only Git read failed; required objects must already exist (lazy fetching disabled)') from exc
 
 
 def snapshots(repository, *, ref, limit=40, path='README.md', changes_only=False):

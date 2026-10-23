@@ -132,3 +132,33 @@ def test_nonregular_readme_entries_are_explicitly_skipped(history, mode, changes
     assert frozen == commit and rows == []
     assert skipped == [{'commit': commit, 'reason': 'README is not a regular file'}]
     assert replay(rows)['readme_tower_reuse_ratio'] is None
+
+
+def test_missing_promisor_readme_never_invokes_git_transport(tmp_path, monkeypatch):
+    import os
+    repo = tmp_path / 'partial'
+    repo.mkdir()
+    def raw_git(*args, data=None):
+        return subprocess.check_output(['git', *args], cwd=repo, input=data, text=True).strip()
+    raw_git('init', '--quiet')
+    blob = raw_git('hash-object', '-w', '--stdin', data='README content')
+    raw_git('config', 'remote.origin.url', 'proof::missing')
+    raw_git('config', 'remote.origin.promisor', 'true')
+    raw_git('config', 'extensions.partialClone', 'origin')
+    (repo / '.git' / 'objects' / blob[:2] / blob[2:]).unlink()
+    helper = tmp_path / 'git-remote-proof'
+    marker = tmp_path / 'transport-invoked'
+    helper.write_text('#!/bin/sh\nprintf attempted > "$PROOF_MARKER"\nexit 1\n')
+    helper.chmod(0o755)
+    monkeypatch.setenv('PATH', str(tmp_path) + os.pathsep + os.environ['PATH'])
+    monkeypatch.setenv('PROOF_MARKER', str(marker))
+    with pytest.raises(RuntimeError, match='lazy fetching disabled'):
+        git(repo, 'show', blob)
+    assert not marker.exists()
+    # The same actual missing object invokes transport without the guard;
+    # absence above cannot be explained by an inert promisor fixture.
+    env = dict(os.environ)
+    env.pop('GIT_NO_LAZY_FETCH', None)
+    subprocess.run(['git', 'show', blob], cwd=repo, env=env,
+                   capture_output=True, text=True, timeout=15, check=False)
+    assert marker.read_text() == 'attempted'
