@@ -104,3 +104,47 @@ def test_holdout_temporal_boundaries_are_validated():
     b['provenance'].update(observation_cutoff='2026-10-23T00:00:00Z',
         label_horizon_end='2026-10-24T00:00:00Z', ingestion_watermark='2026-10-23T12:00:00Z')
     with pytest.raises(ValueError, match='horizon'): Bundle.model_validate(b)
+
+
+def qualification_fixture():
+    """Invented declarations exercise gate mechanics only, never real qualification."""
+    from evaluation.benchmark_gates import DIRECTIONS, STAGES
+    result = report()
+    result['provenance'].update(kind='human_judgment', reference='test-only invented declaration')
+    result['artifact']['timing_kind'] = 'measured'
+    policy = Policy.model_validate(dict(schema_version=1, policy_id='test-only-complete',
+        reference='Invented gate mechanics fixture, not production thresholds', k=3, min_profiles=2,
+        rules=[dict(stage=stage, metric=metric, max_regression=0.,
+                    **({'minimum': 0.} if direction == 'higher' else {'maximum': 1000.}))
+               for stage in STAGES for metric, direction in DIRECTIONS.items()]))
+    baseline = Baseline.model_validate(dict(schema_version=1, status='promoted', reference='test-only',
+        policy_sha256=digest(policy), report_sha256=digest(result), report=result))
+    return result, policy, baseline
+
+
+def test_test_only_complete_qualification_produces_bound_manifest():
+    result, policy, baseline = qualification_fixture()
+    assessment = assess(result, baseline, policy, qualify=True)
+    assert assessment['passed'], assessment['failures']
+    manifest = qualification_manifest(result, baseline, policy)
+    assert manifest['report_sha256'] == digest(result)
+    assert manifest['assessment_sha256'] == digest(assessment)
+    assert manifest['data_snapshot_sha256'] == result['bundle_sha256']
+    assert manifest['model_artifact'] == result['artifact']
+
+
+@pytest.mark.parametrize('metric', ['judged_recall_at_k', 'latency_p95_ms'])
+def test_qualification_rejects_required_gate_with_wrong_direction_only(metric):
+    result, policy, baseline = qualification_fixture()
+    raw = policy.model_dump()
+    rule = next(r for r in raw['rules'] if r['stage'] == 'assembly' and r['metric'] == metric)
+    if metric == 'latency_p95_ms':
+        rule['maximum'], rule['minimum'] = None, 0.
+        expected = 'maximum'
+    else:
+        rule['minimum'], rule['maximum'] = None, 1.
+        expected = 'minimum'
+    changed = Policy.model_validate(raw)
+    baseline = baseline.model_copy(update={'policy_sha256': digest(changed)})
+    assessment = assess(result, baseline, changed, qualify=True)
+    assert assessment['failures'] == [f'assembly.{metric}: qualification requires {expected}']

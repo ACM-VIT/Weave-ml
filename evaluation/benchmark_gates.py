@@ -182,6 +182,11 @@ def assess(report: dict, baseline: Baseline, policy: Policy, *, qualify: bool = 
         indexed = {(r.stage, r.metric): r for r in policy.rules}
         if not required <= set(indexed):
             failures.append('qualification policy omits required quality/diversity/latency/compatibility gates')
+        for stage, metric in sorted(required & set(indexed)):
+            rule = indexed[(stage, metric)]
+            required_limit = 'minimum' if DIRECTIONS[metric] == 'higher' else 'maximum'
+            if getattr(rule, required_limit) is None:
+                failures.append(f'{stage}.{metric}: qualification requires {required_limit}')
         for stage in STAGES:
             metrics = candidate.stages[stage].metrics
             for name in SAFETY:
