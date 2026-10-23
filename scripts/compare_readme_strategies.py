@@ -16,6 +16,28 @@ from typing import Any, Callable
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+def _source_hashes():
+    root=Path(__file__).resolve().parents[1]
+    names=subprocess.check_output(["git","--no-lazy-fetch","ls-files","-z","--","*.py","pyproject.toml","uv.lock"],
+        cwd=root,env={**os.environ,"GIT_NO_LAZY_FETCH":"1","GIT_TERMINAL_PROMPT":"0"},text=True,timeout=15).split("\0")
+    paths={name for name in names if name}
+    paths.update(("scripts/compare_readme_strategies.py","evaluation/readme_experiment.py"))
+    return {name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in sorted(paths)}
+
+
+# Worker source identity is captured before importing any project parser.
+_IMPORTED_SOURCE_SHA256 = None
+if __name__ == "__main__" and "--worker" in sys.argv:
+    try:
+        _IMPORTED_SOURCE_SHA256 = _source_hashes()
+    except Exception:
+        _IMPORTED_SOURCE_SHA256 = {}
+
+
+def _source_digest(value):
+    return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",", ":")).encode()).hexdigest()
+
+
 from acquisition.github_graphql_client import (
     FetchedReadme, GitHubGraphQLClient, build_readme_base_url,
 )
@@ -139,7 +161,10 @@ def compare_repository(repository: str, measurement: Measurement, *, strategies=
     reference_elapsed_ms = (time.perf_counter()-reference_started)*1000
     data = response.get("data")
     repo = data.get("repository") if isinstance(data, dict) else None
-    if response.get("errors") or not isinstance(repo, dict) or repo.get("visibility") != "PUBLIC":
+    if response.get("errors"):
+        return {"repository": repository, "status": "reference_failed",
+                "shared_reference_requests": shared_reference_requests,"shared_reference_elapsed_ms":reference_elapsed_ms}
+    if not isinstance(repo, dict) or repo.get("visibility") != "PUBLIC":
         return {"repository": repository, "status": "unresolved_or_nonpublic",
                 "shared_reference_requests": shared_reference_requests,"shared_reference_elapsed_ms":reference_elapsed_ms}
     ref = repo.get("defaultBranchRef")
@@ -191,13 +216,6 @@ def compare_repository(repository: str, measurement: Measurement, *, strategies=
     return result
 
 
-def _source_hashes():
-    root=Path(__file__).resolve().parents[1]
-    names=subprocess.check_output(["git","--no-lazy-fetch","ls-files","-z","--","*.py","pyproject.toml","uv.lock"],
-        cwd=root,env={**os.environ,"GIT_NO_LAZY_FETCH":"1","GIT_TERMINAL_PROMPT":"0"},text=True,timeout=15).split("\0")
-    paths={name for name in names if name}
-    paths.update(("scripts/compare_readme_strategies.py","evaluation/readme_experiment.py"))
-    return {name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in sorted(paths)}
 
 
 def _live_worker(args,repos,sample_sha256):
@@ -208,6 +226,10 @@ def _live_worker(args,repos,sample_sha256):
     timer=start_worker_watchdog()
     try:
         before=_source_hashes()
+        if (_IMPORTED_SOURCE_SHA256 is not None and _IMPORTED_SOURCE_SHA256 != before
+                or getattr(args,"expected_source_sha256",None) is not None
+                and _source_digest(before) != args.expected_source_sha256):
+            raise ReadmeExperimentError("CONFIG")
         token=os.environ.get(args.token_env,"")
         transport=LiveGitHubTransport(token)
         transport.verify_identity()
@@ -242,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output",type=Path,help="new private report path; existing evidence is never overwritten")
     parser.add_argument("--worker",action="store_true",help=argparse.SUPPRESS)
     parser.add_argument("--sample-sha256",help=argparse.SUPPRESS)
+    parser.add_argument("--expected-source-sha256",help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
         repos,sample_sha256 = _load_sample_snapshot(args.sample)
@@ -252,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
     if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}",args.token_env) is None:
         parser.error("token variable name is invalid")
     if args.worker:
-        if not args.execute_approved or args.sample_sha256!=sample_sha256:
+        if not args.execute_approved or args.sample_sha256!=sample_sha256 or not args.expected_source_sha256:
             parser.error("worker requires exact frozen sample execution")
         return _live_worker(args,repos,sample_sha256)
     if not args.execute_approved:
@@ -269,10 +292,14 @@ def main(argv: list[str] | None = None) -> int:
             except FileNotFoundError:pass
             else:raise FileExistsError()
             if not args.output.parent.is_dir():raise ReadmeExperimentError("CONFIG")
+        expected_source=_source_hashes()
+        command.extend(["--expected-source-sha256",_source_digest(expected_source)])
         child=subprocess.run(command,capture_output=True,text=True,timeout=180,check=False)
         if child.returncode or len(child.stdout.encode())>1024*1024:
             raise ReadmeExperimentError()
         report=json.loads(child.stdout)
+        if report.get("source_sha256") != expected_source:
+            raise ReadmeExperimentError("CONFIG")
         if args.output:publish_new_report(args.output,report)
         else:print(json.dumps(report,indent=2,allow_nan=False))
         return 0

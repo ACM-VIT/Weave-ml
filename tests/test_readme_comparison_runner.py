@@ -112,6 +112,7 @@ def test_failed_worker_never_overwrites_report_or_prints_private_stderr(tmp_path
         assert 'private-token' not in command
         if fault=='timeout':raise subprocess.TimeoutExpired(command,180)
         return SimpleNamespace(returncode=2 if fault=='child_error' else 0,stdout='not-json',stderr='private-token and provider content')
+    monkeypatch.setattr(comparison,'_source_hashes',lambda:{'source':'stable'})
     monkeypatch.setattr(comparison.subprocess,'run',child)
     assert comparison.main(['--sample',str(path),'--execute-approved','--output',str(output)])==2
     assert calls and not output.exists()
@@ -132,6 +133,8 @@ def test_worker_cannot_execute_a_sample_different_from_parent_snapshot(tmp_path,
 
 def test_actual_cli_parent_and_worker_publish_owned_http_measurement(tmp_path):
     """Real CLI processes/parsers/files; loopback HTTP replaces GitHub TLS only."""
+    from tests.test_tower_history import require_local_only_git
+    require_local_only_git()
     fixture=Fixture({'README.md':'private canonical fixture content must never be exported'})
     calls=[]
     token='owned-loopback-fixture-credential'
@@ -178,3 +181,41 @@ def test_actual_cli_parent_and_worker_publish_owned_http_measurement(tmp_path):
     finally:
         server.shutdown();server.server_close();thread.join(timeout=2)
         assert not thread.is_alive()
+
+
+def test_reference_graphql_errors_count_as_failures_and_preserve_reference_costs():
+    from evaluation.readme_experiment import summarize_trials
+    def failed(query, variables):
+        return {'data':{'repository':None,'rateLimit':{'cost':None,'remaining':1000}},
+                'errors':[{'message':'private provider details'}]}
+    trial=comparison.compare_repository('Example/project',comparison.Measurement(failed))
+    report=summarize_trials([trial])
+    assert report['failed_trials']==report['reference_failed_trials']==1
+    assert report['failure_rate_of_all_trials']==1
+    costs=report['shared_reference_totals']
+    assert costs['graphql_calls']==1
+    assert costs['rate_cost'] is None
+    assert costs['normalized_json_bytes']>0
+    assert costs['wire_bytes'] is None
+    assert 'private provider details' not in json.dumps([trial,report])
+
+
+def test_worker_refuses_source_changed_since_import_before_any_transport(monkeypatch,capsys):
+    monkeypatch.setattr(comparison,'_IMPORTED_SOURCE_SHA256',{'source':'old'},raising=False)
+    monkeypatch.setattr(comparison,'_source_hashes',lambda:{'source':'new'})
+    monkeypatch.setattr(comparison,'LiveGitHubTransport',lambda *a:pytest.fail('source drift reached network'))
+    args=SimpleNamespace(repeats=1,token_env='NO_TOKEN')
+    assert comparison._live_worker(args,['Example/project'],'f'*64)==2
+    assert not capsys.readouterr().out
+
+
+def test_parent_passes_source_identity_before_child_and_refuses_other_source(tmp_path,monkeypatch):
+    source={'source':'parent-frozen'}
+    monkeypatch.setattr(comparison,'_source_hashes',lambda:dict(source))
+    def child(command,**options):
+        assert command[command.index('--expected-source-sha256')+1]==comparison._source_digest(source)
+        return SimpleNamespace(returncode=0,stdout=json.dumps({'source_sha256':{'source':'other'}}),stderr='')
+    monkeypatch.setattr(comparison.subprocess,'run',child)
+    output=tmp_path/'report.json'
+    assert comparison.main(['--sample',str(sample(tmp_path)),'--execute-approved','--output',str(output)])==2
+    assert not output.exists()

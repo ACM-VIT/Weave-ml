@@ -268,14 +268,23 @@ def summarize_trials(trials):
         result[strategy]["transport_latency_samples"]=len(pure_transport_ms)
         result[strategy]["transport_p50_ms"]=_percentile(pure_transport_ms,.5)
         result[strategy]["transport_p95_ms"]=_percentile(pure_transport_ms,.95)
+    reference_calls=[call for trial in trials for call in trial.get("shared_reference_requests", [])]
+    def reference_total(field):
+        values=[call.get(field) for call in reference_calls]
+        return sum(values) if all(type(value) is int and value>=0 for value in values) else None
+    reference_totals={"graphql_calls":len(reference_calls),
+        "http_request_attempts":sum(call.get("http_request_started") is True for call in reference_calls),
+        "rate_cost":reference_total("cost"),"wire_bytes":reference_total("wire_bytes"),
+        "decoded_body_bytes":reference_total("decoded_body_bytes"),
+        "normalized_json_bytes":reference_total("decoded_json_bytes")}
     failed_trials = sum(trial.get("status") == "reference_failed" or any(
         item.get("status") == "failed" for item in trial.get("strategies", {}).values()) for trial in trials)
-    return {"strategies": result,
+    return {"strategies": result,"shared_reference_totals":reference_totals,
         "reference_failed_trials": sum(trial.get("status") == "reference_failed" for trial in trials),
         "failed_trials": failed_trials,
         "failure_rate_of_all_trials": failed_trials/len(trials) if trials else None,
         "latency_scope": "shared reference plus full strategy, including diagnostic normalized-JSON accounting; separate transport timings exclude that extra accounting; failures/not-run/partial reported",
-        "cost_scope": "each alternative includes its shared reference; do not sum alternatives as physical experiment calls",
+        "cost_scope": "each executed alternative includes its shared reference; standalone shared_reference_totals includes all reference requests even when neither strategy runs; do not sum these overlapping totals",
         "order_scope": "alternates across repositories and repeats; per-repository balance requires even repeats",
         "paired_comparable_trials": sum(trial.get("status") == "comparable" for trial in trials),
         "canonical_content_equal_trials": sum(trial.get("canonical_content_equal") is True for trial in trials),
