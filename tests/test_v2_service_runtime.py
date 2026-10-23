@@ -189,7 +189,8 @@ async def test_interactive_jobs_run_while_single_embedding_worker_waits_on_summa
             def onboard(request):
                 vector = onboarding.generate_interest_vector(request.profile.model_dump())
                 assert len(vector) == 384
-                return {"accepted": True}
+                return {"accepted": True, "status": "applied", "user_id": str(request.user_id),
+                        "profile_version": request.profile_version}
 
             # Replace external lock/storage boundaries, retaining real profile
             # synthesis, vector validation, shared encoder and HTTP admission.

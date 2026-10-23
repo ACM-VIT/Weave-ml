@@ -20,6 +20,10 @@ from config import (
     QDRANT_VECTOR_NAME,
     REPOSITORY_EMBEDDING_DIM,
 )
+from .corpus_revision import (
+    CorpusAuthorityUnavailable, CorpusRevisionAuthority, MaintenanceProof,
+    authority_from_environment,
+)
 from .qdrant_cas import payload_matches, payload_snapshot_filter
 from .repository_embedding import RepositoryEmbeddingResult
 from .vector_contract import (
@@ -33,6 +37,7 @@ from .vector_contract import (
 )
 
 logger = logging.getLogger(__name__)
+_AUTHORITY_FROM_ENV = object()
 
 
 class QdrantRepositoryStore:
@@ -48,6 +53,7 @@ class QdrantRepositoryStore:
         vector_size: int = REPOSITORY_EMBEDDING_DIM,
         distance: str = QDRANT_DISTANCE,
         client: Any | None = None,
+        corpus_authority: CorpusRevisionAuthority | None | object = _AUTHORITY_FROM_ENV,
     ) -> None:
         try:
             from qdrant_client import QdrantClient
@@ -64,6 +70,23 @@ class QdrantRepositoryStore:
         self.vector_size = vector_size
         self.distance = distance
         self._validate_store_config()
+        if corpus_authority is _AUTHORITY_FROM_ENV:
+            corpus_authority = authority_from_environment(
+                collection=collection_name, vector=vector_name, endpoint=url,
+            )
+            if corpus_authority is not None and client is not None:
+                corpus_authority.close()
+                raise ValueError("enabled authority requires an explicit matching authority for a custom Qdrant client")
+        elif corpus_authority is None:
+            # An explicitly omitted authority must not silently bypass an enabled
+            # protocol while another process can still expose a READY revision.
+            configured = authority_from_environment(collection=collection_name, vector=vector_name, endpoint=url)
+            if configured is not None:
+                configured.close()
+                raise ValueError("an enabled corpus authority cannot be omitted by a writer")
+        if corpus_authority is not None and not isinstance(corpus_authority, CorpusRevisionAuthority):
+            raise TypeError("corpus_authority must be a CorpusRevisionAuthority")
+        self.corpus_authority = corpus_authority
         self.client = client if client is not None else QdrantClient(url=url, api_key=api_key)
 
     def ensure_collection(self) -> None:
@@ -72,7 +95,7 @@ class QdrantRepositoryStore:
         # validated instead of recreated, so stored vectors are not dropped.
         if not self._collection_exists():
             distance = self._distance()
-            self.client.create_collection(
+            self._mutate(lambda: self.client.create_collection(
                 collection_name=self.collection_name,
                 vectors_config={
                     self.vector_name: self.models.VectorParams(
@@ -80,7 +103,7 @@ class QdrantRepositoryStore:
                         distance=distance,
                     )
                 },
-            )
+            ), synchronous_boolean=True)
             logger.info("Created Qdrant collection: %s", self.collection_name)
         self._validate_collection()
 
@@ -107,11 +130,11 @@ class QdrantRepositoryStore:
             )
         if not points:
             return
-        self.client.upsert(
+        self._mutate(lambda: self.client.upsert(
             collection_name=self.collection_name,
             points=points,
             wait=True,
-        )
+        ))
         logger.info("Upserted %d repository vectors into %s", len(points), self.collection_name)
 
     def compare_and_set_content(
@@ -188,7 +211,7 @@ class QdrantRepositoryStore:
                     ),
                 ),
             )
-        self.client.upsert(**kwargs)
+        self._mutate(lambda: self.client.upsert(**kwargs))
         return self._retrieve_point(target_id)
 
     def compare_and_set_features(
@@ -222,13 +245,13 @@ class QdrantRepositoryStore:
             payload=expected_payload,
             fields=("feature_version", "feature_job_id"),
         )
-        self.client.set_payload(
+        self._mutate(lambda: self.client.set_payload(
             collection_name=self.collection_name,
             payload=dict(feature_payload),
             points=selector,
             wait=True,
             ordering=self.models.WriteOrdering.STRONG,
-        )
+        ))
         return self._retrieve_point(str(expected_point.id))
 
     def compare_and_set_card_summary(
@@ -252,14 +275,55 @@ class QdrantRepositoryStore:
                 "card_summary_artifact_hash",
             ),
         )
-        self.client.set_payload(
+        self._mutate(lambda: self.client.set_payload(
             collection_name=self.collection_name,
             payload=card_summary_payload(artifact),
             points=selector,
             wait=True,
             ordering=self.models.WriteOrdering.STRONG,
-        )
+        ))
         return self._retrieve_point(str(expected_point.id))
+
+    def _mutate(self, operation, *, synchronous_boolean: bool = False):
+        if self.corpus_authority is None:
+            return operation()
+        return self.corpus_authority.mutate(operation, synchronous_boolean=synchronous_boolean)
+
+    def delete_repositories(self, repo_ids: Iterable[str]) -> None:
+        """Managed bounded canonical deletion; no public product deletion API."""
+        ids = []
+        for value in repo_ids:
+            if len(ids) >= 100:
+                raise ValueError("managed deletion accepts at most 100 repository IDs")
+            ids.append(canonical_backend_uuid(value, field_name="repo_id"))
+        ids = list(dict.fromkeys(ids))
+        if ids:
+            self._mutate(lambda: self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=self.models.PointIdsList(points=ids),
+                wait=True, ordering=self.models.WriteOrdering.STRONG,
+            ))
+
+    def replace_empty_collection(self, *, proof: MaintenanceProof) -> None:
+        """Controlled empty replacement after proved retirement/completion.
+
+        This is a maintenance primitive, never automatic recovery. It does not
+        clear unknown authority tokens or bootstrap a missing authority record.
+        """
+        if not isinstance(proof, MaintenanceProof):
+            raise ValueError("explicit maintenance proof is required for replacement")
+        def replace():
+            if self.client.delete_collection(self.collection_name) is not True:
+                raise CorpusAuthorityUnavailable("collection deletion completion not proven")
+            if self.client.create_collection(self.collection_name, vectors_config={
+                self.vector_name: self.models.VectorParams(
+                    size=self.vector_size, distance=self._distance(),
+                ),
+            }) is not True:
+                raise CorpusAuthorityUnavailable("collection creation completion not proven")
+            return True
+        self._mutate(replace, synchronous_boolean=True)
+        self.ensure_collection()
 
     def _validated_point(
         self,
@@ -534,12 +598,14 @@ class QdrantRepositoryStore:
         schema_name = QDRANT_PAYLOAD_INDEX_SCHEMA[field_name]
         schema = getattr(self.models.PayloadSchemaType, schema_name.upper())
         try:
-            self.client.create_payload_index(
+            self._mutate(lambda: self.client.create_payload_index(
                 collection_name=self.collection_name,
                 field_name=field_name,
                 field_schema=schema,
                 wait=True,
-            )
+            ))
+        except CorpusAuthorityUnavailable:
+            raise
         except Exception as exc:
             raise RuntimeError(f"Failed to create Qdrant payload index {field_name!r}") from exc
 

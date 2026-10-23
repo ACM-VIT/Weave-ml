@@ -1,0 +1,195 @@
+{
+  "created_at": "2026-10-23T00:00:00Z",
+  "embedding": {
+    "dimension": 3,
+    "document_prompt": "",
+    "model": "diagnostic-basis",
+    "normalized": true,
+    "pooling": "fixture",
+    "query_prompt": "",
+    "recipe": "v1",
+    "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "judgments": [
+    {
+      "grade": 3,
+      "profile_id": "00000000-0000-4000-8000-000000000100",
+      "repo_id": "00000000-0000-4000-8000-000000000001"
+    },
+    {
+      "grade": 2,
+      "profile_id": "00000000-0000-4000-8000-000000000100",
+      "repo_id": "00000000-0000-4000-8000-000000000002"
+    },
+    {
+      "grade": 1,
+      "profile_id": "00000000-0000-4000-8000-000000000100",
+      "repo_id": "00000000-0000-4000-8000-000000000003"
+    },
+    {
+      "grade": 0,
+      "profile_id": "00000000-0000-4000-8000-000000000100",
+      "repo_id": "00000000-0000-4000-8000-000000000004"
+    },
+    {
+      "grade": 0,
+      "profile_id": "00000000-0000-4000-8000-000000000100",
+      "repo_id": "00000000-0000-4000-8000-000000000005"
+    },
+    {
+      "grade": 0,
+      "profile_id": "00000000-0000-4000-8000-000000000100",
+      "repo_id": "00000000-0000-4000-8000-000000000006"
+    },
+    {
+      "grade": 0,
+      "profile_id": "00000000-0000-4000-8000-000000000101",
+      "repo_id": "00000000-0000-4000-8000-000000000001"
+    },
+    {
+      "grade": 0,
+      "profile_id": "00000000-0000-4000-8000-000000000101",
+      "repo_id": "00000000-0000-4000-8000-000000000002"
+    },
+    {
+      "grade": 1,
+      "profile_id": "00000000-0000-4000-8000-000000000101",
+      "repo_id": "00000000-0000-4000-8000-000000000003"
+    },
+    {
+      "grade": 3,
+      "profile_id": "00000000-0000-4000-8000-000000000101",
+      "repo_id": "00000000-0000-4000-8000-000000000004"
+    },
+    {
+      "grade": 2,
+      "profile_id": "00000000-0000-4000-8000-000000000101",
+      "repo_id": "00000000-0000-4000-8000-000000000005"
+    },
+    {
+      "grade": 0,
+      "profile_id": "00000000-0000-4000-8000-000000000101",
+      "repo_id": "00000000-0000-4000-8000-000000000006"
+    }
+  ],
+  "profiles": [
+    {
+      "disliked": [
+        "00000000-0000-4000-8000-000000000006"
+      ],
+      "intent": "synthetic backend testing",
+      "profile_id": "00000000-0000-4000-8000-000000000100",
+      "seen": [
+        "00000000-0000-4000-8000-000000000004"
+      ]
+    },
+    {
+      "disliked": [
+        "00000000-0000-4000-8000-000000000002"
+      ],
+      "intent": "synthetic frontend testing",
+      "profile_id": "00000000-0000-4000-8000-000000000101",
+      "seen": [
+        "00000000-0000-4000-8000-000000000001"
+      ]
+    }
+  ],
+  "provenance": {
+    "kind": "synthetic",
+    "reference": "invented unit-test labels; no human judgment"
+  },
+  "repositories": [
+    {
+      "archived": false,
+      "fork_family": "family-1",
+      "owner": "owner-1",
+      "popularity": 1,
+      "repo_id": "00000000-0000-4000-8000-000000000001",
+      "topics": [
+        "backend"
+      ],
+      "vector": [
+        1.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "archived": false,
+      "fork_family": "family-1",
+      "owner": "owner-1",
+      "popularity": 2,
+      "repo_id": "00000000-0000-4000-8000-000000000002",
+      "topics": [
+        "backend"
+      ],
+      "vector": [
+        1.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "archived": false,
+      "fork_family": "family-3",
+      "owner": "owner-3",
+      "popularity": 3,
+      "repo_id": "00000000-0000-4000-8000-000000000003",
+      "topics": [
+        "backend"
+      ],
+      "vector": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "archived": false,
+      "fork_family": "family-4",
+      "owner": "owner-4",
+      "popularity": 4,
+      "repo_id": "00000000-0000-4000-8000-000000000004",
+      "topics": [
+        "frontend"
+      ],
+      "vector": [
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "archived": false,
+      "fork_family": "family-5",
+      "owner": "owner-5",
+      "popularity": 5,
+      "repo_id": "00000000-0000-4000-8000-000000000005",
+      "topics": [
+        "frontend"
+      ],
+      "vector": [
+        0.0,
+        0.6,
+        0.8
+      ]
+    },
+    {
+      "archived": true,
+      "fork_family": "family-6",
+      "owner": "owner-6",
+      "popularity": 6,
+      "repo_id": "00000000-0000-4000-8000-000000000006",
+      "topics": [
+        "frontend"
+      ],
+      "vector": [
+        -1.0,
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "schema_version": 1,
+  "snapshot_id": "synthetic-smoke-v1"
+}

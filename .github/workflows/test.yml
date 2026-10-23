@@ -60,6 +60,17 @@ jobs:
     - name: Install dependencies
       run: uv sync --locked --dev
 
+    - name: Check synthetic recommendation benchmark regression gates
+      run: |
+        uv run python -m scripts.evaluate_recommendations \
+          --bundle tests/fixtures/recommendation_benchmark/bundle.json \
+          --run tests/fixtures/recommendation_benchmark/run.json \
+          --baseline tests/fixtures/recommendation_benchmark/baseline.json \
+          --policy tests/fixtures/recommendation_benchmark/policy.json \
+          --output "$RUNNER_TEMP/recommendation-diagnostic.json"
+    - name: Check versioned ML contract drift
+      run: uv run python -m scripts.export_ml_openapi --check
+
     - name: Set up test environment
       run: |
         echo "GITHUB_TOKEN=test_token_12345" >> $GITHUB_ENV

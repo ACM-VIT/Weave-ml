@@ -20,6 +20,7 @@ from .github_graphql_client import (
 )
 from .graphql_queries import README_CANDIDATES
 from .models import AcquisitionFailure
+from .repository_lineage import lineage_from_graphql
 from utils.readme_processor import README_PROCESSING_VERSION, ReadmeDocument, process_markdown
 from .github_rate_limit import GitHubRequestBudget
 from .readme_cache import README_DOCUMENT_CACHE
@@ -397,6 +398,16 @@ class RepositoryEnricher:
             "_discovery_band": discovery_band,
         }
         
+        if 'isFork' in data:
+            lineage = lineage_from_graphql(data, observed_at=datetime.now(timezone.utc))
+            raw_repository.update({
+                'is_fork': lineage.is_fork,
+                'fork_parent_github_id': lineage.fork_parent_github_id,
+                'fork_family_github_id': lineage.fork_family_github_id,
+                'lineage_source': lineage.source,
+                'lineage_observed_at': lineage.observed_at,
+            })
+
         # Calculate size from languages sum as fallback
         if languages:
             raw_repository["size"] = sum(languages.values()) // 1024
@@ -454,6 +465,8 @@ class RepositoryEnricher:
             "github_id": repository.get("github_id"),
             "github_node_id": repository.get("github_node_id"),
             "owner_github_id": (repository.get("owner") or {}).get("github_id"),
+            **{field: repository[field] for field in ('is_fork', 'fork_parent_github_id',
+                'fork_family_github_id', 'lineage_source', 'lineage_observed_at') if field in repository},
             "star_count": int(repository.get("stargazers_count") or repository.get("watchers_count") or 0),
             "primary_language": primary_lang_str,
             "special_label": special_label,

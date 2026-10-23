@@ -1,0 +1,174 @@
+{
+  "code_commit": "dddddddddddddddddddddddddddddddddddddddd",
+  "created_at": "2026-10-23T00:00:00Z",
+  "embedding": {
+    "dimension": 3,
+    "document_prompt": "",
+    "model": "diagnostic-basis",
+    "normalized": true,
+    "pooling": "fixture",
+    "query_prompt": "",
+    "recipe": "v1",
+    "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "feature_schema": "diagnostic-v1",
+  "model_id": "synthetic-order-v1",
+  "model_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "outputs": [
+    {
+      "latency_ms": {
+        "assembly": 3.0,
+        "ranking": 2.0,
+        "retrieval": 1.0
+      },
+      "profile_id": "00000000-0000-4000-8000-000000000100",
+      "stages": {
+        "assembly": [
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000001",
+            "score": 10.0,
+            "source": "personalized",
+            "source_score": 0.5
+          },
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000003",
+            "score": 9.0,
+            "source": "personalized",
+            "source_score": 0.5
+          },
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000005",
+            "score": 8.0,
+            "source": "exploration",
+            "source_score": 0.5
+          }
+        ],
+        "ranking": [
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000001",
+            "score": 10.0,
+            "source": "personalized",
+            "source_score": 0.5
+          },
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000002",
+            "score": 9.0,
+            "source": "personalized",
+            "source_score": 0.5
+          },
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000003",
+            "score": 8.0,
+            "source": "exploration",
+            "source_score": 0.5
+          },
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000005",
+            "score": 7.0,
+            "source": "personalized",
+            "source_score": 0.5
+          }
+        ],
+        "retrieval": [
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000002",
+            "score": 10.0,
+            "source": "personalized",
+            "source_score": 0.5
+          },
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000003",
+            "score": 9.0,
+            "source": "personalized",
+            "source_score": 0.5
+          },
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000001",
+            "score": 8.0,
+            "source": "exploration",
+            "source_score": 0.5
+          },
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000005",
+            "score": 7.0,
+            "source": "personalized",
+            "source_score": 0.5
+          }
+        ]
+      }
+    },
+    {
+      "latency_ms": {
+        "assembly": 3.0,
+        "ranking": 2.0,
+        "retrieval": 1.0
+      },
+      "profile_id": "00000000-0000-4000-8000-000000000101",
+      "stages": {
+        "assembly": [
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000004",
+            "score": 10.0,
+            "source": "personalized",
+            "source_score": 0.5
+          },
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000005",
+            "score": 9.0,
+            "source": "personalized",
+            "source_score": 0.5
+          },
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000003",
+            "score": 8.0,
+            "source": "exploration",
+            "source_score": 0.5
+          }
+        ],
+        "ranking": [
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000004",
+            "score": 10.0,
+            "source": "personalized",
+            "source_score": 0.5
+          },
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000003",
+            "score": 9.0,
+            "source": "personalized",
+            "source_score": 0.5
+          },
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000005",
+            "score": 8.0,
+            "source": "exploration",
+            "source_score": 0.5
+          }
+        ],
+        "retrieval": [
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000003",
+            "score": 10.0,
+            "source": "personalized",
+            "source_score": 0.5
+          },
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000004",
+            "score": 9.0,
+            "source": "personalized",
+            "source_score": 0.5
+          },
+          {
+            "repo_id": "00000000-0000-4000-8000-000000000005",
+            "score": 8.0,
+            "source": "exploration",
+            "source_score": 0.5
+          }
+        ]
+      }
+    }
+  ],
+  "scaler_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "schema_version": 1,
+  "timing_kind": "synthetic"
+}

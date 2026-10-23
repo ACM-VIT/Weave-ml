@@ -260,6 +260,8 @@ def validate_repository_payload(
     if not isinstance(payload, Mapping):
         raise TypeError("repository payload must be a mapping")
 
+    validate_diversity_metadata(payload)
+
     required_fields = (
         REPOSITORY_PAYLOAD_REQUIRED_FIELDS
         if require_serving_eligibility
@@ -429,3 +431,45 @@ def repository_payload_defaults() -> dict[str, object]:
             REPOSITORY_SERVING_ELIGIBILITY_VERSION
         ),
     }
+
+
+DIVERSITY_METADATA_FIELDS = (
+    'owner_github_id', 'is_fork', 'fork_parent_github_id', 'fork_family_github_id',
+    'lineage_observed_at', 'lineage_source',
+)
+
+def validate_diversity_metadata(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate optional observed identity; absence never means nonfork."""
+    result = {field: payload.get(field) for field in DIVERSITY_METADATA_FIELDS}
+    for field in ('owner_github_id', 'fork_parent_github_id', 'fork_family_github_id'):
+        value = result[field]
+        if value is not None and (not isinstance(value, str) or not 1 <= len(value) <= 19
+                or not value.isascii() or not value.isdecimal() or value[0] == '0' or int(value) > 2**63 - 1):
+            raise ValueError(f'{field} must be a positive signed-bigint decimal string')
+    state = result['is_fork']
+    if state is not None and type(state) is not bool:
+        raise ValueError('is_fork must be boolean or unknown')
+    parent, family = result['fork_parent_github_id'], result['fork_family_github_id']
+    github_id = payload.get('github_id')
+    if state is None and (parent is not None or family is not None):
+        raise ValueError('Fork ancestry requires explicit fork state')
+    if state is False and (parent is not None or (family is not None and family != github_id)):
+        raise ValueError('Nonfork ancestry must match its own GitHub identity')
+    if state is True and github_id is not None and github_id in {parent, family}:
+        raise ValueError('Fork ancestry cannot refer to the fork itself')
+    source, observed = result['lineage_source'], result['lineage_observed_at']
+    if (source is None) != (observed is None):
+        raise ValueError('Lineage source and observation time must be supplied together')
+    if state is not None and source is None:
+        raise ValueError('Known fork state requires observed source provenance')
+    if source is not None:
+        if source not in {'github-graphql-repository', 'github-rest-repository'}:
+            raise ValueError('Unknown lineage source')
+        try:
+            timestamp = datetime.fromisoformat(observed.replace('Z', '+00:00')) if isinstance(observed, str) else observed
+            if not isinstance(timestamp, datetime) or timestamp.tzinfo is None or timestamp.utcoffset() != timedelta(0):
+                raise ValueError('Lineage observation must be UTC')
+        except (TypeError, AttributeError, ValueError) as exc:
+            raise ValueError('Lineage observation must be an explicit UTC timestamp') from exc
+        result['lineage_observed_at'] = timestamp.isoformat()
+    return result

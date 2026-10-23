@@ -15,6 +15,8 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import PlainTextResponse
 from api.contracts import (
+    RecommendationResponse, FeedbackResponse, RepositoryIndexResponse,
+    RepositoryRefreshResponse, OnboardingResponse,
     FeedbackBatch,
     OnboardingJob,
     RecommendationRequest,
@@ -23,6 +25,7 @@ from api.contracts import (
     RepositoryRefreshJob,
     RepositorySearchRequest,
     RepositorySearchResponse,
+    RequestValidationResponse,
 )
 from api.runtime import (
     ServiceCapacityError,
@@ -37,7 +40,12 @@ from api.runtime import (
 from api.request_budget import run_read_only_request
 from api.health import HealthDiagnostics, HealthSettings
 from api.metrics import record_health_dependency, record_recommendation, render_prometheus
-from config import constant_time_secret_matches, internal_api_header_name
+from config import (
+    QDRANT_COLLECTION_NAME, QDRANT_VECTOR_NAME,
+    constant_time_secret_matches, internal_api_header_name,
+)
+from embedding.corpus_revision import authority_from_environment
+from retrieval.discovery_cache import DiscoveryRevision
 from embedding.qdrant_store import QdrantRepositoryStore
 from embedding.query_cache import CachedQueryEmbedder, QueryCacheCapacityError
 from embedding.runtime import (
@@ -100,7 +108,9 @@ from utils.runtime_lifecycle import (
     RuntimeRetiringError, resume_runtime_admission, stop_runtime_admission,
 )
 
-router = APIRouter(prefix="/api/v2", tags=["v2"])
+router = APIRouter(prefix="/api/v2", tags=["v2"], responses={
+    422: {"model": RequestValidationResponse, "description": "Request validation failed"},
+})
 logger = logging.getLogger("pipeline.api.v2")
 
 
@@ -341,8 +351,22 @@ async def require_internal_secret(
 
 
 @lru_cache(maxsize=1)
+def corpus_authority():
+    return authority_from_environment(collection=QDRANT_COLLECTION_NAME, vector=QDRANT_VECTOR_NAME)
+
+
+def _corpus_discovery_revision():
+    authority = corpus_authority()
+    current = authority.read() if authority is not None else None
+    return DiscoveryRevision(*current) if current is not None else None
+
+
+@lru_cache(maxsize=1)
 def retriever() -> QdrantV2Retriever:
-    return QdrantV2Retriever()
+    authority = corpus_authority()
+    return QdrantV2Retriever(
+        discovery_revision_provider=_corpus_discovery_revision if authority is not None else None,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -361,7 +385,21 @@ def _enqueue_feedback(events: list[dict[str, Any]]) -> tuple[int, int]:
 
 
 def _qdrant_health() -> dict[str, Any]:
-    return retriever().health()
+    result = dict(retriever().health())
+    authority = corpus_authority()
+    if authority is None:
+        state = {"enabled": False, "reachable": None, "healthy": True, "state": "DISABLED", "writers": None}
+    else:
+        try:
+            status = authority.status()
+            state = {"enabled": True, "reachable": True,
+                     "healthy": status["state"] in {"READY", "DIRTY"}, **status}
+        except Exception:
+            # Never expose connection URLs, credentials or arbitrary errors.
+            state = {"enabled": True, "reachable": False, "healthy": False,
+                     "state": "UNAVAILABLE", "writers": None}
+    result["corpus_authority"] = state
+    return result
 
 
 def _feedback_health() -> dict[str, Any]:
@@ -374,6 +412,7 @@ def repository_store() -> QdrantRepositoryStore:
     store = QdrantRepositoryStore(
         vector_size=pipeline.config.embedding_dim,
         client=retriever().client,
+        corpus_authority=corpus_authority(),
     )
     store.ensure_collection()
     return store
@@ -439,6 +478,8 @@ def _runtime_cleanup_actions():
         close = getattr(producer().redis, "close", None)
         if callable(close):
             actions.append(("redis.client.close", close))
+    if corpus_authority.cache_info().currsize and corpus_authority() is not None:
+        actions.append(("corpus.authority.close", corpus_authority().close))
     if retriever.cache_info().currsize:
         close = getattr(retriever().client, "close", None)
         if callable(close):
@@ -446,6 +487,7 @@ def _runtime_cleanup_actions():
     return [
         *actions,
         ("repository_store.cache.clear", repository_store.cache_clear),
+        ("corpus_authority.cache.clear", corpus_authority.cache_clear),
         ("user_profile_store.cache.clear", user_profile_store.cache_clear),
         ("feedback_producer.cache.clear", producer.cache_clear),
         ("retriever.cache.clear", retriever.cache_clear),
@@ -1036,23 +1078,25 @@ def _onboard_user_job(request: OnboardingJob) -> dict[str, Any]:
 
 
 @router.post(
-    "/recommendations/generate", dependencies=[Depends(require_internal_secret)]
+    "/recommendations/generate", response_model=RecommendationResponse, dependencies=[Depends(require_internal_secret)]
 )
 async def generate_recommendations(
     request: RecommendationRequest,
     http_request: Request,
 ):
+    arguments = (
+        str(request.user_id), request.limit,
+        [str(item) for item in request.exclude_repo_ids], str(request.generation_id),
+        request.context.cold_start, [str(item) for item in request.social_repo_ids],
+    )
+    if request.social_candidates:
+        arguments = (*arguments, request.social_candidates)
     try:
         batch = await run_read_only_request(
             http_request, recommendation_timeout_seconds(),
             lambda: run_recommendation_job(
                 retriever().recommend_batch,
-                str(request.user_id),
-                request.limit,
-                [str(item) for item in request.exclude_repo_ids],
-                str(request.generation_id),
-                request.context.cold_start,
-                [str(item) for item in request.social_repo_ids],
+                *arguments,
             ),
         )
     except HTTPException:
@@ -1110,6 +1154,7 @@ async def generate_recommendations(
 
 @router.post(
     "/feedback/batch",
+    response_model=FeedbackResponse,
     status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(require_internal_secret)],
 )
@@ -1158,10 +1203,15 @@ async def submit_feedback(request: FeedbackBatch, http_request: Request):
             retryable=True,
             headers={"Retry-After": "1"},
         ) from exc
-    return {"accepted": accepted, "duplicates": duplicates, "durable": True}
+    # A completed producer call proves every requested event is durably accepted
+    # or already present. Error/timeout paths above must not infer partial ACKs.
+    return {
+        "accepted": accepted, "duplicates": duplicates, "durable": True,
+        "acknowledged_event_ids": [str(event.event_id) for event in request.events],
+    }
 
 
-@router.post("/repositories/embed", dependencies=[Depends(require_internal_secret)])
+@router.post("/repositories/embed", response_model=RepositoryIndexResponse, dependencies=[Depends(require_internal_secret)])
 async def embed_repository(request: RepositoryJob, http_request: Request):
     try:
         deadline = time.monotonic() + embedding_timeout_seconds()
@@ -1188,7 +1238,7 @@ async def embed_repository(request: RepositoryJob, http_request: Request):
         ) from exc
 
 
-@router.post("/repositories/refresh", dependencies=[Depends(require_internal_secret)])
+@router.post("/repositories/refresh", response_model=RepositoryRefreshResponse, dependencies=[Depends(require_internal_secret)])
 async def refresh_repository(request: RepositoryRefreshJob, http_request: Request):
     try:
         return await run_service_job("refresh", _refresh_repository_job, request)
@@ -1210,7 +1260,7 @@ async def refresh_repository(request: RepositoryRefreshJob, http_request: Reques
         ) from exc
 
 
-@router.post("/users/onboard", dependencies=[Depends(require_internal_secret)])
+@router.post("/users/onboard", response_model=OnboardingResponse, dependencies=[Depends(require_internal_secret)])
 async def onboard_user(request: OnboardingJob, http_request: Request):
     try:
         return await run_onboarding_job(_onboard_user_job, request)
@@ -1256,6 +1306,8 @@ def _collect_health_diagnostics(stop: threading.Event) -> tuple[bool, dict[str, 
         try:
             result = check()
             details.update(result)
+            if dependency == "qdrant" and not result.get("corpus_authority", {}).get("healthy", True):
+                raise RuntimeError("enabled corpus authority is unavailable for writes")
             if dependency == "redis":
                 consumer_required = os.getenv(
                     "V2_FEEDBACK_CONSUMER_REQUIRED", "true"

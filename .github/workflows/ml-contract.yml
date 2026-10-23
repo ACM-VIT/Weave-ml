@@ -1,0 +1,42 @@
+name: ML contract compatibility
+
+on:
+  pull_request:
+    paths:
+      - 'api/**'
+      - 'contracts/**'
+      - 'scripts/export_ml_openapi.py'
+      - '.github/workflows/ml-contract.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  breaking-changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select the established base contract
+        id: baseline
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git cat-file -e "$BASE_SHA:contracts/ml-v2.openapi.json"; then
+            git show "$BASE_SHA:contracts/ml-v2.openapi.json" > .ml-v2-base.openapi.json
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'Initial contract publication: no established base artifact.'
+            echo 'exists=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Reject incompatible V2 changes
+        if: steps.baseline.outputs.exists == 'true'
+        uses: oasdiff/oasdiff-action/breaking@9ce3a29eb0e6478dd0140932a678c7fb59d08f22 # v0.1.20
+        with:
+          base: .ml-v2-base.openapi.json
+          revision: contracts/ml-v2.openapi.json
+          fail-on: WARN
+          review: 'false'
+          github-token: ''
