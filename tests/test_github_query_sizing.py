@@ -322,3 +322,28 @@ def test_metadata_projects_authoritative_lifecycle_flags_for_delivery():
     for projection in ('legacy', 'delivery'):
         query = build_batch_metadata_query([('owner', 'repository')], projection=projection)
         assert 'isArchived' in query and 'isDisabled' in query
+
+
+def test_lifecycle_provenance_is_captured_before_later_singleton_fallback(monkeypatch):
+    from datetime import datetime, timezone
+    import acquisition.repository_enricher as module
+    times = iter([datetime(2026, 1, day, tzinfo=timezone.utc) for day in (1, 2, 3, 4, 5, 6, 7, 8)])
+    class Clock:
+        @staticmethod
+        def now(tz=None):
+            return next(times)
+    monkeypatch.setattr(module, 'datetime', Clock)
+    class Client:
+        def get_repositories_batch(self, rows, **kwargs):
+            if len(rows) > 1:
+                raise GitHubGraphQLClientError('isolate rows', category='response')
+            owner, name = rows[0]
+            return {f'{owner}/{name}': {'nameWithOwner': f'{owner}/{name}',
+                'description': 'Mature project', 'isArchived': False, 'isDisabled': False}}
+        def get_readme(self, owner, name):
+            return ''
+    results = module.RepositoryEnricher(Client()).get_repositories_batch(['owner/first', 'owner/second'])
+    first, second = results
+    assert first.payload['lifecycle']['observed_at'] == '2026-01-01T00:00:00+00:00'
+    # Each response receives its own completed-call anchor, not later processing time.
+    assert second.payload['lifecycle']['observed_at'] == '2026-01-02T00:00:00+00:00'

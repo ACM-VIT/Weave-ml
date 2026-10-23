@@ -774,6 +774,8 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
                 error_code="REPOSITORY_CONTENT_HASH_CONFLICT",
                 retryable=False,
             )
+        expected_point = _apply_lifecycle_observation(expected_point, request.repository.lifecycle, lock)
+        stored_payload = dict(expected_point.payload or {})
         artifact = card_summary_from_payload(stored_payload)
         if artifact is None or not pipeline.card_summarizer.is_current(
             artifact, repo=summary_context(artifact)
@@ -952,6 +954,22 @@ def _validated_lifecycle_merge(stored, observation):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+def _apply_lifecycle_observation(expected_point, observation, lock):
+    stored_payload = dict(expected_point.payload or {})
+    lifecycle_features = _validated_lifecycle_merge(stored_payload, observation)
+    if any(stored_payload.get(field) != value for field, value in lifecycle_features.items()):
+        lock.assert_owned()
+        stored = repository_store().compare_and_set_lifecycle(
+            expected_point=expected_point, lifecycle_payload=lifecycle_features,
+        )
+        lock.assert_owned()
+        actual = dict(stored.payload or {}) if stored is not None else {}
+        if any(actual.get(field) != value for field, value in lifecycle_features.items()):
+            raise HTTPException(status_code=503, detail="Repository lifecycle state changed; retry the request.")
+        return stored
+    return expected_point
+
+
 def _refresh_repository_job(request: RepositoryRefreshJob) -> dict[str, Any]:
     repo_id = str(request.repo_id)
     try:
@@ -992,16 +1010,7 @@ def _refresh_repository_job_locked(
             raise
         job_status = "current"
     if job_status != "apply":
-        lifecycle_features = _validated_lifecycle_merge(stored_payload, request.features.lifecycle)
-        if any(stored_payload.get(field) != value for field, value in lifecycle_features.items()):
-            lock.assert_owned()
-            stored = repository_store().compare_and_set_lifecycle(
-                expected_point=expected_point, lifecycle_payload=lifecycle_features,
-            )
-            lock.assert_owned()
-            actual = dict(stored.payload or {}) if stored is not None else {}
-            if any(actual.get(field) != value for field, value in lifecycle_features.items()):
-                raise HTTPException(status_code=503, detail="Repository lifecycle state changed; retry the request.")
+        _apply_lifecycle_observation(expected_point, request.features.lifecycle, lock)
         return {
             "accepted": True, "status": job_status,
             "repo_id": repo_id, "feature_version": current,

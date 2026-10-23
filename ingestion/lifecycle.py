@@ -31,7 +31,13 @@ class RepositoryLifecycleObservation(BaseModel):
     def aware_timestamp(cls, value: datetime) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("lifecycle observed_at must include a timezone")
-        return value.astimezone(timezone.utc)
+        try:
+            normalized = value.astimezone(timezone.utc)
+        except OverflowError as exc:
+            raise ValueError("lifecycle observed_at must normalize within years 1 through 9999") from exc
+        if normalized > datetime.now(timezone.utc):
+            raise ValueError("lifecycle observation cannot be in the future")
+        return normalized
 
     @model_validator(mode="after")
     def complete_observation(self):

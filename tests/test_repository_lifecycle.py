@@ -187,11 +187,11 @@ def test_lifecycle_health_requires_new_indexes_only_when_policy_enabled(monkeypa
     legacy_indexes = {key: value for key, value in QDRANT_PAYLOAD_INDEX_SCHEMA.items() if not key.startswith('lifecycle_')}
     monkeypatch.delenv('V2_REPOSITORY_LIFECYCLE_POLICY', raising=False)
     retriever = QdrantV2Retriever(client=object(), heavy_ranker_enabled=False)
-    retriever._validate_repository_payload_indexes(SimpleNamespace(payload_schema=legacy_indexes))
+    retriever._validate_repository_payload_indexes(SimpleNamespace(payload_schema=legacy_indexes), lifecycle_policy=retriever.lifecycle_policy)
     monkeypatch.setenv('V2_REPOSITORY_LIFECYCLE_POLICY', 'verified-status-v1')
     retriever = QdrantV2Retriever(client=object(), heavy_ranker_enabled=False)
     with pytest.raises(RuntimeError, match='lifecycle_archived'):
-        retriever._validate_repository_payload_indexes(SimpleNamespace(payload_schema=legacy_indexes))
+        retriever._validate_repository_payload_indexes(SimpleNamespace(payload_schema=legacy_indexes), lifecycle_policy=retriever.lifecycle_policy)
 
 
 # Reuse the real local Qdrant corpus/model boundary from existing retrieval tests.
@@ -244,3 +244,69 @@ def test_archive_transition_during_deferred_hydration_cannot_reach_heavy_ranker(
     retriever.recommend_batch(corpus.user_id, 10, [], 'hydrate-lifecycle')
     assert changed
     assert changed[0] not in {row['id'] for row in retriever.ranker.calls[-1][2]}
+
+
+@pytest.mark.parametrize('timestamp', [
+    '0000-01-01T00:00:00Z',
+    '0001-01-01T00:00:00+23:59',
+    '9999-12-31T23:59:59-23:59',
+])
+def test_lifecycle_http_rejects_unrepresentable_utc_dates_with_422(monkeypatch, timestamp):
+    from fastapi.testclient import TestClient
+    from api.main import app
+    monkeypatch.setenv('INTERNAL_API_SECRET', 'lifecycle-range-secret')
+    response = TestClient(app).post('/api/v2/repositories/refresh',
+        headers={'x-internal-secret': 'lifecycle-range-secret'}, json={
+            'schema_version': 2, 'job_id': str(uuid.uuid4()), 'repo_id': str(uuid.uuid4()),
+            'feature_version': 1,
+            'features': {'lifecycle': {**observation(), 'observed_at': timestamp}},
+        })
+    assert response.status_code == 422, response.text
+    assert any('observed_at' in row['path'] for row in response.json()['details'])
+
+
+def test_lifecycle_utc_normalization_retains_supported_extreme_offset_and_microseconds():
+    item = RepositoryLifecycleObservation.model_validate({
+        **observation(), 'observed_at': '0001-01-02T00:00:00.123456+23:59'})
+    assert item.observed_at.isoformat() == '0001-01-01T00:01:00.123456+00:00'
+
+
+@pytest.mark.parametrize('lifecycle', [observation(archived=True), observation(disabled=True)])
+def test_same_content_replay_persists_lifecycle_without_embedding(lifecycle):
+    from api.v2 import _embed_repository_job_locked
+    from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
+    from tests.test_v2_summary_contract import _job, FakeEmbedder
+    client, store, point = _indexed_feature_refresh_fixture()
+    body = _job().model_dump(mode='json')
+    body['repository']['lifecycle'] = lifecycle
+    client.set_payload(store.collection_name, {'content_version': 7}, [point.id])
+    point.payload['content_version'] = 7
+    body['repository']['content_hash'] = point.payload['content_hash']
+    from api.contracts import RepositoryJob
+    with patch('api.v2.repository_store', return_value=store), patch('api.v2._repository_points', return_value=[point]), patch(
+        'api.v2.repository_embedding_pipeline', return_value=RepositoryEmbeddingPipeline(embedder=FakeEmbedder())) as provider:
+        with patch.object(provider.return_value, 'embed_repository', side_effect=AssertionError('same content must not embed')):
+            response = _embed_repository_job_locked(RepositoryJob.model_validate(body), OwnedLock())
+    assert response['status'] == 'current'
+    stored = client.retrieve(store.collection_name, [point.id], with_payload=True)[0]
+    assert stored.payload['lifecycle_archived'] == lifecycle['archived']
+    assert stored.payload['lifecycle_disabled'] == lifecycle['disabled']
+    client.close()
+
+
+def test_future_lifecycle_source_rejected_before_embedding_work(monkeypatch):
+    from fastapi.testclient import TestClient
+    from api.main import app
+    from tests.test_v2_summary_contract import _job
+    monkeypatch.setenv('INTERNAL_API_SECRET', 'lifecycle-future-secret')
+    body = _job().model_dump(mode='json')
+    body['repository']['lifecycle'] = {**observation(), 'observed_at': (datetime.now(timezone.utc)+timedelta(days=1)).isoformat()}
+    with patch('api.v2.repository_embedding_pipeline', side_effect=AssertionError('validation must precede model work')):
+        response = TestClient(app).post('/api/v2/repositories/embed', json=body,
+            headers={'x-internal-secret': 'lifecycle-future-secret'})
+    assert response.status_code == 422
+
+
+def test_bootstrap_can_validate_indexes_without_a_retriever_instance():
+    from config import QDRANT_PAYLOAD_INDEX_SCHEMA
+    QdrantV2Retriever._validate_repository_payload_indexes(SimpleNamespace(payload_schema=QDRANT_PAYLOAD_INDEX_SCHEMA))

@@ -176,6 +176,13 @@ class RepositoryEnricher:
             )
             logger.warning("Metadata chunk failed: %s", error.safe_diagnostic)
 
+        def observed_rows(rows):
+            # Freeze provenance at each completed GitHub call, before fallback
+            # siblings/README processing can delay this response's application.
+            received_at = datetime.now(timezone.utc).isoformat()
+            return {name: ({**data, "_lifecycle_observed_at": received_at} if data else data)
+                    for name, data in rows.items()}
+
         # Pass 1: batch metadata (no readme — avoids 502 on large repos)
         for i in range(0, len(targets), self.metadata_batch_size):
             self._check_cancelled()
@@ -183,9 +190,9 @@ class RepositoryEnricher:
             batch_res = {}
             try:
                 if self.metadata_projection == "legacy":
-                    batch_res = self.graphql_client.get_repositories_batch(batch)
+                    batch_res = observed_rows(self.graphql_client.get_repositories_batch(batch))
                 else:
-                    batch_res = self.graphql_client.get_repositories_batch(batch, projection=self.metadata_projection)
+                    batch_res = observed_rows(self.graphql_client.get_repositories_batch(batch, projection=self.metadata_projection))
             except CancelledError:
                 raise
             except GitHubGraphQLClientError as exc:
@@ -202,7 +209,7 @@ class RepositoryEnricher:
                         retry_res = self.graphql_client.get_repositories_batch(
                             [(owner, name)], projection=self.metadata_projection,
                         )
-                        batch_res.update(retry_res)
+                        batch_res.update(observed_rows(retry_res))
                     except CancelledError:
                         raise
                     except GitHubGraphQLClientError as retry_exc:
@@ -295,6 +302,7 @@ class RepositoryEnricher:
         data = self.graphql_client.get_repository(owner, name)
         if not data:
             return None
+        data = {**data, "_lifecycle_observed_at": datetime.now(timezone.utc).isoformat()}
         return self._process_graphql_data(data, discovery_category, discovery_band)
 
     def _process_graphql_data(
@@ -404,7 +412,7 @@ class RepositoryEnricher:
         if isinstance(data.get('isArchived'), bool) and isinstance(data.get('isDisabled'), bool):
             raw_repository['lifecycle'] = {
                 'status': 'verified', 'source': 'github-graphql-repository',
-                'observed_at': datetime.now(timezone.utc).isoformat(),
+                'observed_at': data.get('_lifecycle_observed_at') or datetime.now(timezone.utc).isoformat(),
                 'archived': data['isArchived'], 'disabled': data['isDisabled'],
             }
 

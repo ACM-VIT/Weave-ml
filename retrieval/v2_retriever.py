@@ -2225,12 +2225,13 @@ class QdrantV2Retriever:
                 f"Qdrant collection {collection_name!r} has an incompatible distance"
             )
 
-    def _validate_repository_payload_indexes(self, info: Any) -> None:
+    @staticmethod
+    def _validate_repository_payload_indexes(info: Any, *, lifecycle_policy: str = "disabled") -> None:
         payload_schema = getattr(info, "payload_schema", None)
         if not isinstance(payload_schema, Mapping):
             raise RuntimeError("Qdrant repository payload index schema is unavailable")
         for field, expected_type in QDRANT_PAYLOAD_INDEX_SCHEMA.items():
-            if field in {"lifecycle_archived", "lifecycle_disabled"} and self.lifecycle_policy == "disabled":
+            if field in {"lifecycle_archived", "lifecycle_disabled"} and lifecycle_policy == "disabled":
                 continue
             actual = payload_schema.get(field)
             if actual is None:
@@ -2270,7 +2271,7 @@ class QdrantV2Retriever:
             expected_size=REPOSITORY_COLLECTION_CONTRACT.vector_size,
             expected_distance=QDRANT_DISTANCE,
         )
-        self._validate_repository_payload_indexes(info)
+        self._validate_repository_payload_indexes(info, lifecycle_policy=self.lifecycle_policy)
         user_collection_contract = "not_required"
         if self.user_collection_required:
             user_info = self.client.get_collection(self.user_collection)

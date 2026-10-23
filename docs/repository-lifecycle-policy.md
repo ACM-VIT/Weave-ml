@@ -45,6 +45,10 @@ from the content hash, so a status-only change never requires embedding again.
 The durable outbox JSON contains the evidence; no new database table/migration is
 needed. Qdrant holds the last verified state and last observation attempt.
 
+Same-content index replays also apply and verify lifecycle-only CAS before success.
+GitHub response completion anchors provenance before fallback siblings or README
+processing; future/out-of-range observations fail request validation before model work.
+
 The defined boundary is the completed, verified ML Qdrant CAS for the repository,
 not acquisition search, SQL enqueue, HTTP dispatch, or an existing generated feed.
 Requests selecting candidates after this boundary exclude archived/disabled
