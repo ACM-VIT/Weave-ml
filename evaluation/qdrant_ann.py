@@ -5,6 +5,7 @@ from contextlib import AbstractContextManager
 from datetime import datetime, timezone
 import math
 import os
+import re
 from pathlib import Path
 import shutil
 import stat
@@ -125,12 +126,11 @@ class OwnedQdrant(AbstractContextManager):
                     if time.monotonic() >= startup_deadline:
                         raise TimeoutError("owned Qdrant startup deadline exceeded")
                     time.sleep(.1)
-        except BaseException as error:
+        except BaseException:
             try:
                 self.cleanup()
-            except Exception as cleanup_error:
-                if hasattr(error, "add_note"):
-                    error.add_note(str(cleanup_error))
+            except Exception:
+                self._warn_cleanup_failure()
             raise
 
     def api(self, path: str, body=None, method=None):
@@ -180,14 +180,24 @@ class OwnedQdrant(AbstractContextManager):
             shutil.rmtree(self.root)
             self.root = None
 
+    def _warn_cleanup_failure(self):
+        # Names are generated locally. Never print Docker output, exception
+        # notes, full paths (including TMPDIR) or arbitrary cleanup error text.
+        names = []
+        if re.fullmatch(r"weave-embedding-ann-[0-9a-f]{16}", self.name):
+            names.append("container=" + self.name)
+        if self.root is not None and re.fullmatch(r"weave-embedding-ann-[a-zA-Z0-9_-]{1,64}", self.root.name):
+            names.append("storage=" + self.root.name)
+        print("WARNING: owned ANN cleanup failed; resources may remain: "
+              + (", ".join(names) or "owned resource identity unavailable"), file=sys.stderr)
+
     def __exit__(self, exc_type, exc, traceback):
         try:
             self.cleanup()
         except Exception as cleanup_error:
+            self._warn_cleanup_failure()
             if exc is None:
-                raise
-            if hasattr(exc, "add_note"):
-                exc.add_note(str(cleanup_error))
+                raise RuntimeError("owned ANN resource cleanup failed") from cleanup_error
         return False
 
 

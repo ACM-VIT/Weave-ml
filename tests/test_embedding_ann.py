@@ -98,12 +98,13 @@ def test_interrupted_startup_cleans_private_directory(monkeypatch):
     assert owned.root is None and not owned.created
 
 
-def test_cleanup_failure_is_reported_without_replacing_original_error(monkeypatch):
+def test_cleanup_failure_is_reported_without_replacing_original_error(monkeypatch, capsys):
     owned = ann.OwnedQdrant()
     monkeypatch.setattr(owned, "cleanup", lambda: (_ for _ in ()).throw(RuntimeError("cleanup failed")))
     original = ValueError("original failure")
     assert owned.__exit__(ValueError, original, None) is False
-    assert original.__notes__ == ["cleanup failed"]
+    assert "cleanup failed" in capsys.readouterr().err
+    assert not getattr(original, "__notes__", [])
 
 
 def test_request_and_result_bounds_do_not_silently_truncate(monkeypatch):
