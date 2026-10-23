@@ -1642,7 +1642,8 @@ class QdrantV2Retriever:
         social_policy = self.social_policy.for_user(user_id)
         social_rows = social_candidates or []
         social_ids = lookup_social_ids(social_rows, social_policy, excluded)
-        social_ids = social_ids[:budget.reserve(len(social_ids))] if social_ids else []
+        if social_policy.injects and social_ids:
+            social_ids = social_ids[:budget.reserve(len(social_ids))]
         social_points: dict[str, _EligibleRepositoryPoint] = {}
         # Inline is an explicit high-RTT alternative only for required-heavy.
         # It never uses the shared discovery pool or a previous request's pair.
@@ -1655,7 +1656,7 @@ class QdrantV2Retriever:
             extra_fields=_HEAVY_RANKER_PAYLOAD_FIELDS,
             # Social reads were already reserved but are observed by the same
             # request-local proof. Include them without increasing the RPC cap.
-            max_entries=max(1, min(20_000, budget.remaining + len(social_ids))),
+            max_entries=max(1, min(20_000, budget.remaining + (len(social_ids) if social_policy.injects else 0))),
         ) if inline_vectors else None
         if snapshots is not None:
             eligibility_cache = snapshots
@@ -1664,7 +1665,7 @@ class QdrantV2Retriever:
             with RetrievalWork() as work:
                 profile_future = work.submit("profile", self._fetch_user_profile, user_id)
                 social_future = (work.submit("social", self._fetch_social_candidates, social_ids)
-                                 if social_ids else None)
+                                 if social_policy.injects and social_ids else None)
                 # Validate the required profile before any vector-bearing
                 # repository RPC. Deferred mode retains its parallel overlap.
                 if inline_vectors:
@@ -1728,6 +1729,24 @@ class QdrantV2Retriever:
                             metadata[repo_id] = point.payload
                             vectors[repo_id] = point.vector
 
+
+                discovery: list[tuple[str, float, str, dict[str, Any], list[float] | None]] = []
+                try:
+                    discovery_points = self._complete_discovery(
+                        work, discovery_plan, max(limit * 8, 200), eligibility_cache,
+                        include_vectors=inline_vectors, exclude_repo_ids=excluded,
+                        minimum_candidates=limit, existing_repo_ids=set(candidates),
+                    )
+                except RetrievalDependencyError:
+                    if not candidates and not (social_policy.injects and social_future is not None):
+                        raise
+                    discovery_points = []
+                # Shadow evaluation cannot reserve reads needed by serving
+                # retrieval/refills. It may inspect only the remaining budget.
+                if social_policy.mode == 'shadow' and social_ids:
+                    social_ids = social_ids[:budget.reserve(len(social_ids))]
+                    if social_ids:
+                        social_future = work.submit("social", self._fetch_social_candidates, social_ids)
                 if social_future is not None:
                     try:
                         records = work.result(social_future)
@@ -1757,17 +1776,6 @@ class QdrantV2Retriever:
                                 social_points[point.repo_id] = point
                         record_candidate_read("social", records, len(social_points))
 
-                discovery: list[tuple[str, float, str, dict[str, Any], list[float] | None]] = []
-                try:
-                    discovery_points = self._complete_discovery(
-                        work, discovery_plan, max(limit * 8, 200), eligibility_cache,
-                        include_vectors=inline_vectors, exclude_repo_ids=excluded,
-                        minimum_candidates=limit, existing_repo_ids=set(candidates),
-                    )
-                except RetrievalDependencyError:
-                    if not candidates and not (social_policy.injects and social_points):
-                        raise
-                    discovery_points = []
         finally:
             self._release_discovery(discovery_plan)
         for point, channel_source in discovery_points:
