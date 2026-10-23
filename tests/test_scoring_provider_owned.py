@@ -90,6 +90,7 @@ def test_registered_capture_with_actual_owned_qdrant_and_trained_ranker(monkeypa
     monkeypatch.setenv("SCORING_CAPTURE_ENABLED", "true")
     monkeypatch.setenv("SCORING_CAPTURE_CAPABILITY", CAPABILITY)
     monkeypatch.setenv("SCORING_CAPTURE_CODE_COMMIT", COMMIT)
+    monkeypatch.setenv("BAKED_ML_RELEASE_ID", COMMIT)
     with owned_server() as client:
         active, _, _ = make_retriever(client, trained_ranker)
         monkeypatch.setattr(v2, "retriever", lambda: active)

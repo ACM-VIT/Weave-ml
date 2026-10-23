@@ -119,8 +119,10 @@ def authorized_capture_options(request: Request, feed_version: str) -> CaptureOp
         raise CaptureHTTPException(503, "SCORING_CAPTURE_DISABLED", "Scoring capture is disabled.")
     capability = os.getenv("SCORING_CAPTURE_CAPABILITY", "")
     commit = os.getenv("SCORING_CAPTURE_CODE_COMMIT", "")
-    if not re.fullmatch("[a-f0-9]{64}", capability) or not re.fullmatch("[a-f0-9]{40}", commit):
+    baked_commit = os.getenv("BAKED_ML_RELEASE_ID", "")
+    if (not re.fullmatch("[a-f0-9]{64}", capability) or not re.fullmatch("[a-f0-9]{40}", commit)
+            or not re.fullmatch("[a-f0-9]{40}", baked_commit) or commit != baked_commit):
         raise CaptureHTTPException(503, "SCORING_CAPTURE_CONFIG_INVALID", "Scoring capture configuration is invalid.")
     if len(supplied) != 1 or not constant_time_secret_matches(supplied[0], capability):
         raise CaptureHTTPException(403, "SCORING_CAPTURE_FORBIDDEN", "Scoring capture capability is invalid or missing.")
-    return CaptureOptions(feed_version=feed_version, code_commit=commit)
+    return CaptureOptions(feed_version=feed_version, code_commit=baked_commit)

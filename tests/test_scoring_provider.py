@@ -76,6 +76,7 @@ def actual_pipeline(monkeypatch, trained_ranker):
     monkeypatch.setenv("SCORING_CAPTURE_ENABLED", "true")
     monkeypatch.setenv("SCORING_CAPTURE_CAPABILITY", CAPABILITY)
     monkeypatch.setenv("SCORING_CAPTURE_CODE_COMMIT", COMMIT)
+    monkeypatch.setenv("BAKED_ML_RELEASE_ID", COMMIT)
     client = QdrantClient(":memory:")
     retriever, repositories, users = make_retriever(client, trained_ranker)
     monkeypatch.setattr(v2, "retriever", lambda: retriever)
