@@ -241,3 +241,21 @@ def test_withdrawal_attestation_does_not_include_or_reconstruct_private_profile_
     assert 'original_profile_context' not in attestation and '検索' not in attestation
     invalid=__import__('json').loads(attestation);invalid['original_profile_context']={'bio':'revoked'}
     with pytest.raises(WireError):parse_withdrawal(canonical_json(invalid),maximum_bytes=131072,allowed_policies={p.sha256})
+
+
+def test_only_marked_legacy_float_vector_projection_uses_exact_hex_leaves():
+    import math
+    from copy import deepcopy
+    from feedback.model_journal import _legacy_float_projection,_exact_payload_matches
+    payload={'preference_accumulator':[7.541981512397263e-35,-0.0,1],
+        'profile_baseline_vector':[.3], 'feedback_latent_vector':[.2],
+        'feedback_adjustments':{uid(100):{'like':{'delta':[.4],'score':.7}}},
+        'profile_version':1,'other_float':.3}
+    original=deepcopy(payload);encoded=_legacy_float_projection(payload)
+    assert payload==original and encoded['preference_accumulator']==[float.hex(7.541981512397263e-35),'-0x0.0p+0',1]
+    assert encoded['feedback_adjustments'][uid(100)]['like']=={'delta':[float.hex(.4)],'score':.7}
+    assert encoded['other_float']==.3 and _exact_payload_matches(encoded,_legacy_float_projection(original))
+    wrong=deepcopy(encoded);wrong['profile_version']=1.0
+    assert not _exact_payload_matches(wrong,encoded)
+    for value in [math.inf,math.nan]:
+        with pytest.raises(JournalConflict):_legacy_float_projection({'preference_accumulator':[value]})

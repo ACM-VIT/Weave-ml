@@ -455,32 +455,43 @@ class QdrantRecords:
         return found
 
 
-def _mirrored_payload_matches(actual, expected, path=()):
-    """Compare the duplicated compatibility projection, not canonical history.
+LEGACY_FLOAT_ENCODING = 'float64-hex-v1'
 
-    Qdrant's JSON binary64 roundtrip can return an adjacent representable value.
-    Only identified legacy float-vector leaves allow that one-nextafter change.
-    Model complete/base64/head bytes and every identity/counter stay exact.
+
+def _legacy_float_projection(value, path=()):
+    """Encode only duplicated vector leaves; canonical complete bytes stay raw.
+
+    Qdrant REST JSON can round tiny binary64 numbers by multiple ULPs. Hex
+    strings preserve every bit without tolerating corruption or changing the
+    vector/ledger used by model inference and replay.
     """
+    if type(value) is dict:
+        return {key: _legacy_float_projection(item, path + (key,)) for key, item in value.items()}
+    if type(value) is list:
+        return [_legacy_float_projection(item, path + (index,)) for index, item in enumerate(value)]
+    vector_leaf = (len(path) == 2 and path[0] in {
+        'preference_accumulator', 'profile_baseline_vector', 'feedback_latent_vector'} and type(path[-1]) is int)
+    delta_leaf = (len(path) == 5 and path[0] == 'feedback_adjustments' and path[-2] == 'delta'
+                  and type(path[-1]) is int)
+    if type(value) is float and (vector_leaf or delta_leaf):
+        import math
+        if not math.isfinite(value):
+            raise JournalConflict('nonfinite compatibility vector')
+        return value.hex()
+    return value
+
+
+def _exact_payload_matches(actual, expected):
     if type(actual) is not type(expected):
         return False
     if type(expected) is dict:
-        return set(actual) == set(expected) and all(_mirrored_payload_matches(actual[key], value, path + (key,))
+        return set(actual) == set(expected) and all(_exact_payload_matches(actual[key], value)
                                                    for key, value in expected.items())
     if type(expected) is list:
-        return len(actual) == len(expected) and all(_mirrored_payload_matches(a, b, path + (index,))
-                                                    for index, (a, b) in enumerate(zip(actual, expected)))
+        return len(actual) == len(expected) and all(_exact_payload_matches(a, b) for a, b in zip(actual, expected))
     if type(expected) is float:
         import math
-        if not math.isfinite(actual) or not math.isfinite(expected):
-            return False
-        if actual == expected:
-            return True
-        vector_leaf = (len(path) == 2 and path[0] in {
-            'preference_accumulator', 'profile_baseline_vector', 'feedback_latent_vector'} and type(path[-1]) is int)
-        delta_leaf = (len(path) == 5 and path[0] == 'feedback_adjustments' and path[-2] == 'delta'
-                      and type(path[-1]) is int)
-        return (vector_leaf or delta_leaf) and actual in {math.nextafter(expected, math.inf), math.nextafter(expected, -math.inf)}
+        return math.isfinite(actual) and math.isfinite(expected) and actual.hex() == expected.hex()
     return actual == expected
 
 
@@ -492,8 +503,8 @@ class QdrantAtomicUsers:
     Existing points require an explicitly installed migration checkpoint.
     """
     FIELDS=('profile_version','job_id','last_feedback_version','last_feedback_event_id','feedback_state_revision',
-            'model_operation_version','model_journal_head','model_state_sha256','model_policy_sha256','model_basis_status')
-    INTERNAL={'model_complete_base64','model_operation_version','model_journal_head','model_state_sha256','model_policy_sha256','model_basis_status'}
+            'model_operation_version','model_journal_head','model_state_sha256','model_policy_sha256','model_basis_status','model_legacy_vector_encoding')
+    INTERNAL={'model_complete_base64','model_operation_version','model_journal_head','model_state_sha256','model_policy_sha256','model_basis_status','model_legacy_vector_encoding'}
     def __init__(self,client,models,snapshot_filter,*,collection,combined_user_bytes,policy,journal=None,ensure_initialized=None,refuse_missing=None):
         if not collection or not 0<combined_user_bytes<=1024*1024: raise JournalError('explicit user collection/budget required')
         self.client,self.models,self.snapshot_filter=client,models,snapshot_filter
@@ -526,8 +537,8 @@ class QdrantAtomicUsers:
             import math
             if any(not math.isfinite(x) for x in vector) or not math.isclose(math.sqrt(sum(x*x for x in vector)),1.,abs_tol=1e-5):
                 raise JournalError('legacy vector finite/unit validation')
-        payload=dict(legacy['payload'])
-        payload.update(model_complete_base64=base64.b64encode(snapshot.complete).decode(),
+        payload=_legacy_float_projection(legacy['payload'])
+        payload.update(model_legacy_vector_encoding=LEGACY_FLOAT_ENCODING,model_complete_base64=base64.b64encode(snapshot.complete).decode(),
             model_operation_version=snapshot.state.operation_version,model_journal_head=snapshot.head,
             model_state_sha256=reducer.state_sha256(snapshot.state),model_policy_sha256=self.policy.sha256,
             model_basis_status='awaiting_profile' if isinstance(snapshot.state,reducer.BootstrapState) else 'ready')
@@ -558,11 +569,13 @@ class QdrantAtomicUsers:
         if str(point.id)!=_uuid(user_id): raise JournalConflict('canonical snapshot owner differs')
         payload=dict(point.payload or {})
         if 'model_complete_base64' not in payload: raise JournalMissing('explicit migration checkpoint required')
+        if payload.get('model_legacy_vector_encoding') != LEGACY_FLOAT_ENCODING:
+            raise JournalConflict('unknown compatibility vector encoding')
         complete=base64.b64decode(payload['model_complete_base64'],validate=True)
         body=_json(complete,self.limit); state=_unpack(body['state'])
         snapshot=Snapshot(user_id,state,payload.get('model_journal_head'),complete)
         vector,expected=self._point(snapshot)
-        if not _mirrored_payload_matches(payload, expected):
+        if not _exact_payload_matches(payload, expected):
             raise JournalConflict('stored complete state/payload mismatch')
         actual = point.vector
         if isinstance(state, reducer.BootstrapState):

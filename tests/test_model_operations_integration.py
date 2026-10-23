@@ -751,8 +751,12 @@ def test_genuine_genesis_process_death_after_cas_has_guard_before_any_ack_and_de
 
 def test_dense_qdrant_float_mirrors_keep_canonical_history_exact_and_refuse_corruption(runtime):
     import math,base64
-    from feedback.model_journal import _json,_unpack
+    from feedback.model_journal import _json,LEGACY_FLOAT_ENCODING
     values=[math.sin(index+1) for index in range(384)];length=math.sqrt(sum(x*x for x in values));dense=[x/length for x in values]
+    # Actual cached MiniLM Rust profile exposed a two-ULP REST roundtrip at this
+    # tiny coordinate. Include it without rounding the authoritative vector.
+    dense[0]=math.copysign(math.sqrt(dense[0]**2+dense[223]**2),dense[0])
+    dense[223]=7.541981512397263e-35
     runtime.processor.profile_encoder=lambda _:dense
     apply(runtime,wire(runtime.policy,'profile',1,profile_payload()))
     snapshot=runtime.users.read(uid(1))
@@ -762,16 +766,36 @@ def test_dense_qdrant_float_mirrors_keep_canonical_history_exact_and_refuse_corr
     frozen=_json(snapshot.complete,runtime.users.limit)
     expected=frozen['legacy']['payload']['preference_accumulator'];actual=point.payload['preference_accumulator']
     assert expected==dense
-    assert any(a!=b for a,b in zip(actual,expected))  # Real server JSON roundtrip, not a fabricated tolerance test.
-    assert all(a in {b,math.nextafter(b,math.inf),math.nextafter(b,-math.inf)} for a,b in zip(actual,expected))
+    assert actual==[value.hex() for value in expected]
+    assert point.payload['model_legacy_vector_encoding']==LEGACY_FLOAT_ENCODING
     from copy import deepcopy
-    two_ulps=deepcopy(point)
-    two_ulps.payload['preference_accumulator'][0]=math.nextafter(math.nextafter(expected[0],math.inf),math.inf)
-    with pytest.raises(JournalConflict):runtime.users.decode_point(two_ulps,uid(1))
+    for changed in [expected[223],math.nextafter(expected[223],math.inf).hex(),
+                    math.nextafter(math.nextafter(expected[223],math.inf),math.inf).hex(),'nan']:
+        altered=deepcopy(point);altered.payload['preference_accumulator'][223]=changed
+        with pytest.raises(JournalConflict):runtime.users.decode_point(altered,uid(1))
     for key,value,error in [('profile_version',float(point.payload['profile_version']),JournalConflict),
-                            ('model_operation_version',True,JournalConflict),('model_journal_head','f'*64,JournalMissing)]:
+                            ('model_operation_version',True,JournalConflict),('model_journal_head','f'*64,JournalMissing),
+                            ('model_legacy_vector_encoding','unknown',JournalConflict)]:
         altered_point=deepcopy(point);altered_point.payload[key]=value
         with pytest.raises(error):runtime.users.decode_point(altered_point,uid(1))
-    altered=list(actual);altered[0]+=0.01
+    no_tag=deepcopy(point);del no_tag.payload['model_legacy_vector_encoding']
+    with pytest.raises(JournalConflict,match='encoding'):runtime.users.decode_point(no_tag,uid(1))
+    # Legacy routes must refuse the marked projection before interpreting its
+    # string leaves as ordinary feedback/profile state or changing the point.
+    from feedback.v2 import FeedbackStateError
+    event=json.loads(feedback_payload()['original_feedback_json'])
+    with pytest.raises(FeedbackStateError,match='ordered model-operation'):runtime.legacy.apply(event)
+    with pytest.raises(FeedbackStateError,match='ordered model-operation'):runtime.legacy.reject(event,code='fixture',reason='fixture')
+    from embedding.user_profile_store import QdrantUserProfileStore
+    store=QdrantUserProfileStore(client=runtime.qdrant)
+    with pytest.raises(ValueError,match='ordered model-operation'):
+        store.compare_and_set_user(uid(1),dense,payload=frozen['legacy']['payload'],expected_point=point)
+    assert runtime.users.read(uid(1))==snapshot
+    checkpoint=runtime.processor.coordinator.checkpoint(uid(1))
+    apply(runtime,wire(runtime.policy,'begin',2,begin_payload()))
+    apply(runtime,wire(runtime.policy,'feedback',3,feedback_payload()))
+    after=runtime.users.read(uid(1))
+    assert runtime.processor.coordinator.rebuild(checkpoint,after.head,expected_user_id=uid(1))==after
+    altered=list(actual);altered[0]=math.nextafter(expected[0],math.inf).hex()
     runtime.qdrant.set_payload(runtime.settings.user_collection,payload={'preference_accumulator':altered},points=[uid(1)],wait=True)
     with pytest.raises(JournalConflict):runtime.users.read(uid(1))
