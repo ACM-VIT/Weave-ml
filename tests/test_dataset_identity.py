@@ -1,0 +1,151 @@
+"""Stable raw dataset binding and actual-stage regression baseline checks."""
+from copy import deepcopy
+import json
+from pathlib import Path
+import pytest
+from evaluation.recommendation_benchmark import Bundle,Run,digest,evaluate
+from evaluation.benchmark_gates import Baseline,Policy,assess
+from evaluation.stage_runner import FrozenSnapshot,execute_snapshot
+from tests.test_tower_history import require_local_only_git
+
+ROOT=Path(__file__).resolve().parents[1]
+FIXTURE=ROOT/'tests/fixtures/recommendation_actual_stage'
+def read(name):
+    if name=='bundle.json':return json.loads((FIXTURE/'snapshot.json').read_text())['bundle']
+    return json.loads((FIXTURE/name).read_text())
+
+def fixture_report():
+    baseline=Baseline.model_validate(read('baseline.json'))
+    return baseline,Policy.model_validate(read('policy.json'))
+
+
+def test_legacy_bundle_policy_serialization_and_hashes_unchanged():
+    root=ROOT/'tests/fixtures/recommendation_benchmark'
+    baseline=Baseline.model_validate(json.loads((root/'baseline.json').read_text()))
+    bundle=Bundle.model_validate(json.loads((root/'bundle.json').read_text()))
+    policy=Policy.model_validate(json.loads((root/'policy.json').read_text()))
+    assert digest(bundle)==baseline.report.bundle_sha256
+    assert digest(policy)==baseline.policy_sha256
+    assert 'dataset' not in bundle.model_dump(mode='json')
+    assert 'embedding_comparison' not in policy.model_dump(mode='json')
+
+
+def test_explicit_cross_encoder_policy_keeps_per_run_identity_and_metrics():
+    old,policy=fixture_report();raw=read('bundle.json');bundle=Bundle.model_validate(raw)
+    policy=Policy.model_validate({**policy.model_dump(mode='json'),'embedding_comparison':'cross_embedding'})
+    baseline=Baseline.model_validate({**old.model_dump(mode='json'),'policy_sha256':digest(policy)})
+    changed=deepcopy(old.report.model_dump(mode='json'))
+    changed['bundle_sha256']='d'*64
+    changed['embedding_identity']['revision']='e'*40
+    changed['embedding_sha256']=digest(changed['embedding_identity'])
+    assessment=assess(changed,baseline,policy)
+    assert assessment['passed']
+    changed['stages']['assembly']['metrics']['judged_ndcg_at_k']=0.
+    assert 'assembly.judged_ndcg_at_k: below minimum' in assess(changed,baseline,policy)['failures']
+    with pytest.raises(ValueError,match='identity digest'):
+        assess({**changed,'embedding_sha256':'f'*64},baseline,policy)
+    assert bundle.dataset.sha256==old.report.evaluation_dataset_sha256
+
+
+@pytest.mark.parametrize('part',['readme','context','judgments','split','exclusions'])
+def test_every_raw_source_label_split_and_exclusion_change_is_bound(part):
+    old,policy=fixture_report();raw=read('bundle.json')
+    if part=='readme':raw['dataset']['repositories'][0]['readme']='different frozen source'
+    elif part=='context':raw['dataset']['profiles'][0]['context_text']='different original profile context'
+    elif part=='judgments':
+        raw['dataset']['judgments'][0]['grade']=3
+        raw['judgments']=deepcopy(raw['dataset']['judgments'])
+    elif part=='split':raw['dataset']['split'][raw['profiles'][0]['profile_id']]='other'
+    else:
+        raw['dataset']['profiles'][0]['seen']=[];raw['profiles'][0]['seen']=[]
+    changed=Bundle.model_validate(raw)
+    assert changed.dataset.sha256!=old.report.evaluation_dataset_sha256
+    policy=Policy.model_validate({**policy.model_dump(mode='json'),'embedding_comparison':'cross_embedding'})
+    baseline=Baseline.model_validate({**old.model_dump(mode='json'),'policy_sha256':digest(policy)})
+    report={**old.report.model_dump(mode='json'),'evaluation_dataset_sha256':changed.dataset.sha256}
+    assert any('identical verified raw' in f for f in assess(report,baseline,policy)['failures'])
+
+
+def test_dataset_cannot_include_vector_material_or_disagree_with_bundle():
+    raw=read('bundle.json');raw['dataset']['repositories'][0]['ranking_material']['nested']={'vector':[1.,0.]}
+    with pytest.raises(ValueError,match='model material'):Bundle.model_validate(raw)
+    raw=read('bundle.json');raw['dataset']['profiles'][0]['seen']=[]
+    with pytest.raises(ValueError,match='profile/exclusions'):Bundle.model_validate(raw)
+
+
+def test_actual_snapshot_must_match_bound_non_model_material():
+    raw=read('snapshot.json');raw['profiles'][0]['payload']['skills']=['other-context']
+    with pytest.raises(ValueError,match='actual profile context'):FrozenSnapshot.model_validate(raw)
+    raw=read('snapshot.json');raw['repositories'][0]['payload']['fork_count']+=1
+    with pytest.raises(ValueError,match='actual ranking material'):FrozenSnapshot.model_validate(raw)
+
+
+def test_actual_candidate_report_gates_against_fixed_dated_baseline():
+    require_local_only_git()
+    snapshot=FrozenSnapshot.model_validate(read('snapshot.json'))
+    exported=execute_snapshot(snapshot,ROOT/'inference')
+    baseline,policy=fixture_report();report=evaluate(snapshot.bundle,exported.run,k=policy.k)
+    assert assess(report,baseline,policy)['passed']
+    changed=exported.run.model_dump(mode='json')
+    for output in changed['outputs']:
+        positive={j.repo_id for j in snapshot.bundle.judgments if j.profile_id==output['profile_id'] and j.grade>0}
+        output['stages']['assembly']=[r for r in output['stages']['ranking'] if r['repo_id'] not in positive][:policy.k]
+    regression=evaluate(snapshot.bundle,Run.model_validate(changed),k=policy.k)
+    assert not assess(regression,baseline,policy)['passed']
+    with pytest.raises(ValueError,match='incompatible embedding identity'):
+        evaluate(snapshot.bundle,Run.model_validate({**changed,'embedding':{**changed['embedding'],'revision':'e'*40}}),k=policy.k)
+
+
+@pytest.mark.parametrize('field',['identity','dimension','feature_schema','weights','scaler','file_drift','unsupported_runtime'])
+def test_cross_encoder_cli_requires_actual_manifest_contract(tmp_path,field,monkeypatch):
+    # Deliberately synthetic declarations test validation only. These tiny byte
+    # artifacts are not models and can never yield qualification evidence.
+    import hashlib
+    from scripts import evaluate_recommendations as cli
+    snapshot=read('snapshot.json');old,policy=fixture_report()
+    policy=Policy.model_validate({**policy.model_dump(mode='json'),'embedding_comparison':'cross_embedding'})
+    model=tmp_path/'model.pt';model.write_bytes(b'synthetic model bytes')
+    scaler=tmp_path/'scaler.json';scaler.write_bytes(b'synthetic scaler bytes')
+    # Preserve the independently recorded stage rows, with explicit synthetic
+    # test artifact identities instead of pretending they came from inference.
+    recorded=read('baseline.json')['report']['artifact']
+    outputs=[]
+    for profile in snapshot['bundle']['profiles']:
+        rows=[{'repo_id':r['repo_id'],'source':'fixture','source_score':0.,'score':0.} for r in snapshot['bundle']['repositories'] if r['repo_id'] not in set(profile['seen'])|set(profile['disliked'])]
+        outputs.append({'profile_id':profile['profile_id'],'stages':{stage:rows for stage in ('retrieval','ranking','assembly')},'latency_ms':{stage:1. for stage in ('retrieval','ranking','assembly')}})
+    run={**recorded,'embedding':snapshot['bundle']['embedding'],'outputs':outputs,
+         'model_sha256':hashlib.sha256(model.read_bytes()).hexdigest(),'scaler_sha256':hashlib.sha256(scaler.read_bytes()).hexdigest()}
+    manifest={'embedding_identity':deepcopy(run['embedding']),'embedding_dim':run['embedding']['dimension'],
+              'model_sha256':run['model_sha256'],'scaler_sha256':run['scaler_sha256'],'feature_spec_version':run['feature_schema'],'feature_count':10,'input_dim':778}
+    good_manifest=deepcopy(manifest)
+    if field=='identity':manifest['embedding_identity']['query_prompt']='wrong-role-prompt'
+    elif field=='dimension':manifest['embedding_dim']=1024
+    elif field=='feature_schema':manifest['feature_spec_version']='wrong-schema'
+    elif field=='weights':manifest['model_sha256']='a'*64
+    elif field=='scaler':manifest['scaler_sha256']='b'*64
+    elif field=='file_drift':manifest['embedding_identity']['query_prompt']='different hashed input'
+    elif field=='unsupported_runtime':
+        run['embedding']['dimension']=1024
+        snapshot['bundle']['embedding']['dimension']=1024
+        for row in snapshot['bundle']['repositories']:row['vector'] += [0.]*(1024-len(row['vector']))
+        manifest['embedding_identity']=deepcopy(run['embedding'])
+        manifest['embedding_dim']=1024;manifest['input_dim']=2058
+    manifest_path=tmp_path/'manifest.json';manifest_path.write_text(json.dumps(manifest));run['manifest_sha256']=hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    if field=='file_drift':
+        original=cli.file_sha256
+        def replace_after_hash(path):
+            result=original(path)
+            if path==manifest_path:manifest_path.write_text(json.dumps(good_manifest))
+            return result
+        monkeypatch.setattr(cli,'file_sha256',replace_after_hash)
+    bundle=Bundle.model_validate(snapshot['bundle']);parsed=Run.model_validate(run);report=evaluate(bundle,parsed,k=policy.k)
+    baseline={'schema_version':1,'status':'diagnostic','reference':'synthetic manifest-mechanics only',
+        'policy_sha256':digest(policy),'report_sha256':digest(report),'report':report}
+    argv=[]
+    for name,value in [('bundle',snapshot['bundle']),('run',run),('baseline',baseline),('policy',policy.model_dump(mode='json'))]:
+        path=tmp_path/(name+'.json');path.write_text(json.dumps(value));argv.extend(['--'+name,str(path)])
+    output=tmp_path/'out.json'
+    assert cli.main([*argv,'--output',str(output),'--qualify','--model-artifact',str(model),'--scaler-artifact',str(scaler),'--manifest-artifact',str(manifest_path)])==1
+    payload=json.loads(output.read_text())
+    assert 'candidate manifest embedding/feature/model compatibility mismatch' in payload['assessment']['failures']
+    assert payload['qualification_manifest'] is None

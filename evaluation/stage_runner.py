@@ -111,6 +111,19 @@ class FrozenSnapshot(StrictModel):
             if (p['star_count']!=repo.popularity or p['topics']!=repo.topics
                     or p.get('owner_github_id')!=repo.owner or p.get('fork_family_github_id')!=repo.fork_family):
                 raise ValueError('bundle metrics metadata and frozen payload disagree')
+        if self.bundle.dataset is not None:
+            sources={row.repo_id:row for row in self.bundle.dataset.repositories}
+            model_keys={'embedding_dim','embedding_model','embedding_model_revision','embedding_version',
+                        'model_version','serving_eligibility_version','indexed_at'}
+            for row in self.repositories:
+                material={key:value for key,value in row.payload.items() if key not in model_keys}
+                if sources[row.repo_id].ranking_material != material:
+                    raise ValueError('raw dataset and actual ranking material differ')
+            profiles={row.profile_id:row for row in self.bundle.dataset.profiles}
+            for row in self.profiles:
+                for key in ('skills','tech_stack','interests','topics'):
+                    if getattr(profiles[row.profile_id],key) != row.payload[key]:
+                        raise ValueError('raw dataset and actual profile context differ')
         return self
 
 
@@ -136,7 +149,8 @@ class StageRunExport(StrictModel):
     @model_validator(mode='after')
     def bound_artifacts(self):
         if (self.run.model_sha256!=self.artifacts.model_sha256 or self.run.scaler_sha256!=self.artifacts.scaler_sha256
-                or self.run.code_commit!=self.code_commit or self.run.timing_kind!='measured'):
+                or self.run.code_commit!=self.code_commit or self.run.timing_kind!='measured'
+                or (self.run.manifest_sha256 is not None and self.run.manifest_sha256!=self.artifacts.manifest_sha256)):
             raise ValueError('stage export and actual run identity disagree')
         if set(self.source_scores)!={row.profile_id for row in self.run.outputs}:
             raise ValueError('source score/profile identity mismatch')
@@ -356,7 +370,7 @@ def execute_snapshot(snapshot: FrozenSnapshot, artifact_dir: Path, *, treatment=
     if before!={key:hashlib.sha256((artifact_dir/name).read_bytes()).hexdigest() for key,name in names.items()} or source_identity()!=(commit,dirty,hashes):
         raise ValueError('source/artifact identity changed during replay')
     run=Run.model_validate(dict(schema_version=1,embedding=snapshot.bundle.embedding.model_dump(),model_id=ranker.model_version,
-        model_sha256=before['model_sha256'],scaler_sha256=before['scaler_sha256'],feature_schema=ranker.feature_spec_version,
+        manifest_sha256=before['manifest_sha256'],model_sha256=before['model_sha256'],scaler_sha256=before['scaler_sha256'],feature_schema=ranker.feature_spec_version,
         code_commit=commit,created_at=datetime.now(timezone.utc).isoformat(),timing_kind='measured',outputs=outputs))
     return StageRunExport(bundle_sha256=digest(snapshot.bundle),snapshot_sha256=frozen_snapshot_sha,artifacts=snapshot.artifacts,
         source_sha256=hashes,code_commit=commit,source_tree_dirty=dirty,as_of=snapshot.as_of,seed=snapshot.seed,total_ms=totals,source_scores=source_scores,configuration=configuration,

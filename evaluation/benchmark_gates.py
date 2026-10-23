@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 from pydantic import Field, field_validator, model_validator
 
 from evaluation.recommendation_benchmark import (
-    Commit, Digest, Number, Provenance, STAGES, StrictModel, Text, aware_timestamp, digest,
+    Commit, Digest, Number, Provenance, STAGES, StrictModel, Text, EmbeddingIdentity, aware_timestamp, digest,
 )
 
 # Directions are semantic, not caller-controlled knobs that can invert a gate.
@@ -53,6 +53,7 @@ class StageReport(StrictModel):
 class Artifact(StrictModel):
     schema_version: Literal[1]
     model_id: Text
+    manifest_sha256: Digest | None = Field(default=None, exclude_if=lambda value: value is None)
     model_sha256: Digest
     scaler_sha256: Digest
     feature_schema: Text
@@ -64,6 +65,8 @@ class Artifact(StrictModel):
 
 class Report(StrictModel):
     schema_version: Literal[1]
+    evaluation_dataset_sha256: Digest | None = Field(default=None, exclude_if=lambda value: value is None)
+    embedding_identity: EmbeddingIdentity | None = Field(default=None, exclude_if=lambda value: value is None)
     bundle_sha256: Digest
     run_sha256: Digest
     snapshot_id: Text
@@ -76,6 +79,10 @@ class Report(StrictModel):
 
     @model_validator(mode='after')
     def complete_stages(self):
+        if (self.evaluation_dataset_sha256 is None) != (self.embedding_identity is None):
+            raise ValueError('dataset comparison requires full per-run embedding identity')
+        if self.embedding_identity is not None and digest(self.embedding_identity) != self.embedding_sha256:
+            raise ValueError('full per-run embedding identity digest mismatch')
         if set(self.stages) != set(STAGES):
             raise ValueError('report requires all stages')
         if len({stage.counts['profiles'] for stage in self.stages.values()}) != 1:
@@ -119,6 +126,8 @@ class Rule(StrictModel):
 
 class Policy(StrictModel):
     schema_version: Literal[1]
+    embedding_comparison: Literal['same_embedding', 'cross_embedding'] = Field(
+        default='same_embedding', exclude_if=lambda value: value == 'same_embedding')
     policy_id: Text
     reference: Text
     k: Annotated[int, Field(ge=1, le=1000)]
@@ -140,7 +149,14 @@ def assess(report: dict, baseline: Baseline, policy: Policy, *, qualify: bool = 
     failures = []
     if baseline.policy_sha256 != digest(policy):
         failures.append('baseline policy digest mismatch')
-    for field in ('bundle_sha256', 'snapshot_id', 'embedding_sha256', 'k'):
+    compare_fields = ('snapshot_id', 'k')
+    if policy.embedding_comparison == 'cross_embedding':
+        if (candidate.evaluation_dataset_sha256 is None or previous.evaluation_dataset_sha256 is None
+                or candidate.evaluation_dataset_sha256 != previous.evaluation_dataset_sha256):
+            failures.append('cross-embedding evaluation requires the identical verified raw source/profile/judgment/split dataset')
+    else:
+        compare_fields += ('bundle_sha256', 'embedding_sha256')
+    for field in compare_fields:
         if getattr(candidate, field) != getattr(previous, field):
             failures.append(f'baseline {field} mismatch')
     if candidate.k != policy.k:
@@ -170,6 +186,8 @@ def assess(report: dict, baseline: Baseline, policy: Policy, *, qualify: bool = 
         failures.extend(f'{name}: {reason}' for reason in reasons)
         checks.append({'gate': name, 'value': value, 'baseline': old, 'passed': not reasons})
     if qualify:
+        if policy.embedding_comparison == 'cross_embedding' and candidate.artifact.manifest_sha256 is None:
+            failures.append('cross-embedding qualification requires the exact candidate compatibility manifest')
         if candidate.provenance.kind == 'synthetic' or previous.provenance.kind == 'synthetic':
             failures.append('synthetic evidence cannot qualify a production model')
         if baseline.status != 'promoted':

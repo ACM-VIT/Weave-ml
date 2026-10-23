@@ -1,0 +1,1275 @@
+{
+  "artifacts": {
+    "manifest_sha256": "b9f7c18e41e6dc55689409463941859ad0c1e491ebb8d494b1522f5d8acc9892",
+    "model_sha256": "ab7d804261bf204e51962192c26b445e058057993ddb67ff75cf32791cca9215",
+    "scaler_sha256": "3c168432741b1e58877692f9cd116a7362bc3a902e63154b88be5e0c2009c5ee"
+  },
+  "as_of": "2026-10-24T00:00:00Z",
+  "bundle": {
+    "created_at": "2026-10-24T00:00:00Z",
+    "dataset": {
+      "judgments": [
+        {
+          "grade": 1,
+          "profile_id": "00000000-0000-4000-8000-000000000100",
+          "repo_id": "00000000-0000-4000-8000-000000000003"
+        },
+        {
+          "grade": 1,
+          "profile_id": "00000000-0000-4000-8000-000000000101",
+          "repo_id": "00000000-0000-4000-8000-000000000003"
+        }
+      ],
+      "profiles": [
+        {
+          "context_text": "",
+          "disliked": [
+            "00000000-0000-4000-8000-000000000002"
+          ],
+          "intent": "synthetic Python profile",
+          "interests": [
+            "search"
+          ],
+          "profile_id": "00000000-0000-4000-8000-000000000100",
+          "seen": [
+            "00000000-0000-4000-8000-000000000001"
+          ],
+          "skills": [
+            "Python"
+          ],
+          "tech_stack": [],
+          "topics": [
+            "python"
+          ]
+        },
+        {
+          "context_text": "",
+          "disliked": [
+            "00000000-0000-4000-8000-000000000002"
+          ],
+          "intent": "synthetic Python profile",
+          "interests": [
+            "search"
+          ],
+          "profile_id": "00000000-0000-4000-8000-000000000101",
+          "seen": [
+            "00000000-0000-4000-8000-000000000001"
+          ],
+          "skills": [
+            "Python"
+          ],
+          "tech_stack": [],
+          "topics": [
+            "python"
+          ]
+        }
+      ],
+      "provenance": {
+        "kind": "synthetic",
+        "reference": "generated unit diagnostic, no human relevance judgments"
+      },
+      "reference": "synthetic raw-source fixture only",
+      "repositories": [
+        {
+          "archived": false,
+          "description": "",
+          "fork_family": "1",
+          "full_name": "diagnostic/repo0",
+          "owner": "1",
+          "popularity": 10,
+          "ranking_material": {
+            "activity_score": 0.0,
+            "card_summary": null,
+            "card_summary_artifact_hash": null,
+            "card_summary_format_version": null,
+            "card_summary_highlights": [],
+            "card_summary_model_version": null,
+            "card_summary_prompt_version": null,
+            "card_summary_source": null,
+            "category": "Unknown",
+            "code_health": 0.0,
+            "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "content_version": 1,
+            "created_at": null,
+            "delta_30d": 0,
+            "delta_3d": 0,
+            "delta_7d": 0,
+            "description": "",
+            "discovery_band": null,
+            "discovery_category": null,
+            "doc_quality": 0.0,
+            "feature_spec_version": "v2",
+            "fork_count": 0,
+            "fork_family_github_id": "1",
+            "full_name": "diagnostic/repo0",
+            "github_id": "1",
+            "html_url": null,
+            "is_fork": false,
+            "languages": [
+              "Python"
+            ],
+            "lineage_observed_at": "2026-10-24T00:00:00Z",
+            "lineage_source": "github-graphql-repository",
+            "mentionable_users_count": 0,
+            "open_issues_count": 0,
+            "owner_github_id": "1",
+            "primary_language": "Python",
+            "pushed_at": "2026-10-23T00:00:00Z",
+            "pushed_days_ago": 999,
+            "readme_chunks": 0,
+            "readme_length": 0,
+            "repo_id": "00000000-0000-4000-8000-000000000001",
+            "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "star_count": 10,
+            "tags": [],
+            "topics": [
+              "python"
+            ],
+            "trend_velocity": 0.0,
+            "updated_at": null
+          },
+          "readme": "",
+          "repo_id": "00000000-0000-4000-8000-000000000001",
+          "topics": [
+            "python"
+          ]
+        },
+        {
+          "archived": false,
+          "description": "",
+          "fork_family": "2",
+          "full_name": "diagnostic/repo1",
+          "owner": "2",
+          "popularity": 11,
+          "ranking_material": {
+            "activity_score": 0.0,
+            "card_summary": null,
+            "card_summary_artifact_hash": null,
+            "card_summary_format_version": null,
+            "card_summary_highlights": [],
+            "card_summary_model_version": null,
+            "card_summary_prompt_version": null,
+            "card_summary_source": null,
+            "category": "Unknown",
+            "code_health": 0.0,
+            "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "content_version": 1,
+            "created_at": null,
+            "delta_30d": 0,
+            "delta_3d": 0,
+            "delta_7d": 0,
+            "description": "",
+            "discovery_band": null,
+            "discovery_category": null,
+            "doc_quality": 0.0,
+            "feature_spec_version": "v2",
+            "fork_count": 0,
+            "fork_family_github_id": "2",
+            "full_name": "diagnostic/repo1",
+            "github_id": "2",
+            "html_url": null,
+            "is_fork": false,
+            "languages": [
+              "Python"
+            ],
+            "lineage_observed_at": "2026-10-24T00:00:00Z",
+            "lineage_source": "github-graphql-repository",
+            "mentionable_users_count": 0,
+            "open_issues_count": 0,
+            "owner_github_id": "2",
+            "primary_language": "Python",
+            "pushed_at": "2026-10-23T00:00:00Z",
+            "pushed_days_ago": 999,
+            "readme_chunks": 0,
+            "readme_length": 0,
+            "repo_id": "00000000-0000-4000-8000-000000000002",
+            "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "star_count": 11,
+            "tags": [],
+            "topics": [
+              "python"
+            ],
+            "trend_velocity": 0.0,
+            "updated_at": null
+          },
+          "readme": "",
+          "repo_id": "00000000-0000-4000-8000-000000000002",
+          "topics": [
+            "python"
+          ]
+        },
+        {
+          "archived": false,
+          "description": "",
+          "fork_family": "3",
+          "full_name": "diagnostic/repo2",
+          "owner": "3",
+          "popularity": 12,
+          "ranking_material": {
+            "activity_score": 0.0,
+            "card_summary": null,
+            "card_summary_artifact_hash": null,
+            "card_summary_format_version": null,
+            "card_summary_highlights": [],
+            "card_summary_model_version": null,
+            "card_summary_prompt_version": null,
+            "card_summary_source": null,
+            "category": "Unknown",
+            "code_health": 0.0,
+            "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "content_version": 1,
+            "created_at": null,
+            "delta_30d": 0,
+            "delta_3d": 0,
+            "delta_7d": 0,
+            "description": "",
+            "discovery_band": null,
+            "discovery_category": null,
+            "doc_quality": 0.0,
+            "feature_spec_version": "v2",
+            "fork_count": 0,
+            "fork_family_github_id": "3",
+            "full_name": "diagnostic/repo2",
+            "github_id": "3",
+            "html_url": null,
+            "is_fork": false,
+            "languages": [
+              "Python"
+            ],
+            "lineage_observed_at": "2026-10-24T00:00:00Z",
+            "lineage_source": "github-graphql-repository",
+            "mentionable_users_count": 0,
+            "open_issues_count": 0,
+            "owner_github_id": "3",
+            "primary_language": "Python",
+            "pushed_at": "2026-10-23T00:00:00Z",
+            "pushed_days_ago": 999,
+            "readme_chunks": 0,
+            "readme_length": 0,
+            "repo_id": "00000000-0000-4000-8000-000000000003",
+            "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "star_count": 12,
+            "tags": [],
+            "topics": [
+              "python"
+            ],
+            "trend_velocity": 0.0,
+            "updated_at": null
+          },
+          "readme": "",
+          "repo_id": "00000000-0000-4000-8000-000000000003",
+          "topics": [
+            "python"
+          ]
+        },
+        {
+          "archived": false,
+          "description": "",
+          "fork_family": "4",
+          "full_name": "diagnostic/repo3",
+          "owner": "4",
+          "popularity": 13,
+          "ranking_material": {
+            "activity_score": 0.0,
+            "card_summary": null,
+            "card_summary_artifact_hash": null,
+            "card_summary_format_version": null,
+            "card_summary_highlights": [],
+            "card_summary_model_version": null,
+            "card_summary_prompt_version": null,
+            "card_summary_source": null,
+            "category": "Unknown",
+            "code_health": 0.0,
+            "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "content_version": 1,
+            "created_at": null,
+            "delta_30d": 0,
+            "delta_3d": 0,
+            "delta_7d": 0,
+            "description": "",
+            "discovery_band": null,
+            "discovery_category": null,
+            "doc_quality": 0.0,
+            "feature_spec_version": "v2",
+            "fork_count": 0,
+            "fork_family_github_id": "4",
+            "full_name": "diagnostic/repo3",
+            "github_id": "4",
+            "html_url": null,
+            "is_fork": false,
+            "languages": [
+              "Python"
+            ],
+            "lineage_observed_at": "2026-10-24T00:00:00Z",
+            "lineage_source": "github-graphql-repository",
+            "mentionable_users_count": 0,
+            "open_issues_count": 0,
+            "owner_github_id": "4",
+            "primary_language": "Python",
+            "pushed_at": "2026-10-23T00:00:00Z",
+            "pushed_days_ago": 999,
+            "readme_chunks": 0,
+            "readme_length": 0,
+            "repo_id": "00000000-0000-4000-8000-000000000004",
+            "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "star_count": 13,
+            "tags": [],
+            "topics": [
+              "python"
+            ],
+            "trend_velocity": 0.0,
+            "updated_at": null
+          },
+          "readme": "",
+          "repo_id": "00000000-0000-4000-8000-000000000004",
+          "topics": [
+            "python"
+          ]
+        },
+        {
+          "archived": false,
+          "description": "",
+          "fork_family": "5",
+          "full_name": "diagnostic/repo4",
+          "owner": "5",
+          "popularity": 14,
+          "ranking_material": {
+            "activity_score": 0.0,
+            "card_summary": null,
+            "card_summary_artifact_hash": null,
+            "card_summary_format_version": null,
+            "card_summary_highlights": [],
+            "card_summary_model_version": null,
+            "card_summary_prompt_version": null,
+            "card_summary_source": null,
+            "category": "Unknown",
+            "code_health": 0.0,
+            "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "content_version": 1,
+            "created_at": null,
+            "delta_30d": 0,
+            "delta_3d": 0,
+            "delta_7d": 0,
+            "description": "",
+            "discovery_band": null,
+            "discovery_category": null,
+            "doc_quality": 0.0,
+            "feature_spec_version": "v2",
+            "fork_count": 0,
+            "fork_family_github_id": "5",
+            "full_name": "diagnostic/repo4",
+            "github_id": "5",
+            "html_url": null,
+            "is_fork": false,
+            "languages": [
+              "Python"
+            ],
+            "lineage_observed_at": "2026-10-24T00:00:00Z",
+            "lineage_source": "github-graphql-repository",
+            "mentionable_users_count": 0,
+            "open_issues_count": 0,
+            "owner_github_id": "5",
+            "primary_language": "Python",
+            "pushed_at": "2026-10-23T00:00:00Z",
+            "pushed_days_ago": 999,
+            "readme_chunks": 0,
+            "readme_length": 0,
+            "repo_id": "00000000-0000-4000-8000-000000000005",
+            "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "star_count": 14,
+            "tags": [],
+            "topics": [
+              "python"
+            ],
+            "trend_velocity": 0.0,
+            "updated_at": null
+          },
+          "readme": "",
+          "repo_id": "00000000-0000-4000-8000-000000000005",
+          "topics": [
+            "python"
+          ]
+        },
+        {
+          "archived": false,
+          "description": "",
+          "fork_family": "6",
+          "full_name": "diagnostic/repo5",
+          "owner": "6",
+          "popularity": 15,
+          "ranking_material": {
+            "activity_score": 0.0,
+            "card_summary": null,
+            "card_summary_artifact_hash": null,
+            "card_summary_format_version": null,
+            "card_summary_highlights": [],
+            "card_summary_model_version": null,
+            "card_summary_prompt_version": null,
+            "card_summary_source": null,
+            "category": "Unknown",
+            "code_health": 0.0,
+            "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "content_version": 1,
+            "created_at": null,
+            "delta_30d": 0,
+            "delta_3d": 0,
+            "delta_7d": 0,
+            "description": "",
+            "discovery_band": null,
+            "discovery_category": null,
+            "doc_quality": 0.0,
+            "feature_spec_version": "v2",
+            "fork_count": 0,
+            "fork_family_github_id": "6",
+            "full_name": "diagnostic/repo5",
+            "github_id": "6",
+            "html_url": null,
+            "is_fork": false,
+            "languages": [
+              "Python"
+            ],
+            "lineage_observed_at": "2026-10-24T00:00:00Z",
+            "lineage_source": "github-graphql-repository",
+            "mentionable_users_count": 0,
+            "open_issues_count": 0,
+            "owner_github_id": "6",
+            "primary_language": "Python",
+            "pushed_at": "2026-10-23T00:00:00Z",
+            "pushed_days_ago": 999,
+            "readme_chunks": 0,
+            "readme_length": 0,
+            "repo_id": "00000000-0000-4000-8000-000000000006",
+            "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "star_count": 15,
+            "tags": [],
+            "topics": [
+              "python"
+            ],
+            "trend_velocity": 0.0,
+            "updated_at": null
+          },
+          "readme": "",
+          "repo_id": "00000000-0000-4000-8000-000000000006",
+          "topics": [
+            "python"
+          ]
+        },
+        {
+          "archived": false,
+          "description": "",
+          "fork_family": "7",
+          "full_name": "diagnostic/repo6",
+          "owner": "7",
+          "popularity": 16,
+          "ranking_material": {
+            "activity_score": 0.0,
+            "card_summary": null,
+            "card_summary_artifact_hash": null,
+            "card_summary_format_version": null,
+            "card_summary_highlights": [],
+            "card_summary_model_version": null,
+            "card_summary_prompt_version": null,
+            "card_summary_source": null,
+            "category": "Unknown",
+            "code_health": 0.0,
+            "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "content_version": 1,
+            "created_at": null,
+            "delta_30d": 0,
+            "delta_3d": 0,
+            "delta_7d": 0,
+            "description": "",
+            "discovery_band": null,
+            "discovery_category": null,
+            "doc_quality": 0.0,
+            "feature_spec_version": "v2",
+            "fork_count": 0,
+            "fork_family_github_id": "7",
+            "full_name": "diagnostic/repo6",
+            "github_id": "7",
+            "html_url": null,
+            "is_fork": false,
+            "languages": [
+              "Python"
+            ],
+            "lineage_observed_at": "2026-10-24T00:00:00Z",
+            "lineage_source": "github-graphql-repository",
+            "mentionable_users_count": 0,
+            "open_issues_count": 0,
+            "owner_github_id": "7",
+            "primary_language": "Python",
+            "pushed_at": "2026-10-23T00:00:00Z",
+            "pushed_days_ago": 999,
+            "readme_chunks": 0,
+            "readme_length": 0,
+            "repo_id": "00000000-0000-4000-8000-000000000007",
+            "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "star_count": 16,
+            "tags": [],
+            "topics": [
+              "python"
+            ],
+            "trend_velocity": 0.0,
+            "updated_at": null
+          },
+          "readme": "",
+          "repo_id": "00000000-0000-4000-8000-000000000007",
+          "topics": [
+            "python"
+          ]
+        },
+        {
+          "archived": true,
+          "description": "",
+          "fork_family": "8",
+          "full_name": "diagnostic/repo7",
+          "owner": "8",
+          "popularity": 17,
+          "ranking_material": {
+            "activity_score": 0.0,
+            "card_summary": null,
+            "card_summary_artifact_hash": null,
+            "card_summary_format_version": null,
+            "card_summary_highlights": [],
+            "card_summary_model_version": null,
+            "card_summary_prompt_version": null,
+            "card_summary_source": null,
+            "category": "Unknown",
+            "code_health": 0.0,
+            "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "content_version": 1,
+            "created_at": null,
+            "delta_30d": 0,
+            "delta_3d": 0,
+            "delta_7d": 0,
+            "description": "",
+            "discovery_band": null,
+            "discovery_category": null,
+            "doc_quality": 0.0,
+            "feature_spec_version": "v2",
+            "fork_count": 0,
+            "fork_family_github_id": "8",
+            "full_name": "diagnostic/repo7",
+            "github_id": "8",
+            "html_url": null,
+            "is_fork": false,
+            "languages": [
+              "Python"
+            ],
+            "lineage_observed_at": "2026-10-24T00:00:00Z",
+            "lineage_source": "github-graphql-repository",
+            "mentionable_users_count": 0,
+            "open_issues_count": 0,
+            "owner_github_id": "8",
+            "primary_language": "Python",
+            "pushed_at": "2026-10-23T00:00:00Z",
+            "pushed_days_ago": 999,
+            "readme_chunks": 0,
+            "readme_length": 0,
+            "repo_id": "00000000-0000-4000-8000-000000000008",
+            "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "star_count": 17,
+            "tags": [],
+            "topics": [
+              "python"
+            ],
+            "trend_velocity": 0.0,
+            "updated_at": null
+          },
+          "readme": "",
+          "repo_id": "00000000-0000-4000-8000-000000000008",
+          "topics": [
+            "python"
+          ]
+        }
+      ],
+      "schema_version": 1,
+      "snapshot_id": "synthetic-actual-stages-v1",
+      "split": {
+        "00000000-0000-4000-8000-000000000100": "diagnostic",
+        "00000000-0000-4000-8000-000000000101": "diagnostic"
+      }
+    },
+    "embedding": {
+      "dimension": 384,
+      "document_prompt": "",
+      "model": "all-MiniLM-L6-v2",
+      "normalized": true,
+      "pooling": "mean",
+      "query_prompt": "",
+      "recipe": "repo-embedding-v2",
+      "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+    },
+    "judgments": [
+      {
+        "grade": 1,
+        "profile_id": "00000000-0000-4000-8000-000000000100",
+        "repo_id": "00000000-0000-4000-8000-000000000003"
+      },
+      {
+        "grade": 1,
+        "profile_id": "00000000-0000-4000-8000-000000000101",
+        "repo_id": "00000000-0000-4000-8000-000000000003"
+      }
+    ],
+    "profiles": [
+      {
+        "disliked": [
+          "00000000-0000-4000-8000-000000000002"
+        ],
+        "intent": "synthetic Python profile",
+        "profile_id": "00000000-0000-4000-8000-000000000100",
+        "seen": [
+          "00000000-0000-4000-8000-000000000001"
+        ]
+      },
+      {
+        "disliked": [
+          "00000000-0000-4000-8000-000000000002"
+        ],
+        "intent": "synthetic Python profile",
+        "profile_id": "00000000-0000-4000-8000-000000000101",
+        "seen": [
+          "00000000-0000-4000-8000-000000000001"
+        ]
+      }
+    ],
+    "provenance": {
+      "kind": "synthetic",
+      "reference": "generated unit diagnostic, no human relevance judgments"
+    },
+    "repositories": [
+      {
+        "archived": false,
+        "fork_family": "1",
+        "owner": "1",
+        "popularity": 10,
+        "repo_id": "00000000-0000-4000-8000-000000000001",
+        "topics": [
+          "python"
+        ],
+        "vector": [1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]
+      },
+      {
+        "archived": false,
+        "fork_family": "2",
+        "owner": "2",
+        "popularity": 11,
+        "repo_id": "00000000-0000-4000-8000-000000000002",
+        "topics": [
+          "python"
+        ],
+        "vector": [0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]
+      },
+      {
+        "archived": false,
+        "fork_family": "3",
+        "owner": "3",
+        "popularity": 12,
+        "repo_id": "00000000-0000-4000-8000-000000000003",
+        "topics": [
+          "python"
+        ],
+        "vector": [0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]
+      },
+      {
+        "archived": false,
+        "fork_family": "4",
+        "owner": "4",
+        "popularity": 13,
+        "repo_id": "00000000-0000-4000-8000-000000000004",
+        "topics": [
+          "python"
+        ],
+        "vector": [1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]
+      },
+      {
+        "archived": false,
+        "fork_family": "5",
+        "owner": "5",
+        "popularity": 14,
+        "repo_id": "00000000-0000-4000-8000-000000000005",
+        "topics": [
+          "python"
+        ],
+        "vector": [0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]
+      },
+      {
+        "archived": false,
+        "fork_family": "6",
+        "owner": "6",
+        "popularity": 15,
+        "repo_id": "00000000-0000-4000-8000-000000000006",
+        "topics": [
+          "python"
+        ],
+        "vector": [0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]
+      },
+      {
+        "archived": false,
+        "fork_family": "7",
+        "owner": "7",
+        "popularity": 16,
+        "repo_id": "00000000-0000-4000-8000-000000000007",
+        "topics": [
+          "python"
+        ],
+        "vector": [1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]
+      },
+      {
+        "archived": true,
+        "fork_family": "8",
+        "owner": "8",
+        "popularity": 17,
+        "repo_id": "00000000-0000-4000-8000-000000000008",
+        "topics": [
+          "python"
+        ],
+        "vector": [0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]
+      }
+    ],
+    "schema_version": 1,
+    "snapshot_id": "synthetic-actual-stages-v1"
+  },
+  "limit": 4,
+  "profiles": [
+    {
+      "payload": {
+        "embedding_dim": 384,
+        "embedding_model": "all-MiniLM-L6-v2",
+        "embedding_model_revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+        "embedding_version": "repo-embedding-v2",
+        "feedback_state_revision": 0,
+        "interests": [
+          "search"
+        ],
+        "last_feedback_version": 0,
+        "profile_version": 1,
+        "skills": [
+          "Python"
+        ],
+        "tech_stack": [],
+        "topics": [
+          "python"
+        ]
+      },
+      "profile_id": "00000000-0000-4000-8000-000000000100",
+      "vector": [1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]
+    },
+    {
+      "payload": {
+        "embedding_dim": 384,
+        "embedding_model": "all-MiniLM-L6-v2",
+        "embedding_model_revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+        "embedding_version": "repo-embedding-v2",
+        "feedback_state_revision": 0,
+        "interests": [
+          "search"
+        ],
+        "last_feedback_version": 0,
+        "profile_version": 1,
+        "skills": [
+          "Python"
+        ],
+        "tech_stack": [],
+        "topics": [
+          "python"
+        ]
+      },
+      "profile_id": "00000000-0000-4000-8000-000000000101",
+      "vector": [0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]
+    }
+  ],
+  "repositories": [
+    {
+      "payload": {
+        "activity_score": 0.0,
+        "card_summary": null,
+        "card_summary_artifact_hash": null,
+        "card_summary_format_version": null,
+        "card_summary_highlights": [],
+        "card_summary_model_version": null,
+        "card_summary_prompt_version": null,
+        "card_summary_source": null,
+        "category": "Unknown",
+        "code_health": 0.0,
+        "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "content_version": 1,
+        "created_at": null,
+        "delta_30d": 0,
+        "delta_3d": 0,
+        "delta_7d": 0,
+        "description": "",
+        "discovery_band": null,
+        "discovery_category": null,
+        "doc_quality": 0.0,
+        "embedding_dim": 384,
+        "embedding_model": "all-MiniLM-L6-v2",
+        "embedding_model_revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+        "embedding_version": "repo-embedding-v2",
+        "feature_spec_version": "v2",
+        "fork_count": 0,
+        "fork_family_github_id": "1",
+        "full_name": "diagnostic/repo0",
+        "github_id": "1",
+        "html_url": null,
+        "indexed_at": "2026-10-24T00:00:00Z",
+        "is_fork": false,
+        "languages": [
+          "Python"
+        ],
+        "lineage_observed_at": "2026-10-24T00:00:00Z",
+        "lineage_source": "github-graphql-repository",
+        "mentionable_users_count": 0,
+        "model_version": "all-MiniLM-L6-v2",
+        "open_issues_count": 0,
+        "owner_github_id": "1",
+        "primary_language": "Python",
+        "pushed_at": "2026-10-23T00:00:00Z",
+        "pushed_days_ago": 999,
+        "readme_chunks": 0,
+        "readme_length": 0,
+        "repo_id": "00000000-0000-4000-8000-000000000001",
+        "serving_eligibility_version": "repository-vector-v2",
+        "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "star_count": 10,
+        "tags": [],
+        "topics": [
+          "python"
+        ],
+        "trend_velocity": 0.0,
+        "updated_at": null
+      },
+      "repo_id": "00000000-0000-4000-8000-000000000001"
+    },
+    {
+      "payload": {
+        "activity_score": 0.0,
+        "card_summary": null,
+        "card_summary_artifact_hash": null,
+        "card_summary_format_version": null,
+        "card_summary_highlights": [],
+        "card_summary_model_version": null,
+        "card_summary_prompt_version": null,
+        "card_summary_source": null,
+        "category": "Unknown",
+        "code_health": 0.0,
+        "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "content_version": 1,
+        "created_at": null,
+        "delta_30d": 0,
+        "delta_3d": 0,
+        "delta_7d": 0,
+        "description": "",
+        "discovery_band": null,
+        "discovery_category": null,
+        "doc_quality": 0.0,
+        "embedding_dim": 384,
+        "embedding_model": "all-MiniLM-L6-v2",
+        "embedding_model_revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+        "embedding_version": "repo-embedding-v2",
+        "feature_spec_version": "v2",
+        "fork_count": 0,
+        "fork_family_github_id": "2",
+        "full_name": "diagnostic/repo1",
+        "github_id": "2",
+        "html_url": null,
+        "indexed_at": "2026-10-24T00:00:00Z",
+        "is_fork": false,
+        "languages": [
+          "Python"
+        ],
+        "lineage_observed_at": "2026-10-24T00:00:00Z",
+        "lineage_source": "github-graphql-repository",
+        "mentionable_users_count": 0,
+        "model_version": "all-MiniLM-L6-v2",
+        "open_issues_count": 0,
+        "owner_github_id": "2",
+        "primary_language": "Python",
+        "pushed_at": "2026-10-23T00:00:00Z",
+        "pushed_days_ago": 999,
+        "readme_chunks": 0,
+        "readme_length": 0,
+        "repo_id": "00000000-0000-4000-8000-000000000002",
+        "serving_eligibility_version": "repository-vector-v2",
+        "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "star_count": 11,
+        "tags": [],
+        "topics": [
+          "python"
+        ],
+        "trend_velocity": 0.0,
+        "updated_at": null
+      },
+      "repo_id": "00000000-0000-4000-8000-000000000002"
+    },
+    {
+      "payload": {
+        "activity_score": 0.0,
+        "card_summary": null,
+        "card_summary_artifact_hash": null,
+        "card_summary_format_version": null,
+        "card_summary_highlights": [],
+        "card_summary_model_version": null,
+        "card_summary_prompt_version": null,
+        "card_summary_source": null,
+        "category": "Unknown",
+        "code_health": 0.0,
+        "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "content_version": 1,
+        "created_at": null,
+        "delta_30d": 0,
+        "delta_3d": 0,
+        "delta_7d": 0,
+        "description": "",
+        "discovery_band": null,
+        "discovery_category": null,
+        "doc_quality": 0.0,
+        "embedding_dim": 384,
+        "embedding_model": "all-MiniLM-L6-v2",
+        "embedding_model_revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+        "embedding_version": "repo-embedding-v2",
+        "feature_spec_version": "v2",
+        "fork_count": 0,
+        "fork_family_github_id": "3",
+        "full_name": "diagnostic/repo2",
+        "github_id": "3",
+        "html_url": null,
+        "indexed_at": "2026-10-24T00:00:00Z",
+        "is_fork": false,
+        "languages": [
+          "Python"
+        ],
+        "lineage_observed_at": "2026-10-24T00:00:00Z",
+        "lineage_source": "github-graphql-repository",
+        "mentionable_users_count": 0,
+        "model_version": "all-MiniLM-L6-v2",
+        "open_issues_count": 0,
+        "owner_github_id": "3",
+        "primary_language": "Python",
+        "pushed_at": "2026-10-23T00:00:00Z",
+        "pushed_days_ago": 999,
+        "readme_chunks": 0,
+        "readme_length": 0,
+        "repo_id": "00000000-0000-4000-8000-000000000003",
+        "serving_eligibility_version": "repository-vector-v2",
+        "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "star_count": 12,
+        "tags": [],
+        "topics": [
+          "python"
+        ],
+        "trend_velocity": 0.0,
+        "updated_at": null
+      },
+      "repo_id": "00000000-0000-4000-8000-000000000003"
+    },
+    {
+      "payload": {
+        "activity_score": 0.0,
+        "card_summary": null,
+        "card_summary_artifact_hash": null,
+        "card_summary_format_version": null,
+        "card_summary_highlights": [],
+        "card_summary_model_version": null,
+        "card_summary_prompt_version": null,
+        "card_summary_source": null,
+        "category": "Unknown",
+        "code_health": 0.0,
+        "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "content_version": 1,
+        "created_at": null,
+        "delta_30d": 0,
+        "delta_3d": 0,
+        "delta_7d": 0,
+        "description": "",
+        "discovery_band": null,
+        "discovery_category": null,
+        "doc_quality": 0.0,
+        "embedding_dim": 384,
+        "embedding_model": "all-MiniLM-L6-v2",
+        "embedding_model_revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+        "embedding_version": "repo-embedding-v2",
+        "feature_spec_version": "v2",
+        "fork_count": 0,
+        "fork_family_github_id": "4",
+        "full_name": "diagnostic/repo3",
+        "github_id": "4",
+        "html_url": null,
+        "indexed_at": "2026-10-24T00:00:00Z",
+        "is_fork": false,
+        "languages": [
+          "Python"
+        ],
+        "lineage_observed_at": "2026-10-24T00:00:00Z",
+        "lineage_source": "github-graphql-repository",
+        "mentionable_users_count": 0,
+        "model_version": "all-MiniLM-L6-v2",
+        "open_issues_count": 0,
+        "owner_github_id": "4",
+        "primary_language": "Python",
+        "pushed_at": "2026-10-23T00:00:00Z",
+        "pushed_days_ago": 999,
+        "readme_chunks": 0,
+        "readme_length": 0,
+        "repo_id": "00000000-0000-4000-8000-000000000004",
+        "serving_eligibility_version": "repository-vector-v2",
+        "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "star_count": 13,
+        "tags": [],
+        "topics": [
+          "python"
+        ],
+        "trend_velocity": 0.0,
+        "updated_at": null
+      },
+      "repo_id": "00000000-0000-4000-8000-000000000004"
+    },
+    {
+      "payload": {
+        "activity_score": 0.0,
+        "card_summary": null,
+        "card_summary_artifact_hash": null,
+        "card_summary_format_version": null,
+        "card_summary_highlights": [],
+        "card_summary_model_version": null,
+        "card_summary_prompt_version": null,
+        "card_summary_source": null,
+        "category": "Unknown",
+        "code_health": 0.0,
+        "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "content_version": 1,
+        "created_at": null,
+        "delta_30d": 0,
+        "delta_3d": 0,
+        "delta_7d": 0,
+        "description": "",
+        "discovery_band": null,
+        "discovery_category": null,
+        "doc_quality": 0.0,
+        "embedding_dim": 384,
+        "embedding_model": "all-MiniLM-L6-v2",
+        "embedding_model_revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+        "embedding_version": "repo-embedding-v2",
+        "feature_spec_version": "v2",
+        "fork_count": 0,
+        "fork_family_github_id": "5",
+        "full_name": "diagnostic/repo4",
+        "github_id": "5",
+        "html_url": null,
+        "indexed_at": "2026-10-24T00:00:00Z",
+        "is_fork": false,
+        "languages": [
+          "Python"
+        ],
+        "lineage_observed_at": "2026-10-24T00:00:00Z",
+        "lineage_source": "github-graphql-repository",
+        "mentionable_users_count": 0,
+        "model_version": "all-MiniLM-L6-v2",
+        "open_issues_count": 0,
+        "owner_github_id": "5",
+        "primary_language": "Python",
+        "pushed_at": "2026-10-23T00:00:00Z",
+        "pushed_days_ago": 999,
+        "readme_chunks": 0,
+        "readme_length": 0,
+        "repo_id": "00000000-0000-4000-8000-000000000005",
+        "serving_eligibility_version": "repository-vector-v2",
+        "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "star_count": 14,
+        "tags": [],
+        "topics": [
+          "python"
+        ],
+        "trend_velocity": 0.0,
+        "updated_at": null
+      },
+      "repo_id": "00000000-0000-4000-8000-000000000005"
+    },
+    {
+      "payload": {
+        "activity_score": 0.0,
+        "card_summary": null,
+        "card_summary_artifact_hash": null,
+        "card_summary_format_version": null,
+        "card_summary_highlights": [],
+        "card_summary_model_version": null,
+        "card_summary_prompt_version": null,
+        "card_summary_source": null,
+        "category": "Unknown",
+        "code_health": 0.0,
+        "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "content_version": 1,
+        "created_at": null,
+        "delta_30d": 0,
+        "delta_3d": 0,
+        "delta_7d": 0,
+        "description": "",
+        "discovery_band": null,
+        "discovery_category": null,
+        "doc_quality": 0.0,
+        "embedding_dim": 384,
+        "embedding_model": "all-MiniLM-L6-v2",
+        "embedding_model_revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+        "embedding_version": "repo-embedding-v2",
+        "feature_spec_version": "v2",
+        "fork_count": 0,
+        "fork_family_github_id": "6",
+        "full_name": "diagnostic/repo5",
+        "github_id": "6",
+        "html_url": null,
+        "indexed_at": "2026-10-24T00:00:00Z",
+        "is_fork": false,
+        "languages": [
+          "Python"
+        ],
+        "lineage_observed_at": "2026-10-24T00:00:00Z",
+        "lineage_source": "github-graphql-repository",
+        "mentionable_users_count": 0,
+        "model_version": "all-MiniLM-L6-v2",
+        "open_issues_count": 0,
+        "owner_github_id": "6",
+        "primary_language": "Python",
+        "pushed_at": "2026-10-23T00:00:00Z",
+        "pushed_days_ago": 999,
+        "readme_chunks": 0,
+        "readme_length": 0,
+        "repo_id": "00000000-0000-4000-8000-000000000006",
+        "serving_eligibility_version": "repository-vector-v2",
+        "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "star_count": 15,
+        "tags": [],
+        "topics": [
+          "python"
+        ],
+        "trend_velocity": 0.0,
+        "updated_at": null
+      },
+      "repo_id": "00000000-0000-4000-8000-000000000006"
+    },
+    {
+      "payload": {
+        "activity_score": 0.0,
+        "card_summary": null,
+        "card_summary_artifact_hash": null,
+        "card_summary_format_version": null,
+        "card_summary_highlights": [],
+        "card_summary_model_version": null,
+        "card_summary_prompt_version": null,
+        "card_summary_source": null,
+        "category": "Unknown",
+        "code_health": 0.0,
+        "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "content_version": 1,
+        "created_at": null,
+        "delta_30d": 0,
+        "delta_3d": 0,
+        "delta_7d": 0,
+        "description": "",
+        "discovery_band": null,
+        "discovery_category": null,
+        "doc_quality": 0.0,
+        "embedding_dim": 384,
+        "embedding_model": "all-MiniLM-L6-v2",
+        "embedding_model_revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+        "embedding_version": "repo-embedding-v2",
+        "feature_spec_version": "v2",
+        "fork_count": 0,
+        "fork_family_github_id": "7",
+        "full_name": "diagnostic/repo6",
+        "github_id": "7",
+        "html_url": null,
+        "indexed_at": "2026-10-24T00:00:00Z",
+        "is_fork": false,
+        "languages": [
+          "Python"
+        ],
+        "lineage_observed_at": "2026-10-24T00:00:00Z",
+        "lineage_source": "github-graphql-repository",
+        "mentionable_users_count": 0,
+        "model_version": "all-MiniLM-L6-v2",
+        "open_issues_count": 0,
+        "owner_github_id": "7",
+        "primary_language": "Python",
+        "pushed_at": "2026-10-23T00:00:00Z",
+        "pushed_days_ago": 999,
+        "readme_chunks": 0,
+        "readme_length": 0,
+        "repo_id": "00000000-0000-4000-8000-000000000007",
+        "serving_eligibility_version": "repository-vector-v2",
+        "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "star_count": 16,
+        "tags": [],
+        "topics": [
+          "python"
+        ],
+        "trend_velocity": 0.0,
+        "updated_at": null
+      },
+      "repo_id": "00000000-0000-4000-8000-000000000007"
+    },
+    {
+      "payload": {
+        "activity_score": 0.0,
+        "card_summary": null,
+        "card_summary_artifact_hash": null,
+        "card_summary_format_version": null,
+        "card_summary_highlights": [],
+        "card_summary_model_version": null,
+        "card_summary_prompt_version": null,
+        "card_summary_source": null,
+        "category": "Unknown",
+        "code_health": 0.0,
+        "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "content_version": 1,
+        "created_at": null,
+        "delta_30d": 0,
+        "delta_3d": 0,
+        "delta_7d": 0,
+        "description": "",
+        "discovery_band": null,
+        "discovery_category": null,
+        "doc_quality": 0.0,
+        "embedding_dim": 384,
+        "embedding_model": "all-MiniLM-L6-v2",
+        "embedding_model_revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+        "embedding_version": "repo-embedding-v2",
+        "feature_spec_version": "v2",
+        "fork_count": 0,
+        "fork_family_github_id": "8",
+        "full_name": "diagnostic/repo7",
+        "github_id": "8",
+        "html_url": null,
+        "indexed_at": "2026-10-24T00:00:00Z",
+        "is_fork": false,
+        "languages": [
+          "Python"
+        ],
+        "lineage_observed_at": "2026-10-24T00:00:00Z",
+        "lineage_source": "github-graphql-repository",
+        "mentionable_users_count": 0,
+        "model_version": "all-MiniLM-L6-v2",
+        "open_issues_count": 0,
+        "owner_github_id": "8",
+        "primary_language": "Python",
+        "pushed_at": "2026-10-23T00:00:00Z",
+        "pushed_days_ago": 999,
+        "readme_chunks": 0,
+        "readme_length": 0,
+        "repo_id": "00000000-0000-4000-8000-000000000008",
+        "serving_eligibility_version": "repository-vector-v2",
+        "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "star_count": 17,
+        "tags": [],
+        "topics": [
+          "python"
+        ],
+        "trend_velocity": 0.0,
+        "updated_at": null
+      },
+      "repo_id": "00000000-0000-4000-8000-000000000008"
+    }
+  ],
+  "schema_version": 1,
+  "seed": "diagnostic-fixed"
+}
