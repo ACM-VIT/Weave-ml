@@ -128,6 +128,11 @@ Additional evaluation, seeding, onboarding, and integration utilities are in `sc
 
 Repository acquisition and trending synchronization are offline worker jobs, not request-path services. See the [offline pipeline operations runbook](docs/OFFLINE_PIPELINE_RUNBOOK.md) for configuration validation, bounded runs, safe shutdown, checkpoint resume, and diagnosis.
 
+The production corpus CLI streams enriched batches through filtering and backend delivery. At most `workers` metadata/enrichment batches are outstanding, each with at most `batch_size` records; the synchronous delivery sink applies backpressure before admitting a replacement. HTTP bodies retain the existing 100-record/8 MiB bounds and retry the same bytes and request identity. Smaller enrichment batches can increase HTTP request count; compare this overhead with time-to-first-persist and peak RSS using `scripts/benchmark_corpus_streaming.py`. This bounds retained enriched results independently of corpus size; lightweight discovery/retry identities and existing bounded README caches remain separate.
+
+Before source workers start, the checkpoint atomically records selected repository names only. Each acknowledged subset clears its names; cancellation, ambiguous transport and unsent records remain retryable through re-enrichment on restart. Restart enrichment is also batched. A completely unsuccessful delivery batch stops further source admission; mixed outcomes preserve per-identity retries. Invalid or duplicate mapping responses acknowledge no prefix. Canonical backend persistence still precedes indexing. No durable README staging or checkpoint-retention policy is introduced. Library callers retain materialized discovery-order results by default; `on_batch` opts into synchronous completion-order delivery with an empty final repository list and audit counters.
+
+
 Production configuration, feedback replay, alerts, deployment, rollback, and
 rollout gates are in the [V2 production operations runbook](docs/PRODUCTION_RUNBOOK.md).
 

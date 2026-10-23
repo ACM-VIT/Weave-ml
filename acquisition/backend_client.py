@@ -144,19 +144,27 @@ class BackendIngestionClient:
                     raise ValueError("backend response is missing mappings")
                 by_github_id = {github_id: name for name, github_id in batch.identities}
                 mapped_names: set[str] = set()
+                validated_mappings: dict[str, dict[str, Any]] = {}
                 for mapping in mappings:
                     github_id = str(mapping.get("github_id") or "")
                     name = by_github_id.get(github_id)
                     if not name:
                         raise ValueError(f"unexpected github_id mapping: {github_id!r}")
+                    if name in mapped_names:
+                        raise ValueError("backend returned duplicate repository mappings")
                     uuid.UUID(str(mapping.get("repo_id") or ""))
                     content_version = mapping.get("content_version")
                     if isinstance(content_version, bool) or not isinstance(content_version, int):
                         raise ValueError("content_version must be an integer")
-                    result.mappings[github_id] = dict(mapping)
+                    validated_mappings[github_id] = dict(mapping)
+                    mapped_names.add(name)
+                # Publish acknowledgements only after validating the complete
+                # response. A malformed suffix makes this delivery ambiguous.
+                result.mappings.update(validated_mappings)
+                for github_id in validated_mappings:
+                    name = by_github_id[github_id]
                     result.succeeded.append(name)
                     self._accepted_names.add(name.casefold())
-                    mapped_names.add(name)
                 for name in names:
                     if name not in mapped_names:
                         result.failed[name] = "backend returned no repository mapping"
