@@ -81,6 +81,19 @@ jobs:
           --baseline tests/fixtures/recommendation_actual_stage/baseline.json \
           --policy tests/fixtures/recommendation_actual_stage/policy.json \
           --output "$RUNNER_TEMP/actual-recommendation-diagnostic.json"
+    - name: Gate public-source catalogue against curated accepted-artifact metrics
+      run: |
+        uv run python -c 'import json, os; from pathlib import Path; snapshot=json.loads(Path("tests/fixtures/recommendation_public_catalog/snapshot.json").read_text()); (Path(os.environ["RUNNER_TEMP"])/"public-catalog-bundle.json").write_text(json.dumps(snapshot["bundle"], allow_nan=False))'
+        uv run python -m scripts.run_recommendation_stages \
+          --snapshot tests/fixtures/recommendation_public_catalog/snapshot.json \
+          --artifact-dir inference \
+          --output "$RUNNER_TEMP/public-catalog-stage-run.json"
+        uv run python -m scripts.evaluate_recommendations \
+          --bundle "$RUNNER_TEMP/public-catalog-bundle.json" \
+          --run "$RUNNER_TEMP/public-catalog-stage-run.json" \
+          --baseline tests/fixtures/recommendation_public_catalog/reference.json \
+          --policy tests/fixtures/recommendation_public_catalog/policy.json \
+          --output "$RUNNER_TEMP/public-catalog-diagnostic.json"
     - name: Retain actual-stage diagnostic evidence
       if: always()
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
