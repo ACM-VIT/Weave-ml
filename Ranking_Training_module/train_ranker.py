@@ -28,6 +28,9 @@ from inference.feature_spec import (  # noqa: E402
     RANKER_MODEL_VERSION,
 )
 from inference.ranker_service import MMoEHeavyRanker  # noqa: E402
+from inference.preprocessing import (  # noqa: E402
+    PREPROCESSING_VERSION, fit_dense_features, scaler_document, transform_dense_features,
+)
 from inference.value_function import VALUE_WEIGHTS  # noqa: E402
 from config import (  # noqa: E402
     EMBEDDING_MODEL_REVISION,
@@ -91,23 +94,30 @@ def load_training_data(data_path: str | Path) -> dict[str, np.ndarray]:
 
 def standardize_dense_features(
     dense_features: np.ndarray,
+    *, fit_rows: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Apply StandardScaler-compatible population mean and scale."""
-    dense_float = np.asarray(dense_features, dtype=np.float64)
-    mean = dense_float.mean(axis=0)
-    scale = dense_float.std(axis=0)
-    scale = np.where(scale == 0.0, 1.0, scale)
-    scaled = ((dense_float - mean) / scale).astype(np.float32)
-    return scaled, mean, scale
+    """Fit the chronological training prefix, then transform both partitions."""
+    if not 1 <= fit_rows <= len(dense_features):
+        raise ValueError("fit_rows must select a non-empty training prefix")
+    mean, scale = fit_dense_features(dense_features[:fit_rows])
+    return transform_dense_features(dense_features, mean, scale), mean, scale
+
+
+def chronological_split_index(row_count: int) -> int:
+    split_index = int(row_count * 0.8)
+    if split_index < 2 or split_index >= row_count:
+        raise ValueError("The chronological split requires at least 2 training rows")
+    return split_index
 
 
 def build_dataloaders(
     X: np.ndarray,
     labels: tuple[np.ndarray, ...],
     batch_size: int,
+    *, split_index: int | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     """Create an 80/20 chronological train/validation split."""
-    split_index = int(len(X) * 0.8)
+    split_index = chronological_split_index(len(X)) if split_index is None else split_index
     if split_index < 2 or split_index >= len(X):
         raise ValueError("The chronological split requires at least 2 training rows")
 
@@ -259,8 +269,9 @@ def train(
         raise ValueError("code_version must be a non-empty string")
 
     arrays = load_training_data(data_path)
+    split_index = chronological_split_index(len(arrays["dense_features"]))
     scaled_dense, scaler_mean, scaler_scale = standardize_dense_features(
-        arrays["dense_features"]
+        arrays["dense_features"], fit_rows=split_index,
     )
     X = np.concatenate(
         [
@@ -277,7 +288,7 @@ def train(
         arrays[key].astype(np.float32, copy=False).reshape(-1)
         for key in ("y_ctr", "y_save", "y_gh", "y_dwell", "y_follow")
     )
-    train_loader, val_loader = build_dataloaders(X, labels, batch_size)
+    train_loader, val_loader = build_dataloaders(X, labels, batch_size, split_index=split_index)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = MMoEHeavyRanker(INPUT_DIM).to(device)
@@ -330,10 +341,7 @@ def train(
     torch.save(model.state_dict(), model_path)
     scaler_path.write_text(
         json.dumps(
-            {
-                "mean": scaler_mean.tolist(),
-                "scale": scaler_scale.tolist(),
-            },
+            scaler_document(scaler_mean, scaler_scale),
             indent=2,
         )
         + "\n",
@@ -349,6 +357,7 @@ def train(
         "embedding_model_revision": EMBEDDING_MODEL_REVISION,
         "compatible_embedding_versions": [REPOSITORY_EMBEDDING_VERSION],
         "feature_spec_version": FEATURE_SPEC_VERSION,
+        "preprocessing_version": PREPROCESSING_VERSION,
         "input_dim": INPUT_DIM,
         "embedding_dim": EMBEDDING_DIM,
         "feature_count": FEATURE_COUNT,
@@ -360,6 +369,11 @@ def train(
         "training_data": {
             "identity": training_data_identity,
             "type": training_data_type,
+        },
+        "preprocessing_fit": {
+            "split": "input_order_80_20",
+            "training_rows": split_index,
+            "validation_rows": len(X) - split_index,
         },
         "training_timestamp": datetime.now(timezone.utc).isoformat(),
         "offline_metrics": {

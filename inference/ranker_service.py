@@ -25,12 +25,14 @@ from inference.feature_spec import (
 )
 from inference.value_function import VALUE_WEIGHTS
 from inference.scoring_provenance import capture_ranker_input
+from inference.preprocessing import (
+    FEATURE_DEFAULTS, STANDARDIZED_FEATURE_CLIP, load_scaler_document, transform_dense_features,
+)
 from config import REPOSITORY_EMBEDDING_VERSION
 from utils.deadline import check_deadline
 
 
 logger = logging.getLogger("pipeline.ranker")
-STANDARDIZED_FEATURE_CLIP = 8.0
 _SHA256_HEX_LENGTH = 64
 _KEYWORD_CACHE_MAX_ELEMENTS = 64
 _KEYWORD_CACHE_MAX_CHARACTERS = 1024
@@ -308,24 +310,10 @@ class RankerService:
             scaler_bytes = Path(scaler_path).read_bytes()
             scaler_params = json.loads(scaler_bytes)
             self.loaded_artifact_sha256['scaler_sha256'] = hashlib.sha256(scaler_bytes).hexdigest()
-            self.scaler_mean = np.array(scaler_params['mean'], dtype=np.float32)
-            self.scaler_scale = np.array(scaler_params['scale'], dtype=np.float32)
-            if len(self.scaler_mean) != FEATURE_COUNT:
-                raise ValueError(
-                    f"Feature scaler has {len(self.scaler_mean)} features; "
-                    f"expected {FEATURE_COUNT}"
-                )
-            if len(self.scaler_scale) != FEATURE_COUNT:
-                raise ValueError(
-                    f"Feature scaler has {len(self.scaler_scale)} scale values; "
-                    f"expected {FEATURE_COUNT}"
-                )
-            if not np.all(np.isfinite(self.scaler_mean)):
-                raise ValueError("Feature scaler means must all be finite")
-            if not np.all(np.isfinite(self.scaler_scale)) or np.any(
-                self.scaler_scale <= 0
-            ):
-                raise ValueError("Feature scaler scales must be finite and positive")
+            self.scaler_mean, self.scaler_scale = load_scaler_document(scaler_params)
+            if (self.manifest.get('preprocessing_version') is not None
+                    and self.manifest['preprocessing_version'] != scaler_params.get('preprocessing_version')):
+                raise ValueError("Model manifest and scaler preprocessing versions do not match")
             logger.info("Feature scaler loaded successfully from %s", scaler_path)
         else:
             raise RuntimeError(f"{scaler_path} not found; refusing to use unscaled features")
@@ -619,31 +607,16 @@ class RankerService:
             
             # The EXACT 10 features generated in DataGen:
             # batch_doc, batch_health, batch_readme, batch_stars, batch_forks, batch_issues, batch_pushed, batch_activity, batch_trend, skill_match_score
-            feature_values = {
-                'doc_quality': self._finite_feature(repo.get('doc_quality'), default=0.5),
-                'code_health': self._finite_feature(repo.get('code_health'), default=0.5),
-                'readme_length': self._finite_feature(repo.get('readme_length'), default=1000),
-                'star_count': self._finite_feature(repo.get('star_count'), default=0),
-                'fork_count': self._finite_feature(repo.get('fork_count'), default=0),
-                'open_issues_count': self._finite_feature(repo.get('open_issues_count'), default=0),
-                'pushed_days_ago': self._finite_feature(repo.get('pushed_days_ago'), default=365),
-                'activity_score': self._finite_feature(repo.get('activity_score'), default=0.0),
-                'trend_velocity': self._finite_feature(repo.get('trend_velocity'), default=0.0),
-                'skill_match_score': skill_match,
-            }
+            feature_values = {name: self._finite_feature(repo.get(name), default=default)
+                              for name, default in FEATURE_DEFAULTS.items()}
+            feature_values['skill_match_score'] = skill_match
             row = [feature_values[name] for name in FEATURE_ORDER]
             dense_features.append(row)
             
-        dense_features = np.asarray(dense_features, dtype=np.float32)
-        skill_matches = dense_features[:, 9].copy() if diagnostics else None
+        dense_features = np.asarray(dense_features, dtype=np.float64)
+        skill_matches = dense_features[:, 9].astype(np.float32) if diagnostics else None
         
-        # Manually apply StandardScaler math
-        dense_features = (dense_features - self.scaler_mean) / self.scaler_scale
-        dense_features = np.clip(
-            dense_features,
-            -STANDARDIZED_FEATURE_CLIP,
-            STANDARDIZED_FEATURE_CLIP,
-        )
+        dense_features = transform_dense_features(dense_features, self.scaler_mean, self.scaler_scale)
             
         X_tensor = self._input_tensor(user_vector, candidate_repos, dense_features)
 
