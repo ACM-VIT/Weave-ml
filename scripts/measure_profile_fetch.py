@@ -138,7 +138,15 @@ class _LocalDocker:
         result = subprocess.run([*self.prefix,*arguments], env=self.environment,
             timeout=40, capture_output=True, text=True, check=False)
         if check and result.returncode:
-            raise RuntimeError("owned profile Docker operation failed: " + arguments[0])
+            reason = "unclassified Docker failure; inspect the local daemon logs"
+            error = result.stderr.casefold()
+            if "permission denied" in error:
+                reason = "Docker socket permission denied; check local socket access"
+            elif "no such image" in error or "image not found" in error or "pull access denied" in error:
+                reason = "pinned image is unavailable locally; load the pinned image first"
+            elif any(word in error for word in ("memory", "cpus", "pids", "resource limit")):
+                reason = "container resource limit rejected; check local daemon capabilities"
+            raise RuntimeError("owned profile Docker operation failed: " + arguments[0] + "; " + reason)
         return result
 
     def owned_info(self, name: str, owner: str):
@@ -169,6 +177,7 @@ def owned_qdrant():
     owner = uuid.uuid4().hex
     primary_error = None
     attempted = False
+    startup_completed = False
     try:
         # No pull; identity is captured from the SAME pinned local daemon.
         image_id = json.loads(docker.run("image","inspect",IMAGE).stdout)[0]["Id"]
@@ -176,6 +185,7 @@ def owned_qdrant():
         docker.run("run", "--pull=never", "-d", "--name", name, "--label", OWNER_LABEL+"="+owner,
             "--cpus","2","--memory","1g","--pids-limit","256",
             "-p", "127.0.0.1::6333", "-e", "QDRANT__TELEMETRY_DISABLED=true", IMAGE)
+        startup_completed = True
         info = docker.owned_info(name,owner)
         if info is None:
             raise RuntimeError("owned profile container was not created")
@@ -203,7 +213,17 @@ def owned_qdrant():
             try:
                 # Inspect even after startup timeout/failure; never delete by a
                 # guessed name or through a newly resolved environment/context.
-                if docker.owned_info(name,owner) is not None:
+                info = docker.owned_info(name,owner)
+                if not startup_completed:
+                    # A timed-out CLI can return before daemon creation is visible.
+                    for _ in range(4):
+                        if info is not None:
+                            break
+                        time.sleep(.1)
+                        info = docker.owned_info(name,owner)
+                    if info is None:
+                        raise RuntimeError("startup outcome remains uncertain after bounded inspection")
+                if info is not None:
                     docker.run("rm","-f","-v",name)
                     if docker.owned_info(name,owner) is not None:
                         raise RuntimeError("owned profile container remained after removal")

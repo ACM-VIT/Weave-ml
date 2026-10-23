@@ -277,3 +277,42 @@ def test_missing_docker_cli_is_bounded_and_has_no_cleanup_target(monkeypatch):
     monkeypatch.setattr(bench.subprocess,'run',missing)
     with pytest.raises(FileNotFoundError):
         with bench.owned_qdrant():pytest.fail('missing Docker yielded')
+
+
+@pytest.mark.parametrize('appears', [True, False])
+def test_timeout_cleanup_retries_late_creation_or_warns(monkeypatch, capsys, appears):
+    import subprocess
+    bench, fake = _fake_owned_docker(monkeypatch, startup_timeout=True)
+    original = fake.owned_info
+    reads = []
+    def delayed(name, owner):
+        reads.append(name)
+        if len(reads) < 3 or not appears:
+            return None
+        return original(name, owner)
+    monkeypatch.setattr(fake, 'owned_info', delayed)
+    monkeypatch.setattr(bench.time, 'sleep', lambda _: None)
+    with pytest.raises(subprocess.TimeoutExpired):
+        with bench.owned_qdrant(): pytest.fail('startup timeout yielded')
+    assert len(reads) >= 3
+    if appears:
+        assert not fake.exists
+    else:
+        assert fake.name in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('stderr,reason', [
+    ('permission denied: private/token', 'Docker socket permission denied'),
+    ('No such image: private/token', 'pinned image is unavailable locally'),
+    ('invalid memory resource private/token', 'container resource limit rejected'),
+    ('unknown private/token', 'unclassified Docker failure')])
+def test_docker_failure_reasons_are_actionable_without_echoing_secrets(monkeypatch, stderr, reason):
+    from scripts import measure_profile_fetch as bench
+    from types import SimpleNamespace
+    docker = object.__new__(bench._LocalDocker)
+    docker.prefix = ('docker',); docker.environment = {}
+    monkeypatch.setattr(bench.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=1, stderr=stderr))
+    with pytest.raises(RuntimeError) as caught:
+        docker.run('run')
+    assert reason in str(caught.value)
+    assert 'private/token' not in str(caught.value)
