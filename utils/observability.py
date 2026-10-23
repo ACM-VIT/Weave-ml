@@ -18,6 +18,8 @@ import threading
 import time
 from uuid import UUID, uuid4
 
+from utils.deadline import current_deadline
+
 _TRACEPARENT = re.compile(r"00-([0-9a-f]{32})-([0-9a-f]{16})-(00|01)")
 _OPERATIONS = frozenset({
     "search", "recommendation", "feedback", "embed", "refresh", "onboard",
@@ -43,7 +45,10 @@ _SPAN_BYTES = 512
 _lock = threading.Lock()
 _ring: deque[bytes] = deque()
 _ring_bytes = 0
-_BUCKETS = (0.005, 0.025, 0.1, 0.5, 1.0, 5.0, 30.0, 120.0)
+# Include the default search, health, feedback, recommendation and refresh budgets.
+_BUCKETS = (0.005, 0.025, 0.1, 0.5, 1.0, 4.0, 5.0, 8.0, 12.0, 30.0, 45.0, 120.0)
+_STAGES = frozenset({"http", "span", "queue", "service", "late_work",
+                     "model_lock", "encoding", "qdrant", "ranking", "response_build"})
 _LIMIT = 2**63 - 1
 _histograms: dict[tuple[str, str, str], list[float | int]] = {}
 
@@ -102,17 +107,21 @@ def _id(byte_count: int) -> str:
 
 
 def _record(context: Correlation, operation: str, kind: str,
-            outcome: str, elapsed: float) -> None:
+            outcome: str, elapsed: float, stage: str, remaining_deadline: float | None) -> None:
     global _ring_bytes
     if not context.sampled:
         return
     # All strings are internal enums or strictly bounded generated/validated IDs.
-    encoded = json.dumps({
+    record = {
         "trace_id": context.trace_id, "span_id": context.span_id,
         "parent_span_id": context.parent_span_id,
-        "operation": operation, "kind": kind, "outcome": outcome,
+        "operation": operation, "kind": kind, "stage": stage, "outcome": outcome,
         "duration_seconds": round(max(0.0, elapsed), 6),
-    }, separators=(",", ":")).encode("ascii")
+        "ended_at_unix_seconds": round(time.time(), 6),
+    }
+    if remaining_deadline is not None:
+        record["remaining_deadline_seconds"] = remaining_deadline
+    encoded = json.dumps(record, separators=(",", ":")).encode("ascii")
     if len(encoded) > _SPAN_BYTES:
         return
     with _lock:
@@ -129,14 +138,17 @@ class Span:
     outcome: str = "ok"
 
     def set_http_status(self, status: int) -> None:
-        self.outcome = "error" if status >= 400 else "ok"
+        self.outcome = ("timeout" if status == 504 else "rejected" if status == 429
+                        else "error" if status >= 400 else "ok")
 
 
 @contextmanager
 def span_scope(operation: str, *, request_id: str | None = None,
-               authenticated_traceparent: str | None = None, server: bool = False):
+               authenticated_traceparent: str | None = None, server: bool = False,
+               stage: str = "span"):
     """Create a SERVER scope post-auth, or an INTERNAL child in a copied context."""
     operation = operation if operation in _OPERATIONS else "other"
+    stage = "http" if server else stage if stage in _STAGES else "span"
     parent = _current.get() if not server else None
     remote = _remote_parent(authenticated_traceparent) if server else None
     if remote is not None:
@@ -152,6 +164,12 @@ def span_scope(operation: str, *, request_id: str | None = None,
         sampled,
     )
     token = _current.set(context)
+    remaining_deadline = None
+    if context.sampled and (deadline := current_deadline()) is not None:
+        # Read the existing clock without remaining(), which cancels on expiry.
+        value = deadline.expires_at - deadline.clock()
+        if math.isfinite(value):
+            remaining_deadline = round(max(0.0, value), 6)
     started = time.monotonic()
     span = Span()
     try:
@@ -164,8 +182,8 @@ def span_scope(operation: str, *, request_id: str | None = None,
         _current.reset(token)
         outcome = span.outcome if span.outcome in _OUTCOMES else "error"
         elapsed = time.monotonic() - started
-        observe_duration(operation, "http" if server else "span", outcome, elapsed)
-        _record(context, operation, "SERVER" if server else "INTERNAL", outcome, elapsed)
+        observe_duration(operation, stage, outcome, elapsed)
+        _record(context, operation, "SERVER" if server else "INTERNAL", outcome, elapsed, stage, remaining_deadline)
 
 
 def diagnostic_snapshot() -> dict:
@@ -218,7 +236,7 @@ def _exception_outcome(exc: BaseException | None) -> str:
 
 def observe_duration(operation: str, stage: str, outcome: str, elapsed: float) -> None:
     """Sample-independent histograms with a finite Cartesian label space."""
-    if stage not in {"http", "span", "queue", "service", "late_work"}:
+    if stage not in _STAGES:
         return
     operation = operation if operation in _OPERATIONS else "other"
     outcome = outcome if outcome in _OUTCOMES else "error"
@@ -295,3 +313,28 @@ class WorkObservation:
                 if abandoned is not None:
                     observe_duration(self.operation, "late_work", abandon_outcome,
                                      now - max(self._started, abandoned))
+
+
+def render_stage_histograms() -> list[str]:
+    """Export unsampled cumulative seconds; identical buckets can be fleet-summed."""
+    with _lock:
+        snapshot = [(key, tuple(values)) for key, values in sorted(_histograms.items())]
+    lines = [
+        "# HELP ml_stage_duration_seconds ML process-local stage duration, including failures.",
+        "# TYPE ml_stage_duration_seconds histogram",
+    ]
+    for (operation, stage, outcome), values in snapshot:
+        labels = f'operation="{operation}",stage="{stage}",outcome="{outcome}"'
+        for bound, count in zip(_BUCKETS, values[2:]):
+            lines.append(f'ml_stage_duration_seconds_bucket{{{labels},le="{bound:g}"}} {count}')
+        lines.extend((
+            f'ml_stage_duration_seconds_bucket{{{labels},le="+Inf"}} {values[0]}',
+            f'ml_stage_duration_seconds_count{{{labels}}} {values[0]}',
+            f'ml_stage_duration_seconds_sum{{{labels}}} {values[1]:.9f}',
+        ))
+    return lines
+
+
+def reset_stage_histograms_for_tests() -> None:
+    with _lock:
+        _histograms.clear()

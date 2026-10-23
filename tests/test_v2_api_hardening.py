@@ -461,8 +461,15 @@ async def test_cancelled_embedding_keeps_capacity_until_worker_finishes(
             await task
 
         assert admission.releases == 0
+        from utils.observability import diagnostic_snapshot
+        def rejection_count():
+            return sum(row["count"] for row in diagnostic_snapshot()["histograms"]
+                       if row["operation"] == "embedding" and row["stage"] == "queue"
+                       and row["outcome"] == "rejected")
+        before = rejection_count()
         with pytest.raises(embedding_runtime.EmbeddingCapacityError):
             await embedding_runtime.run_embedding_job(lambda: "too-early")
+        assert rejection_count() == before + 1
 
         allow_finish.set()
         assert await asyncio.to_thread(finished.wait, 2)
@@ -550,3 +557,28 @@ def test_invalid_traceparent_starts_independent_root(header) -> None:
             assert child.sampled == server.sampled
         assert current_correlation() is server
     assert current_correlation() is None
+
+
+def test_sampled_stages_report_remaining_budget_without_expiring_it():
+    from utils.deadline import RequestDeadline, deadline_scope
+    from utils.observability import diagnostic_snapshot, span_scope
+
+    clock = [100.0]
+    deadline = RequestDeadline(5, clock=lambda: clock[0])
+    trace = "abcdabcdabcdabcdabcdabcdabcdabcd"
+    with deadline_scope(deadline), span_scope(
+        "search", server=True,
+        authenticated_traceparent=f"00-{trace}-1234567890abcdef-01",
+    ):
+        clock[0] = 102.0
+        with span_scope("search", stage="qdrant"):
+            pass
+        clock[0] = 107.0
+        with span_scope("search", stage="response_build"):
+            pass
+    spans = [span for span in diagnostic_snapshot()["spans"] if span["trace_id"] == trace]
+    values = {span["stage"]: span["remaining_deadline_seconds"] for span in spans}
+    assert values == {"http": 5, "qdrant": 3, "response_build": 0}
+    assert deadline.expires_at == 105 and not deadline.cancelled.is_set()
+    assert all("expires_at" not in span for span in spans)
+    assert all(span["ended_at_unix_seconds"] > 0 for span in spans)

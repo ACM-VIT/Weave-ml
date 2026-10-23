@@ -71,8 +71,15 @@ async def test_interrupted_recommendation_keeps_admission_until_worker_exits(
                 await task
 
         assert admission.releases == 0
+        from utils.observability import diagnostic_snapshot
+        def rejection_count():
+            return sum(row["count"] for row in diagnostic_snapshot()["histograms"]
+                       if row["operation"] == "recommendation" and row["stage"] == "queue"
+                       and row["outcome"] == "rejected")
+        before = rejection_count()
         with pytest.raises(runtime.RecommendationCapacityError):
             await runtime.run_recommendation_job(lambda: "too-early")
+        assert rejection_count() == before + 1
 
         allow_finish.set()
         assert await asyncio.to_thread(finished.wait, 2)

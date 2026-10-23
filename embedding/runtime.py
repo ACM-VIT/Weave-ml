@@ -188,23 +188,25 @@ class BoundedEmbeddingModel:
 
     def encode(self, *args: Any, **kwargs: Any) -> Any:
         ticket = object()
-        with self._condition:
-            self._waiting.append(ticket)
-            try:
-                while self._waiting[0] is not ticket or self._active >= self._max_concurrency:
-                    # Preserve FIFO fairness while bounding queue waits. Polling
-                    # observes this job's cancellation without stealing a turn.
-                    self._condition.wait(timeout=remaining_seconds(0.05))
-                check_deadline()
-            except BaseException:
-                self._waiting.remove(ticket)
+        with span_scope("embedding", stage="model_lock"):
+            with self._condition:
+                self._waiting.append(ticket)
+                try:
+                    while self._waiting[0] is not ticket or self._active >= self._max_concurrency:
+                        # Preserve FIFO fairness while bounding queue waits. Polling
+                        # observes this job's cancellation without stealing a turn.
+                        self._condition.wait(timeout=remaining_seconds(0.05))
+                    check_deadline()
+                except BaseException:
+                    self._waiting.remove(ticket)
+                    self._condition.notify_all()
+                    raise
+                self._waiting.popleft()
+                self._active += 1
                 self._condition.notify_all()
-                raise
-            self._waiting.popleft()
-            self._active += 1
-            self._condition.notify_all()
         try:
-            return self._model.encode(*args, **kwargs)
+            with span_scope("embedding", stage="encoding"):
+                return self._model.encode(*args, **kwargs)
         finally:
             with self._condition:
                 self._active -= 1
@@ -366,13 +368,14 @@ async def _run_embedding_job(
     **kwargs: Any,
 ) -> T:
     with runtime_admission():
+        operation = "onboard" if executor_factory is onboarding_executor else "embedding"
+        observation = WorkObservation(operation)
         admission = embedding_admission()
         if not admission.acquire(blocking=False):
+            observation.finish("rejected")
             raise EmbeddingCapacityError(
                 "the bounded embedding executor is at capacity"
             )
-        operation = "onboard" if executor_factory is onboarding_executor else "embedding"
-        observation = WorkObservation(operation)
         try:
             context = copy_context()
             def invoke() -> T:

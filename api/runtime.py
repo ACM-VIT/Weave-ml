@@ -135,13 +135,14 @@ class _BoundedExecutor:
     ) -> Future[T]:
         """Retain admission until actual worker completion, including cancellation."""
         with runtime_admission():
+            observation = observation or WorkObservation(self.operation)
             if not self.admission.acquire(blocking=False):
                 with self._lock:
                     self._rejected += 1
+                observation.finish("rejected")
                 raise ServiceCapacityError(self.operation)
             with self._lock:
                 self._outstanding += 1
-            observation = observation or WorkObservation(self.operation)
             try:
                 with deadline_scope(deadline):
                     context = copy_context()

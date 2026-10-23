@@ -67,6 +67,8 @@ async def test_cancelled_service_job_retains_capacity_until_worker_exits(
     with pytest.raises(runtime.ServiceCapacityError):
         await runtime.run_service_job("refresh", lambda: "too-early")
 
+    assert any(stage == "queue" and outcome == "rejected"
+               for _, stage, outcome, _ in observations)
     assert not any(stage == "late_work" for _, stage, _, _ in observations)
     allow_finish.set()
     deadline = time.monotonic() + 2
@@ -88,6 +90,8 @@ async def test_timed_out_service_job_retains_capacity_until_worker_exits(
     monkeypatch,
     anyio_backend,
 ) -> None:
+    from utils.observability import diagnostic_snapshot, reset_stage_histograms_for_tests
+    reset_stage_histograms_for_tests()
     monkeypatch.setenv("V2_HEALTH_EXECUTOR_WORKERS", "1")
     monkeypatch.setenv("V2_HEALTH_MAX_OUTSTANDING", "1")
     monkeypatch.setenv("V2_HEALTH_TIMEOUT_SECONDS", "0.1")
@@ -105,6 +109,8 @@ async def test_timed_out_service_job_retains_capacity_until_worker_exits(
     status = runtime.service_runtime_status()["health"]
     assert status["outstanding"] == 1
     assert status["timed_out_total"] == 1
+    assert not any(row["stage"] in {"service", "late_work"}
+                   for row in diagnostic_snapshot()["histograms"])
 
     with pytest.raises(runtime.ServiceCapacityError):
         await runtime.run_service_job("health", lambda: "too-early")
@@ -116,6 +122,12 @@ async def test_timed_out_service_job_retains_capacity_until_worker_exits(
             break
         await asyncio.sleep(0.01)
     assert runtime.service_runtime_status()["health"]["outstanding"] == 0
+
+    rows = diagnostic_snapshot()["histograms"]
+    assert any(row["stage"] == "service" and row["count"] == 1 for row in rows)
+    assert any(row["stage"] == "late_work" and row["outcome"] == "timeout"
+               and row["count"] == 1 for row in rows)
+    reset_stage_histograms_for_tests()
 
 
 def test_runtime_status_uses_immutable_pool_settings(monkeypatch) -> None:
@@ -437,3 +449,41 @@ async def test_embedding_shutdown_cancels_onboarding_queue_but_retains_running_s
         release.set()
         await asyncio.gather(*tasks, return_exceptions=True)
         embedding_runtime.reset_embedding_runtime_for_tests()
+
+
+def test_native_executor_queue_and_service_histograms_wait_for_physical_exit(monkeypatch):
+    from utils.observability import diagnostic_snapshot, reset_stage_histograms_for_tests
+
+    monkeypatch.setenv("V2_REFRESH_EXECUTOR_WORKERS", "1")
+    monkeypatch.setenv("V2_REFRESH_MAX_OUTSTANDING", "2")
+    reset_stage_histograms_for_tests()
+    executor = runtime._BoundedExecutor("refresh")
+    entered = threading.Event()
+    release = threading.Event()
+    def blocked():
+        entered.set()
+        assert release.wait(2)
+    try:
+        first = executor.submit(blocked)
+        assert entered.wait(2)
+        second = executor.submit(lambda: "queued")
+        with pytest.raises(runtime.ServiceCapacityError):
+            executor.submit(lambda: "rejected")
+        time.sleep(0.02)
+        pending = diagnostic_snapshot()["histograms"]
+        assert not any(row["stage"] == "service" for row in pending)
+        assert any(row["stage"] == "queue" and row["outcome"] == "rejected"
+                   and row["count"] == 1 for row in pending)
+        release.set()
+        first.result(2)
+        assert second.result(2) == "queued"
+        executor.drain()
+        rows = {row["stage"]: row for row in diagnostic_snapshot()["histograms"]
+                if row["operation"] == "refresh" and row["outcome"] == "ok"}
+        assert rows["queue"]["count"] == rows["service"]["count"] == 2
+        assert rows["queue"]["sum_seconds"] >= 0.02
+        assert rows["service"]["sum_seconds"] >= 0.02
+    finally:
+        release.set()
+        executor.drain()
+        reset_stage_histograms_for_tests()

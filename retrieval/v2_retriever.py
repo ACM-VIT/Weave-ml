@@ -57,6 +57,7 @@ from retrieval.runtime import RetrievalWork, validate_retrieval_runtime
 from retrieval.social_candidates import (
     SocialCandidate, SocialPolicy, lookup_social_ids, select_social_candidates,
 )
+from utils.observability import span_scope
 from utils.deadline import (
     CooperativeDeadlineExceeded, RequestDeadline, check_deadline, current_deadline,
     deadline_scope, qdrant_timeout,
@@ -701,6 +702,7 @@ class QdrantV2Retriever:
             cache[cache_key] = eligible
         return eligible
 
+    @span_scope("recommendation", stage="qdrant")
     def _fetch_user_profile(self, user_id: str) -> list[Any]:
         return self.client.retrieve(
             collection_name=self.user_collection,
@@ -778,6 +780,7 @@ class QdrantV2Retriever:
             time.monotonic() + seconds,
         )
 
+    @span_scope("recommendation", stage="qdrant")
     def _fetch_semantic(
         self,
         vector: list[float],
@@ -800,6 +803,7 @@ class QdrantV2Retriever:
             **qdrant_timeout(self.qdrant_timeout_seconds),
         )
 
+    @span_scope("recommendation", stage="qdrant")
     def _fetch_retained_vectors(self, repo_ids: list[str]) -> list[Any]:
         return self.client.retrieve(
             collection_name=self.repository_collection,
@@ -811,6 +815,7 @@ class QdrantV2Retriever:
             **qdrant_timeout(self.qdrant_timeout_seconds),
         )
 
+    @span_scope("recommendation", stage="qdrant")
     def _fetch_social_candidates(self, repo_ids: list[str]) -> list[Any]:
         return self.client.retrieve(
             collection_name=self.repository_collection, ids=repo_ids,
@@ -935,6 +940,7 @@ class QdrantV2Retriever:
                 excluded.update(new_ids)
         return list(eligible.values())[:target]
 
+    @span_scope("recommendation", stage="qdrant")
     def _fetch_discovery_channel(
         self,
         channel: str,
@@ -1522,11 +1528,12 @@ class QdrantV2Retriever:
             if not callable(score_batch):
                 score_batch = self.ranker.score_batch
             check_deadline()
-            results = score_batch(
-                user_vector,
-                self._profile_terms(user_profile),
-                ranker_candidates,
-            )
+            with span_scope("recommendation", stage="ranking"):
+                results = score_batch(
+                    user_vector,
+                    self._profile_terms(user_profile),
+                    ranker_candidates,
+                )
             expected_ids = {item.repo_id for item in ranked}
             returned_ids = [str(result.get("repo_id")) for result in results]
             if (
