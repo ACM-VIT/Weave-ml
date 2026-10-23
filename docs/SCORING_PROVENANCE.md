@@ -73,7 +73,11 @@ of raw copied inputs in addition to serialization buffers and ordinary inference
 ## Required before any capture activation
 
 - Wire trusted loaded-profile/candidate context and a generated paired response
-  contract without changing the default score/public feed API.
+  contract without changing the default score/public feed API. The current profile
+  fetch projection omits profile/feedback revisions; obtain those from the SAME
+  retrieved point before activation, never a later read or the backend accepted
+  feedback version. Current profile-fetch measurements do not include that future
+  additional field transport.
 - Backend-owned private immutable generation+repository storage, idempotent equal
   retry/conflicting-hash handling and persistence before queue publication. Link
   PER serve item: refills can mix generations, while the current serve header
