@@ -227,3 +227,78 @@ def test_full_semantic_pool_retains_independent_exploration_only_when_enabled(di
         assert batch.ranker_applied
     else:
         assert not ranked_ids.intersection(independent)
+
+
+def test_shadow_skips_optional_selector_near_parent_deadline(diversity_corpus, monkeypatch):
+    from utils.deadline import RequestDeadline, check_deadline, deadline_scope
+    corpus = diversity_corpus
+    retriever = _corpus_retriever(corpus, heavy=True)
+    baseline = retriever.recommend_batch(corpus.user_id, 10, [], 'near-deadline')
+    retriever.diversity_mode = 'shadow'
+    retriever.diversity_traffic_percent = 100
+    retriever.diversity_policy = DiversityPolicy(minimum_exploration=0)
+    clock = [0.]
+    deadline = RequestDeadline(30, clock=lambda: clock[0])
+    original_score = retriever.ranker.score_batch
+    def finish_near_deadline(*args):
+        result = original_score(*args)
+        clock[0] = deadline.expires_at - .001
+        return result
+    monkeypatch.setattr(retriever.ranker, 'score_batch', finish_near_deadline)
+    original_shape = retriever.assembler.shape_batch
+    shadow_calls = []
+    def slow_optional(*args, **kwargs):
+        if kwargs.get('diversity_policy') is not None:
+            shadow_calls.append(True)
+            clock[0] += .002
+            check_deadline()
+        return original_shape(*args, **kwargs)
+    monkeypatch.setattr(retriever.assembler, 'shape_batch', slow_optional)
+    with deadline_scope(deadline):
+        result = retriever.recommend_batch(corpus.user_id, 10, [], 'near-deadline')
+    assert result.items == baseline.items
+    assert not shadow_calls
+    assert not deadline.cancelled.is_set()
+
+
+@pytest.mark.parametrize('parent_cancelled', [False, True])
+def test_shadow_child_expiry_is_isolated_but_parent_cancellation_is_authoritative(
+    diversity_corpus, monkeypatch, parent_cancelled,
+):
+    from utils.deadline import (
+        CooperativeDeadlineExceeded, RequestDeadline, check_deadline,
+        current_deadline, deadline_scope,
+    )
+    corpus = diversity_corpus
+    retriever = _corpus_retriever(corpus, heavy=True)
+    baseline = retriever.recommend_batch(corpus.user_id, 10, [], 'child-budget')
+    retriever.diversity_mode = 'shadow'
+    retriever.diversity_traffic_percent = 100
+    retriever.diversity_policy = DiversityPolicy(minimum_exploration=0)
+    clock = [0.]
+    parent = RequestDeadline(30, clock=lambda: clock[0])
+    original = retriever.assembler.shape_batch
+    children = []
+    def expire_optional(*args, **kwargs):
+        if kwargs.get('diversity_policy') is not None:
+            child = current_deadline()
+            assert child is not parent
+            assert child.expires_at < parent.expires_at - .05
+            children.append(child)
+            if parent_cancelled:
+                parent.cancel('cancelled')
+            else:
+                clock[0] = child.expires_at + .001
+            check_deadline()
+        return original(*args, **kwargs)
+    monkeypatch.setattr(retriever.assembler, 'shape_batch', expire_optional)
+    with deadline_scope(parent):
+        if parent_cancelled:
+            with pytest.raises(CooperativeDeadlineExceeded):
+                retriever.recommend_batch(corpus.user_id, 10, [], 'child-budget')
+        else:
+            result = retriever.recommend_batch(corpus.user_id, 10, [], 'child-budget')
+            assert result.items == baseline.items
+            assert parent.remaining() > 29
+    assert len(children) == 1
+    assert parent.cancelled.is_set() is parent_cancelled

@@ -57,7 +57,10 @@ from retrieval.runtime import RetrievalWork, validate_retrieval_runtime
 from retrieval.social_candidates import (
     SocialCandidate, SocialPolicy, lookup_social_ids, select_social_candidates,
 )
-from utils.deadline import CooperativeDeadlineExceeded, check_deadline, current_deadline, qdrant_timeout
+from utils.deadline import (
+    CooperativeDeadlineExceeded, RequestDeadline, check_deadline, current_deadline,
+    deadline_scope, qdrant_timeout,
+)
 from scripts.user_onboarding import TARGET_VECTOR_NAME, USER_PROFILES_COLLECTION
 
 logger = logging.getLogger("pipeline.v2_retrieval")
@@ -74,6 +77,19 @@ _FALLBACK_MESSAGES = {
     "HEAVY_SCORING_FAILED": "heavy ranker scoring failed",
     "CANDIDATE_VECTORS_UNAVAILABLE": "retained candidate vectors are unavailable",
 }
+
+
+class _DiversityShadowDeadline(RequestDeadline):
+    """Optional CPU work has its own expiry and still observes parent cancellation."""
+
+    def __init__(self, seconds: float, parent: RequestDeadline | None):
+        self.parent = parent
+        super().__init__(seconds, clock=parent.clock if parent is not None else time.monotonic)
+
+    def remaining(self) -> float:
+        if self.parent is not None:
+            self.parent.remaining()
+        return super().remaining()
 
 _DISCOVERY_SOURCES = {
     "trend": "trending",
@@ -2011,20 +2027,34 @@ class QdrantV2Retriever:
                 if self.diversity_mode == 'enabled':
                     raise RetrievalDependencyError('Configured diversity requires qualified vector candidates')
             else:
-                try:
-                    diverse = self.assembler.shape_batch(
-                        assembly_input, seen_repo_ids=excluded, generation_id=generation_seed,
-                        target_size=limit, input_is_unique=True, diversity_policy=self.diversity_policy,
-                        diversity_vectors=vectors, diversity_seed=generation_seed or user_id,
-                        diversity_report=report,
-                    )
-                    if self.diversity_mode == 'enabled':
-                        shaped = diverse
-                        count('diversity_served_requests')
-                except (ValueError, DiversityUnavailableError) as exc:
+                parent = current_deadline()
+                shadow_seconds = min(.01, parent.remaining() - .05) if parent is not None else .01
+                if self.diversity_mode == 'shadow' and shadow_seconds <= 0:
+                    # Preserve a return margin instead of spending the final
+                    # request budget on diagnostics after the baseline is ready.
                     count('diversity_unavailable_requests')
-                    if self.diversity_mode == 'enabled':
-                        raise RetrievalDependencyError('Configured diversity metadata or exploration is unavailable') from exc
+                else:
+                    optional = _DiversityShadowDeadline(shadow_seconds, parent) if self.diversity_mode == 'shadow' else None
+                    try:
+                        with deadline_scope(optional) if optional is not None else nullcontext():
+                            diverse = self.assembler.shape_batch(
+                                assembly_input, seen_repo_ids=excluded, generation_id=generation_seed,
+                                target_size=limit, input_is_unique=True, diversity_policy=self.diversity_policy,
+                                diversity_vectors=vectors, diversity_seed=generation_seed or user_id,
+                                diversity_report=report,
+                            )
+                        if self.diversity_mode == 'enabled':
+                            shaped = diverse
+                            count('diversity_served_requests')
+                    except (CooperativeDeadlineExceeded, ValueError, DiversityUnavailableError) as exc:
+                        count('diversity_unavailable_requests')
+                        if self.diversity_mode == 'enabled':
+                            if isinstance(exc, CooperativeDeadlineExceeded):
+                                raise
+                            raise RetrievalDependencyError('Configured diversity metadata or exploration is unavailable') from exc
+                    # Child expiry never cancels the parent; real request
+                    # cancellation/expiry must nevertheless remain authoritative.
+                    check_deadline()
         items = [
             RankedRepository(
                 repo_id=str(item["repo_id"]),
