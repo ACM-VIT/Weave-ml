@@ -119,6 +119,8 @@ def test_grouped_readme_and_interactive_streams_make_fifo_progress():
 
 @pytest.mark.parametrize('interruption', ['expiry', 'cancellation'])
 def test_expired_or_cancelled_queued_work_never_invokes_encoder(interruption):
+    from utils.observability import diagnostic_snapshot, reset_stage_histograms_for_tests
+    reset_stage_histograms_for_tests()
     raw = ControlledEncoder()
     model = BoundedEmbeddingModel(raw, max_concurrency=1)
     now = [0.0]
@@ -144,6 +146,10 @@ def test_expired_or_cancelled_queued_work_never_invokes_encoder(interruption):
                 expired.result(timeout=2)
             wait_for_model(model, waiting=0)
             assert raw.calls == [['repository']]
+            rows = diagnostic_snapshot()["histograms"]
+            assert any(row["stage"] == "model_lock" and row["outcome"] == "timeout"
+                       and row["count"] == 1 for row in rows)
+            assert not any(row["stage"] == "encoding" for row in rows)
             successor = workers.submit(model.encode, ['onboard'])
             wait_for_model(model, waiting=1)
             assert raw.started.empty()

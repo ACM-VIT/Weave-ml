@@ -7,6 +7,8 @@ import math
 import threading
 from typing import Mapping
 
+from utils.observability import render_stage_histograms, reset_stage_histograms_for_tests
+
 from retrieval.metrics import render_candidate_metrics, reset_candidate_metrics_for_tests
 from retrieval.runtime import retrieval_runtime_status
 from summarization.runtime import summary_admission_metrics
@@ -244,6 +246,7 @@ def render_prometheus(
             "ml_health_dependency_duration_seconds_sum"
             + _labels(dependency=dependency) + f" {duration:.9f}"
         )
+    lines.extend(render_stage_histograms())
     lines.extend(render_candidate_metrics())
     retrieval = retrieval_runtime_status()
     for name in ("workers", "capacity", "outstanding", "running", "peak_running", "waiting_submitters"):
@@ -274,6 +277,7 @@ def render_prometheus(
 def reset_metrics_for_tests() -> None:
     global _empty_recommendations
     reset_candidate_metrics_for_tests()
+    reset_stage_histograms_for_tests()
     with _lock:
         _requests.clear()
         _durations.clear()

@@ -8,6 +8,7 @@ from qdrant_client import models
 from api.contracts import RepositorySearchRequest
 from config import QDRANT_VECTOR_NAME
 from embedding.vector_contract import validate_embedding_vector
+from utils.observability import span_scope
 from utils.deadline import check_deadline, qdrant_timeout
 from retrieval.v2_retriever import _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS
 from retrieval.runtime import run_retrieval_io
@@ -36,6 +37,7 @@ def search_repositories(request: RepositorySearchRequest, retriever: Any, embedd
         must=must,
         must_not=[models.HasIdCondition(has_id=sorted(exclusions))] if exclusions else None,
     )
+    @span_scope("search", stage="qdrant")
     def query_points():
         return retriever.client.query_points(
             collection_name=retriever.repository_collection,

@@ -108,8 +108,10 @@ async def run_recommendation_job(function: Callable[..., T], *args: object) -> T
     except CooperativeDeadlineExceeded as exc:
         raise RecommendationDeadlineExceeded("recommendation budget expired before admission") from exc
     with runtime_admission():
+        observation = WorkObservation("recommendation")
         admission = recommendation_admission()
         if not admission.acquire(blocking=False):
+            observation.finish("rejected")
             with _counter_lock:
                 _rejected = min(_COUNTER_LIMIT, _rejected + 1)
             raise RecommendationCapacityError(
@@ -117,7 +119,6 @@ async def run_recommendation_job(function: Callable[..., T], *args: object) -> T
             )
         with _counter_lock:
             _outstanding += 1
-        observation = WorkObservation("recommendation")
         try:
             # A fresh Context belongs to this task, never shared across workers.
             with deadline_scope(deadline):

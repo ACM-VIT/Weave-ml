@@ -63,6 +63,7 @@ def test_search_deadline_returns_retryable_unavailable(monkeypatch):
 
 
 def test_semantic_search_local_qdrant_filters_and_no_canonical_data():
+    from utils.observability import diagnostic_snapshot, span_scope
     # Embedded in-memory Qdrant only; never reads network credentials.
     client = QdrantClient(':memory:')
     collection = 'phase4_search'
@@ -80,11 +81,19 @@ def test_semantic_search_local_qdrant_filters_and_no_canonical_data():
     seen = []
     embedder = SimpleNamespace(embed_text=lambda text: seen.append(text) or vector)
     req = request(filters={'languages': ['Python'], 'topics': ['vision']}, exclude_repo_ids=[ids[4]])
-    result = search_repositories(req, retriever, embedder)
+    with span_scope("search", server=True, authenticated_traceparent="00-1234567890abcdef1234567890abcdef-1234567890abcdef-01"):
+        result = search_repositories(req, retriever, embedder)
     assert seen == [req.query]
     assert result['items'] == [{'repo_id': ids[0], 'score': pytest.approx(1.)}]
     assert set(result['items'][0]) == {'repo_id', 'score'}
     assert result['embedding_version'] == retriever.embedding_version
+    spans = [span for span in diagnostic_snapshot()["spans"]
+             if span["trace_id"] == "1234567890abcdef1234567890abcdef"]
+    server = next(span for span in reversed(spans) if span["kind"] == "SERVER")
+    dependency = next(span for span in reversed(spans) if span["stage"] == "qdrant")
+    assert dependency["parent_span_id"] == server["span_id"]
+    assert dependency["outcome"] == "ok"
+
     client.close()
 
 

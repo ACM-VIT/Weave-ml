@@ -103,6 +103,7 @@ from summarization.contracts import (
 from summarization.provider import SUMMARY_COMPLETION_RESERVE_SECONDS
 from summarization.settings import SummarySettings
 from utils.readme_processor import clean_markdown_copy, process_markdown
+from utils.observability import span_scope
 from utils.deadline import check_deadline
 from utils.runtime_lifecycle import (
     RuntimeRetiringError, resume_runtime_admission, stop_runtime_admission,
@@ -1130,26 +1131,27 @@ async def generate_recommendations(
         fallback_code=getattr(batch, "fallback_code", None),
         item_count=len(items),
     )
-    return {
-        "schema_version": 2,
-        "generation_id": str(request.generation_id),
-        "user_id": str(request.user_id),
-        "feed_version": request.feed_version,
-        "model_version": batch.model_version,
-        "embedding_version": batch.embedding_version,
-        "embedding_versions": list(getattr(batch, "embedding_versions", ())),
-        "served_ranker": getattr(batch, "served_ranker", "heavy"),
-        "heavy_ranker_selected": getattr(batch, "heavy_ranker_selected", False),
-        "ranker_applied": batch.ranker_applied,
-        "fallback_code": getattr(batch, "fallback_code", None),
-        "fallback_reason": getattr(batch, "fallback_reason", None),
-        "retrieval_mode": getattr(batch, "retrieval_mode", "personalized"),
-        "context_status": {
-            "cold_start_applied": request.context.cold_start,
-            "locale": "reserved_unused" if request.context.locale else "not_provided",
-        },
-        "items": [asdict(item) for item in items],
-    }
+    with span_scope("recommendation", stage="response_build"):
+        return {
+            "schema_version": 2,
+            "generation_id": str(request.generation_id),
+            "user_id": str(request.user_id),
+            "feed_version": request.feed_version,
+            "model_version": batch.model_version,
+            "embedding_version": batch.embedding_version,
+            "embedding_versions": list(getattr(batch, "embedding_versions", ())),
+            "served_ranker": getattr(batch, "served_ranker", "heavy"),
+            "heavy_ranker_selected": getattr(batch, "heavy_ranker_selected", False),
+            "ranker_applied": batch.ranker_applied,
+            "fallback_code": getattr(batch, "fallback_code", None),
+            "fallback_reason": getattr(batch, "fallback_reason", None),
+            "retrieval_mode": getattr(batch, "retrieval_mode", "personalized"),
+            "context_status": {
+                "cold_start_applied": request.context.cold_start,
+                "locale": "reserved_unused" if request.context.locale else "not_provided",
+            },
+            "items": [asdict(item) for item in items],
+        }
 
 
 @router.post(
