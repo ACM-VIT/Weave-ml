@@ -69,6 +69,9 @@ class GraphQLFixture:
         self.partial_manifest = False
         self.tamper_blob = False
         self.truncate_blob = False
+        self.manifest_started = threading.Event()
+        self.release_manifest = threading.Event()
+        self.release_manifest.set()
         self.blob_started = threading.Event()
         self.release_blob = threading.Event()
         self.release_blob.set()
@@ -131,6 +134,9 @@ class GraphQLFixture:
                 assert 0 < length < 64_000
                 raw = self.rfile.read(length)
                 stage, status, result = fixture._response(json.loads(raw))
+                if stage == "manifest":
+                    fixture.manifest_started.set()
+                    assert fixture.release_manifest.wait(5), "fixture manifest gate was not released"
                 if stage == "blob":
                     fixture.blob_started.set()
                     assert fixture.release_blob.wait(5), "fixture blob gate was not released"
@@ -153,6 +159,7 @@ class GraphQLFixture:
         return self
 
     def __exit__(self, *_args):
+        self.release_manifest.set()
         self.release_blob.set()
         self.server.shutdown()
         self.server.server_close()

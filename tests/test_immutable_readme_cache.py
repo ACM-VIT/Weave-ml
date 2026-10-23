@@ -79,9 +79,16 @@ def test_credentials_and_repository_identity_never_share_cached_private_artifact
     with GraphQLFixture() as fixture:
         clients = [fixture.client(token) for token in ("scope-one", "scope-two")]
         try:
-            for client in clients:
-                client.get_readme("owner", "repo")
-            clients[0].get_readme("other-owner", "repo")
+            for index, client in enumerate(clients, 1):
+                readme = client.get_readme("owner", "repo")
+                document = enrichment.RepositoryEnricher(client)._process_readme(readme,
+                    source_path=readme.source_path, default_branch=readme.default_branch, base_url=readme.base_url)
+                assert document.raw_markdown == str(readme)
+                assert stores["README_DOCUMENT_CACHE"].snapshot()["entries"] == index
+            readme = clients[0].get_readme("other-owner", "repo")
+            enrichment.RepositoryEnricher(clients[0])._process_readme(readme,
+                source_path=readme.source_path, default_branch=readme.default_branch, base_url=readme.base_url)
+            assert stores["README_DOCUMENT_CACHE"].snapshot()["entries"] == 3
             assert fixture.calls == {"ref": 3, "manifest": 3, "blob": 3}
             for store in stores.values():
                 assert "scope-one" not in repr(store._values) and "scope-two" not in repr(store._values)
@@ -103,8 +110,14 @@ def test_opaque_auth_bypasses_shared_content_and_document_caches(stores):
         client.session.auth = OpaqueAuth()
         try:
             first = client.get_readme("owner", "repo")
+            enricher = enrichment.RepositoryEnricher(client)
+            def process(value):
+                return enricher._process_readme(value, source_path=value.source_path,
+                    default_branch=value.default_branch, base_url=value.base_url)
+            assert process(first).raw_markdown == str(first)
             client.session.auth.value = "opaque-two"
             second = client.get_readme("owner", "repo")
+            assert process(second).raw_markdown == str(second)
             assert first == second and first.authorization_scope is None
             assert fixture.calls == {"ref": 2, "manifest": 2, "blob": 2}
             assert all(store.snapshot()["entries"] == 0 for store in stores.values())
@@ -164,20 +177,33 @@ def test_partial_candidate_selection_is_not_retained_as_canonical_manifest(store
 
 def test_real_concurrent_clients_share_manifest_and_blob_work(stores):
     with GraphQLFixture() as fixture, ThreadPoolExecutor(max_workers=6) as pool:
+        fixture.release_manifest.clear()
         fixture.release_blob.clear()
         clients = [fixture.client() for _ in range(6)]
-        futures = [pool.submit(client.get_readme, "owner", "repo") for client in clients]
+        futures = []
         try:
+            futures = [pool.submit(client.get_readme, "owner", "repo") for client in clients]
+            assert fixture.manifest_started.wait(2)
+            wait_until(lambda: stores["README_MANIFEST_CACHE"].snapshot().get("coalesced", 0) >= 5)
+            fixture.release_manifest.set()
             assert fixture.blob_started.wait(2)
             wait_until(lambda: stores["README_BLOB_CACHE"].snapshot().get("coalesced", 0) >= 5)
-        finally:
             fixture.release_blob.set()
-        try:
             values = [future.result(3) for future in futures]
             assert len(set(values)) == 1
             assert fixture.calls == {"ref": 6, "manifest": 1, "blob": 1}
             assert stores["README_BLOB_CACHE"].snapshot()["inflight"] == 0
+            assert stores["README_MANIFEST_CACHE"].snapshot()["inflight"] == 0
         finally:
+            fixture.release_manifest.set()
+            fixture.release_blob.set()
+            # Drain both phases even when a barrier assertion fails, before
+            # closing each session owned by an actual concurrent request.
+            for future in futures:
+                try:
+                    future.result(3)
+                except Exception:
+                    pass
             for client in clients:
                 client.session.close()
 
@@ -200,8 +226,12 @@ def test_processed_artifacts_invalidate_parser_context_and_cannot_be_poisoned(st
                 return enricher._process_readme(readme, source_path=readme.source_path,
                     default_branch=branch, base_url=readme.base_url)
             first = parsed()
+            original_paragraphs = list(first.extracted_paragraphs)
             first.clean_text = "poisoned"
-            assert parsed().clean_text != "poisoned" and len(calls) == 1
+            first.extracted_paragraphs.append("poisoned mutable paragraph")
+            second = parsed()
+            assert second.clean_text != "poisoned" and len(calls) == 1
+            assert second.extracted_paragraphs == original_paragraphs
             monkeypatch.setattr(enrichment, "README_PROCESSING_VERSION", "acceptance-parser-v2")
             assert parsed().raw_markdown == str(readme) and len(calls) == 2
             assert parsed("release/v2").default_branch == "release/v2" and len(calls) == 3
@@ -308,3 +338,29 @@ def test_benchmark_counts_actual_wire_savings_without_claiming_latency_threshold
     assert report["avoided_requests"] == 4 and report["avoided_response_body_bytes"] > 0
     assert report["results"]["cached"]["cache"]["README_BLOB_CACHE"]["hits"] == 2
     assert report["results"]["cached"]["cache"]["README_BLOB_CACHE"]["stored_value_hit_ratio"] == pytest.approx(2 / 3)
+
+
+
+@pytest.mark.parametrize('limits', [dict(max_entries=2, max_bytes=100),
+                                   dict(max_entries=100, max_bytes=5)], ids=['entry-only', 'byte-only'])
+def test_entry_and_byte_limits_independently_preserve_recently_read_entries(limits):
+    cache = BoundedReadmeCache(**limits)
+    produced = []
+    def load(key):
+        budget = GitHubRequestBudget()
+        def produce():
+            produced.append(key)
+            return key * 2
+        try:
+            return cache.get_or_load(key, produce, budget, size=len)
+        finally:
+            budget.finish()
+    assert load('a') == 'aa' and load('b') == 'bb'
+    assert load('a') == 'aa'  # Protect the older entry via a real stored-value hit.
+    assert load('c') == 'cc'
+    assert cache.snapshot()['entries'] == 2 and cache.snapshot()['bytes'] == 4
+    assert produced == ['a', 'b', 'c']
+    assert load('a') == 'aa'
+    assert produced == ['a', 'b', 'c'], 'recently accessed entry was evicted'
+    assert load('b') == 'bb'
+    assert produced == ['a', 'b', 'c', 'b'], 'untouched oldest entry was not evicted'
