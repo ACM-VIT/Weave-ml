@@ -134,15 +134,15 @@ def score_code_health(repo: dict) -> float:
 
 
 def activity_score(repo: dict) -> float:
-    """Calculates active code maintainer energy incorporating commit history and recency."""
+    """Repository activity from commit observations or push recency, never owner presence."""
     recent_commits = repo.get("recent_commits", [])
     
     if not recent_commits:
-        # Fallback to push recency and contributor count
+        # Push recency is observed repository activity. The deprecated mentionable
+        # count has no contributor provenance and must not affect this score.
         pushed_days = repo.get("pushed_days_ago", 999)
         recency = math.exp(-pushed_days * math.log(2) / 30.0)
-        contrib = min(repo.get("mentionable_users_count", 0) / 10.0, 1.0)
-        return round(math.sqrt(recency * contrib), 4)
+        return round(recency, 4)
 
     # Convert commit timestamps to days ago
     from datetime import datetime, timezone
