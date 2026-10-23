@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import hashlib
 import math
 import uuid
-from typing import Literal, Sequence
+from typing import Callable, Literal, Sequence
 
 import numpy as np
 
@@ -79,6 +79,7 @@ def rerank_diverse(
     candidates: Sequence[DiversityCandidate], *, target_size: int, seed: str,
     policy: DiversityPolicy = DiversityPolicy(), recent_repo_ids: frozenset[str] = frozenset(),
     personalized_top_ids: frozenset[str] = frozenset(),
+    check_work: Callable[[], None] = lambda: None,
 ) -> DiversityResult:
     """Reserve feasible exploration first, then maximize relevance/diversity.
 
@@ -99,6 +100,7 @@ def rerank_diverse(
     pool: list[tuple[DiversityCandidate, tuple[float, ...]]] = []
     excluded = unknown = 0
     for candidate in candidates:
+        check_work()
         repo_id = str(uuid.UUID(candidate.repo_id))
         if candidate.repo_id != repo_id or repo_id in identities:
             raise ValueError('Candidates require unique canonical repository UUIDs')
@@ -137,7 +139,9 @@ def rerank_diverse(
     normalized = np.asarray([vector for _, vector in pool], dtype=np.float64).reshape((-1, policy.dimensions))
     # At most150x150 scalars: compute each dot product once, not once per
     # candidate per prior selection per greedy iteration.
+    check_work()
     similarities = np.clip(normalized @ normalized.T, -1.0, 1.0)
+    check_work()
     selected: list[tuple[DiversityCandidate, tuple[float, ...]]] = []
     owners: dict[str, int] = {}
     families: dict[str, int] = {}
@@ -186,6 +190,7 @@ def rerank_diverse(
         if len(explore_pool) - start < required - len(selected):
             return False
         for index in range(start, len(explore_pool)):
+            check_work()
             if attempts >= policy.quota_search_limit:
                 exhausted = True
                 return False
@@ -211,6 +216,7 @@ def rerank_diverse(
     for chosen in selected:
         pool.remove(chosen)
     while len(selected) < target_size:
+        check_work()
         eligible = [row for row in pool if feasible(row)]
         if not eligible:
             break

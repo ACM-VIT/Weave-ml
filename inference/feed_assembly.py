@@ -5,7 +5,10 @@ import threading
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
+
+from inference.diversity import DiversityCandidate, DiversityPolicy, DiversityResult, rerank_diverse
+from utils.deadline import check_deadline
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +17,10 @@ def _utc_hour(value: datetime) -> datetime:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+
+
+class DiversityUnavailableError(RuntimeError):
+    """Configured diversity cannot serve a fully qualified selection."""
 
 
 class FeedAssemblySystem:
@@ -103,6 +110,10 @@ class FeedAssemblySystem:
         generation_id: str | None = None,
         target_size: int | None = None,
         input_is_unique: bool = False,
+        diversity_policy: DiversityPolicy | None = None,
+        diversity_vectors: dict[str, list[float] | None] | None = None,
+        diversity_seed: str = 'default',
+        diversity_report: Callable[[DiversityResult], None] | None = None,
     ) -> list[dict]:
         """Shape a ranked pool with in-page exploration.
 
@@ -199,6 +210,38 @@ class FeedAssemblySystem:
             ),
             reverse=True,
         )
+
+        if diversity_policy is not None:
+            vectors = diversity_vectors or {}
+            candidates = []
+            for item in shaped:
+                vector = vectors.get(item['repo_id'])
+                if vector is None:
+                    raise DiversityUnavailableError('Diversity requires fresh compatible repository vectors')
+                raw_topics = item.get('topics') or []
+                if (not isinstance(raw_topics, (list, tuple)) or len(raw_topics) > 200
+                        or any(not isinstance(topic, str) or not 1 <= len(topic) <= 128 for topic in raw_topics)
+                        or (item.get('category') is not None and not isinstance(item['category'], str))):
+                    raise DiversityUnavailableError('Diversity requires bounded topic/category metadata')
+                candidates.append(DiversityCandidate(
+                    repo_id=item['repo_id'], score=float(item['final_score']), vector=tuple(vector),
+                    owner_github_id=item.get('owner_github_id'), fork_family_github_id=item.get('fork_family_github_id'),
+                    topics=tuple(sorted(set(topic.strip().casefold() for topic in raw_topics))),
+                    category=str(item['category']).strip().casefold() if item.get('category') else None,
+                    bucket=item.get('candidate_bucket', 'personalized'),
+                ))
+            desired = len(shaped) if target_size is None else int(target_size)
+            personalized = frozenset(item['repo_id'] for item in shaped
+                if item.get('candidate_bucket', 'personalized') == 'personalized')
+            result = rerank_diverse(candidates, target_size=desired, seed=diversity_seed,
+                policy=diversity_policy, recent_repo_ids=frozenset(seen_repo_ids),
+                personalized_top_ids=personalized, check_work=check_deadline)
+            if diversity_report is not None:
+                diversity_report(result)
+            if result.unknown_identity or result.exploration_shortfall or (desired and not result.candidates):
+                raise DiversityUnavailableError('Diversity metadata or required exploration is unavailable')
+            by_id = {item['repo_id']: item for item in shaped}
+            return [by_id[candidate.repo_id] for candidate in result.candidates]
 
         language_counts: dict[str, int] = {}
         diverse: list[dict] = []

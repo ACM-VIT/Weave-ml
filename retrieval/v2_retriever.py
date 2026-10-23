@@ -42,8 +42,10 @@ from embedding.vector_contract import (
     USER_PROFILE_COLLECTION_CONTRACT,
     user_point_id,
     validate_embedding_vector,
+    validate_diversity_metadata,
 )
-from inference.feed_assembly import FeedAssemblySystem
+from inference.feed_assembly import FeedAssemblySystem, DiversityUnavailableError
+from inference.diversity import DiversityPolicy
 from inference.feature_spec import FEATURE_ORDER
 from inference.ranker_service import RankerService
 from inference.runtime import RecommendationDeadlineExceeded, recommendation_timeout_seconds
@@ -124,9 +126,11 @@ _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS = [
     "trend_velocity",
     "delta_7d",
     "primary_language",
+    "github_id", "owner_github_id", "is_fork", "fork_parent_github_id", "fork_family_github_id",
+    "lineage_source", "lineage_observed_at",
     "created_at",
 ]
-_HEAVY_RANKER_PAYLOAD_FIELDS = ["languages", "topics", "tags"]
+_HEAVY_RANKER_PAYLOAD_FIELDS = ["languages", "topics", "tags", "category"]
 
 
 class RetrievalDependencyError(RuntimeError):
@@ -374,6 +378,21 @@ class QdrantV2Retriever:
             raise ValueError(
                 "V2_HEAVY_RANKER_TRAFFIC_PERCENT must be 100 when the heavy ranker is required"
             )
+        self.diversity_mode = os.getenv('V2_DIVERSITY_MODE', 'disabled').strip().casefold()
+        if self.diversity_mode not in {'disabled', 'shadow', 'enabled'}:
+            raise ValueError('V2_DIVERSITY_MODE must be disabled, shadow or enabled')
+        self.diversity_traffic_percent = self._float_env('V2_DIVERSITY_TRAFFIC_PERCENT', default=0, minimum=0, maximum=100)
+        self.diversity_policy = DiversityPolicy(
+            relevance_weight=self._float_env('V2_DIVERSITY_RELEVANCE_WEIGHT', default=.7, minimum=0, maximum=1),
+            duplicate_cosine=self._float_env('V2_DIVERSITY_DUPLICATE_COSINE', default=.98, minimum=.01, maximum=1),
+            max_per_owner=self._int_env('V2_DIVERSITY_MAX_PER_OWNER', default=2, minimum=1),
+            max_per_topic=self._int_env('V2_DIVERSITY_MAX_PER_TOPIC', default=5, minimum=1),
+            max_per_category=self._int_env('V2_DIVERSITY_MAX_PER_CATEGORY', default=8, minimum=1),
+            max_per_fork_family=self._int_env('V2_DIVERSITY_MAX_PER_FAMILY', default=1, minimum=1),
+            minimum_exploration=self._int_env('V2_DIVERSITY_MIN_EXPLORATION', default=2, minimum=0),
+        )
+        if self.diversity_mode == 'enabled' and (not self.heavy_ranker_required or self.max_candidates > 150):
+            raise ValueError('Enabled diversity requires strict-heavy ranking with at most150 candidates')
         if allow_unqualified_ranker is None:
             allow_unqualified_ranker = self._boolean_env(
                 "V2_ALLOW_UNQUALIFIED_HEAVY_RANKER", default=True
@@ -392,6 +411,9 @@ class QdrantV2Retriever:
             "social_shadow_candidates": 0,
             "social_injected_candidates": 0,
             "social_lookup_failures": 0,
+            "diversity_shadow_requests": 0, "diversity_served_requests": 0,
+            "diversity_unavailable_requests": 0, "diversity_unknown_candidates": 0,
+            "diversity_exploration_shortfall": 0, "diversity_search_exhausted": 0,
             **{f"fallback_{code.casefold()}": 0 for code in _FALLBACK_MESSAGES},
         }
         self.ranker: RankerService | None = None
@@ -593,6 +615,7 @@ class QdrantV2Retriever:
             if repo_id is None:
                 raise ValueError("repository identity is not canonical")
             payload = dict(point.payload or {})
+            validate_diversity_metadata(payload)
             revision = payload.get("embedding_model_revision")
             if (
                 payload.get(REPOSITORY_SERVING_ELIGIBILITY_FIELD)
@@ -1927,6 +1950,13 @@ class QdrantV2Retriever:
                 "primary_language": metadata.get(item.repo_id, {}).get(
                     "primary_language"
                 ),
+                "owner_github_id": metadata.get(item.repo_id, {}).get('owner_github_id'),
+                "fork_family_github_id": metadata.get(item.repo_id, {}).get('fork_family_github_id'),
+                "topics": metadata.get(item.repo_id, {}).get('topics') or [],
+                "category": metadata.get(item.repo_id, {}).get('category'),
+                "candidate_bucket": ('personalized' if item.source == 'semantic' else
+                    'adjacent' if 'adjacent_interest' in item.retrieval_scores else
+                    'trending' if item.source == 'trending' else 'exploration'),
                 "created_at": metadata.get(item.repo_id, {}).get("created_at"),
             }
             for item in ranked
@@ -1940,6 +1970,36 @@ class QdrantV2Retriever:
             target_size=limit,
             input_is_unique=True,
         )
+        cohort = int.from_bytes(hashlib.sha256(str(uuid.UUID(user_id)).encode()).digest()[:8], 'big') % 10000
+        if self.diversity_mode != 'disabled' and cohort < self.diversity_traffic_percent * 100:
+            def count(name, amount=1):
+                with self._counter_lock:
+                    self._ranking_counters[name] = min(_COUNTER_LIMIT, self._ranking_counters[name] + amount)
+            def report(result):
+                count('diversity_unknown_candidates', result.unknown_identity)
+                count('diversity_exploration_shortfall', result.exploration_shortfall)
+                count('diversity_search_exhausted', int(result.quota_search_exhausted))
+            if self.diversity_mode == 'shadow':
+                count('diversity_shadow_requests')
+            if not ranker_applied or len(assembly_input) > 150:
+                count('diversity_unavailable_requests')
+                if self.diversity_mode == 'enabled':
+                    raise RetrievalDependencyError('Configured diversity requires qualified vector candidates')
+            else:
+                try:
+                    diverse = self.assembler.shape_batch(
+                        assembly_input, seen_repo_ids=excluded, generation_id=generation_seed,
+                        target_size=limit, input_is_unique=True, diversity_policy=self.diversity_policy,
+                        diversity_vectors=vectors, diversity_seed=generation_seed or user_id,
+                        diversity_report=report,
+                    )
+                    if self.diversity_mode == 'enabled':
+                        shaped = diverse
+                        count('diversity_served_requests')
+                except (ValueError, DiversityUnavailableError) as exc:
+                    count('diversity_unavailable_requests')
+                    if self.diversity_mode == 'enabled':
+                        raise RetrievalDependencyError('Configured diversity metadata or exploration is unavailable') from exc
         items = [
             RankedRepository(
                 repo_id=str(item["repo_id"]),
@@ -2121,6 +2181,8 @@ class QdrantV2Retriever:
             "allow_missing_embedding_revision": self.allow_missing_embedding_revision,
             "minimum_eligible_repository_points": self.minimum_eligible_repositories,
             "heavy_ranker_enabled": self.heavy_ranker_enabled,
+            "diversity_mode": self.diversity_mode,
+            "diversity_traffic_percent": self.diversity_traffic_percent,
             "heavy_ranker_required": self.heavy_ranker_required,
             "heavy_ranker_ready": self.ranker is not None,
             "heavy_ranker_production_qualified": self.heavy_ranker_production_qualified,

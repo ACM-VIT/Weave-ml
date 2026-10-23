@@ -109,3 +109,99 @@ def test_quota_search_has_an_explicit_work_bound_and_never_relaxes_hard_caps():
         policy=replace(policy(max_per_topic=1),minimum_exploration=2,quota_search_limit=1))
     assert result.quota_search_exhausted and result.exploration_shortfall == 1
     assert len(result.candidates) == 1
+
+
+def test_actual_assembler_requires_qualified_vectors_metadata_and_preserves_source_scores():
+    from inference.feed_assembly import FeedAssemblySystem, DiversityUnavailableError
+    rows = [candidate(1,(1,0,0)),candidate(2,(0,1,0),bucket='trending'),candidate(3,(0,0,1),bucket='adjacent')]
+    assembly = [{'repo_id':r.repo_id,'score':r.score,'source':r.bucket,'candidate_bucket':r.bucket,
+        'owner_github_id':r.owner_github_id,'fork_family_github_id':r.fork_family_github_id,
+        'retrieval_scores':{r.bucket:r.score}} for r in rows]
+    vectors = {r.repo_id:list(r.vector) for r in rows}
+    assembler = FeedAssemblySystem(freshness_boost=0)
+    shaped = assembler.shape_batch(assembly,target_size=2,diversity_policy=replace(policy(),minimum_exploration=1),
+        diversity_vectors=vectors,diversity_seed='g')
+    assert len(shaped)==2 and any(row['candidate_bucket']!='personalized' for row in shaped)
+    assert all(row['retrieval_scores']==next(r['retrieval_scores'] for r in assembly if r['repo_id']==row['repo_id']) for row in shaped)
+    with pytest.raises(DiversityUnavailableError,match='vectors'):
+        assembler.shape_batch(assembly,target_size=2,diversity_policy=policy(),diversity_vectors={})
+    with pytest.raises(DiversityUnavailableError,match='metadata'):
+        assembler.shape_batch([{**assembly[0],'owner_github_id':None}],target_size=1,
+            diversity_policy=policy(),diversity_vectors=vectors)
+
+
+def test_diversity_cooperatively_stops_inside_candidate_work():
+    calls = 0
+    def check():
+        nonlocal calls
+        calls += 1
+        if calls==2: raise TimeoutError('request deadline')
+    with pytest.raises(TimeoutError,match='deadline'):
+        rerank_diverse([candidate(1,(1,0,0)),candidate(2,(0,1,0))],target_size=2,seed='g',policy=policy(),check_work=check)
+
+# Real local Qdrant filters/projections and fresh retained vector reads; only the
+# model scores are deterministic fixture outputs, not real-user quality labels.
+from tests.test_v2_retrieval import local_recommendation_corpus, _corpus_retriever
+
+
+@pytest.fixture
+def diversity_corpus(local_recommendation_corpus):
+    from config import QDRANT_VECTOR_NAME
+    from qdrant_client import models
+    corpus = local_recommendation_corpus
+    points = corpus.client.retrieve(collection_name=corpus.repository_collection,ids=corpus.repo_ids,
+                                    with_vectors=False,with_payload=True)
+    rebuilt = []
+    for index,point in enumerate(points):
+        payload = {**point.payload,'github_id':str(100000+index),'owner_github_id':str(index//2+1),
+            'is_fork':False,'fork_family_github_id':str(100000+index),
+            'lineage_source':'github-graphql-repository','lineage_observed_at':'2026-10-23T00:00:00+00:00',
+            'topics':[f'topic_{index%20}'],'category':f'category_{index%10}'}
+        vector = [0.0]*384
+        vector[0],vector[1],vector[2+index%382] = 1.0,index/600,.8
+        rebuilt.append(models.PointStruct(id=str(point.id),vector={QDRANT_VECTOR_NAME:vector},payload=payload))
+    corpus.client.upsert(collection_name=corpus.repository_collection,points=rebuilt)
+    corpus.client.retrieve.reset_mock()
+    return corpus
+
+
+def test_actual_retriever_diversity_shadow_and_enabled_preserve_fresh_pairs_and_source_evidence(diversity_corpus):
+    from retrieval.social_candidates import SocialCandidate,SocialPolicy
+    corpus = diversity_corpus
+    retriever = _corpus_retriever(corpus,heavy=True)
+    retriever.social_policy = SocialPolicy(mode='enabled')
+    social = SocialCandidate(repo_id=corpus.repo_ids[-1],owner_github_id='300',source='followed_owner',support=1,source_score=.5)
+    baseline = retriever.recommend_batch(corpus.user_id,10,[],'diversity-generation',False,[],[social])
+    retriever.diversity_traffic_percent = 100
+    retriever.diversity_policy = DiversityPolicy(minimum_exploration=1)
+    retriever.diversity_mode = 'shadow'
+    shadow = retriever.recommend_batch(corpus.user_id,10,[],'diversity-generation',False,[],[social])
+    assert shadow.items == baseline.items
+    retriever.diversity_mode = 'enabled'
+    enabled = retriever.recommend_batch(corpus.user_id,10,[],'diversity-generation',False,[],[social])
+    assert enabled.ranker_applied and enabled.served_ranker=='heavy'
+    assert social.repo_id in {row.repo_id for row in enabled.items}
+    assert next(row for row in enabled.items if row.repo_id==social.repo_id).retrieval_scores['followed_owner']==.5
+    assert len(enabled.items)==10
+    assert retriever._ranking_counter_snapshot()['diversity_served_requests']==1
+    excluded = next(row.repo_id for row in enabled.items if row.repo_id!=social.repo_id)
+    replay = retriever.recommend_batch(corpus.user_id,10,[excluded],'diversity-excluded',False,[],[social])
+    assert excluded not in {row.repo_id for row in replay.items}
+    corpus.client.set_payload(collection_name=corpus.repository_collection,
+                              payload={'owner_github_id':None},points=[corpus.repo_ids[0]])
+    from retrieval.v2_retriever import RetrievalDependencyError
+    with pytest.raises(RetrievalDependencyError,match='diversity'):
+        retriever.recommend_batch(corpus.user_id,10,[],'diversity-unknown',False,[],[social])
+
+
+def test_diversity_does_not_add_repository_vector_reads_to_hybrid_and_rejects_enabled_hybrid(local_recommendation_corpus,monkeypatch):
+    corpus = local_recommendation_corpus
+    retriever = _corpus_retriever(corpus,heavy=False)
+    retriever.diversity_mode='shadow'; retriever.diversity_traffic_percent=100
+    retriever.recommend_batch(corpus.user_id,10,[],'hybrid-shadow')
+    assert len(corpus.client.retrieve.call_args_list)==1
+    assert all(not call.kwargs.get('with_vectors') for call in corpus.client.query_points.call_args_list)
+    assert retriever._ranking_counter_snapshot()['diversity_unavailable_requests']==1
+    monkeypatch.setenv('V2_DIVERSITY_MODE','enabled')
+    with pytest.raises(ValueError,match='strict-heavy'):
+        _corpus_retriever(corpus,heavy=False)
