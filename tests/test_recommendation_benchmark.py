@@ -107,3 +107,67 @@ def test_run_requires_complete_profiles_stages_and_matching_embedding_identity()
     b, r = diagnostic()
     r['embedding']['query_prompt'] = 'changed meaning'
     with pytest.raises(ValueError, match='embedding'): report(b, r)
+
+
+def test_similarity_reuses_pairs_across_profiles_stages_and_reverse_order(monkeypatch):
+    from evaluation import recommendation_benchmark as benchmark
+    b, r = diagnostic()
+    # Preserve per-position repeated-ID contributions and self-pairs. Near-unit
+    # vectors at the accepted tolerance make each pair's clamp observable.
+    b['repositories'][0]['vector'] = [math.sqrt(1.000001), 0., 0.]
+    b['repositories'][1]['vector'] = [-math.sqrt(1.000001), 0., 0.]
+    ids = [repo['repo_id'] for repo in b['repositories']]
+    orders = [[ids[0], ids[0], ids[1], ids[2]], [ids[2], ids[1], ids[0], ids[0]]]
+    for index, output in enumerate(r['outputs']):
+        for stage in output['stages']:
+            output['stages'][stage] = [dict(repo_id=repo_id, score=float(4-i),
+                source='diagnostic', source_score=.5) for i, repo_id in enumerate(orders[index])]
+    bundle, run = Bundle.model_validate(b), Run.model_validate(r)
+    pairs = set()
+    for output in run.outputs:
+        for rows in output.stages.values():
+            for i, a in enumerate(rows):
+                for c in rows[i+1:]:
+                    pairs.add(tuple(sorted((a.repo_id, c.repo_id))))
+    calls = []
+    original = benchmark._clamped_cosine
+    def counted(left, right):
+        calls.append((left, right))
+        return original(left, right)
+    monkeypatch.setattr(benchmark, '_clamped_cosine', counted)
+    result = benchmark.evaluate(bundle, run, k=4)
+    assert len(calls) == len(pairs)
+    repos = {repo.repo_id: repo for repo in bundle.repositories}
+    for stage in ('retrieval', 'ranking', 'assembly'):
+        expected, visits = 0., 0
+        for output in run.outputs:
+            rows = output.stages[stage]
+            for i, a in enumerate(rows):
+                for c in rows[i+1:]:
+                    expected += max(-1., min(1., sum(x*y for x,y in zip(
+                        repos[a.repo_id].vector, repos[c.repo_id].vector))))
+                    visits += 1
+        assert result['stages'][stage]['counts']['similarity_pairs'] == visits == 12
+        assert result['stages'][stage]['metrics']['intra_list_similarity'] == expected / visits
+    assert result['stages']['assembly']['metrics']['repeat_rate'] == .25
+    assert result['stages']['assembly']['metrics']['intra_list_similarity'] == -1 / 6
+
+
+@pytest.mark.parametrize('capacity', [0, 1, 2])
+def test_similarity_cache_eviction_preserves_every_report_field(monkeypatch, capacity):
+    from evaluation import recommendation_benchmark as benchmark
+    b, r = diagnostic()
+    bundle, run = Bundle.model_validate(b), Run.model_validate(r)
+    expected = benchmark.evaluate(bundle, run, k=4)
+    monkeypatch.setattr(benchmark, '_SIMILARITY_CACHE_PAIRS', capacity)
+    assert benchmark.evaluate(bundle, run, k=4) == expected
+
+
+def test_similarity_cache_cannot_reuse_another_snapshots_vectors():
+    from evaluation import recommendation_benchmark as benchmark
+    b, r = diagnostic()
+    run = Run.model_validate(r)
+    first = benchmark.evaluate(Bundle.model_validate(b), run, k=3)
+    b['repositories'][0]['vector'] = [-1., 0., 0.]
+    second = benchmark.evaluate(Bundle.model_validate(b), run, k=3)
+    assert first['stages']['ranking']['metrics']['intra_list_similarity'] != second['stages']['ranking']['metrics']['intra_list_similarity']
