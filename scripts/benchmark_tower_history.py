@@ -53,6 +53,7 @@ def snapshots(repository, *, ref, limit=40, path='README.md', changes_only=False
     candidate = PurePosixPath(path)
     if candidate.is_absolute() or '..' in candidate.parts or not candidate.name.lower().startswith('readme'):
         raise ValueError('only relative README paths may be sampled')
+    path = candidate.as_posix()
     repository = Path(repository).resolve()
     frozen = git(repository, 'rev-parse', '--verify', '--end-of-options', f'{ref}^{{commit}}').decode().strip()
     args = ['log', '--first-parent', f'-{limit}', '--format=%H', frozen]
@@ -139,6 +140,7 @@ def main():
     parser.add_argument('--changes-only', action='store_true')
     parser.add_argument('--cached-real-model', action='store_true')
     args = parser.parse_args()
+    args.path = PurePosixPath(args.path).as_posix()
     frozen, rows, skipped = snapshots(args.repo, ref=args.ref, limit=args.limit,
                                      path=args.path, changes_only=args.changes_only)
     model = None

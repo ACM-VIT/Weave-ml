@@ -8,8 +8,21 @@ import pytest
 from scripts.benchmark_tower_history import git, replay, snapshots
 
 
+def require_local_only_git():
+    # Probe before fixture mutation. Replay intentionally fails closed if this
+    # no-network option is absent, including on distribution Git 2.39 builds.
+    try:
+        probe = subprocess.run(['git', '--no-lazy-fetch', '--version'],
+                               capture_output=True, timeout=15, check=False)
+    except FileNotFoundError:
+        pytest.skip('Git is required for the local-history fixture')
+    if probe.returncode:
+        pytest.skip('Git with --no-lazy-fetch support is required for history replay')
+
+
 @pytest.fixture
 def history(tmp_path):
+    require_local_only_git()
     # Synthetic bare fixture only, never a checkout/copy of either project.
     repo = tmp_path / 'objects.git'
     subprocess.run(['git', 'init', '--bare', str(repo)], check=True, capture_output=True)
@@ -136,6 +149,9 @@ def test_nonregular_readme_entries_are_explicitly_skipped(history, mode, changes
 
 def test_missing_promisor_readme_never_invokes_git_transport(tmp_path, monkeypatch):
     import os
+    require_local_only_git()
+    if os.name != "posix":
+        pytest.skip("This promisor fixture uses a POSIX transport helper")
     repo = tmp_path / 'partial'
     repo.mkdir()
     def raw_git(*args, data=None):
@@ -162,3 +178,47 @@ def test_missing_promisor_readme_never_invokes_git_transport(tmp_path, monkeypat
     subprocess.run(['git', 'show', blob], cwd=repo, env=env,
                    capture_output=True, text=True, timeout=15, check=False)
     assert marker.read_text() == 'attempted'
+
+
+@pytest.mark.parametrize('changes_only', [False, True])
+@pytest.mark.parametrize('path', ['./README.md', '././README.md'])
+def test_relative_dot_readme_paths_preserve_actual_object_snapshots(history, changes_only, path):
+    repo, _ = history
+    canonical = snapshots(repo, ref='fixture', path='README.md', changes_only=changes_only)
+    actual = snapshots(repo, ref='fixture', path=path, changes_only=changes_only)
+    assert actual == canonical
+    assert actual[1]
+    assert all(row['path'] == 'README.md' for row in actual[1])
+
+
+def test_cli_reports_canonical_readme_path(history):
+    import sys
+    result = subprocess.run([sys.executable, '-m', 'scripts.benchmark_tower_history',
+                             '--repo', str(history[0]), '--ref', 'fixture',
+                             '--path', './README.md'], capture_output=True,
+                            text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report['path'] == 'README.md'
+    assert report['snapshots'] > 0
+    assert all(row['path'] == 'README.md' for row in report['records'])
+
+
+def test_unsupported_git_skips_before_any_fixture_setup(tmp_path, monkeypatch):
+    calls = []
+    def unsupported(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 129, b'', b'unknown option: --no-lazy-fetch')
+    monkeypatch.setattr(subprocess, 'run', unsupported)
+    with pytest.raises(pytest.skip.Exception, match='no-lazy-fetch'):
+        history.__wrapped__(tmp_path)
+    assert not list(tmp_path.iterdir())
+    assert calls == [['git', '--no-lazy-fetch', '--version']]
+
+
+def test_replay_on_unsupported_git_still_fails_closed(tmp_path, monkeypatch):
+    def unsupported(args, **kwargs):
+        raise subprocess.CalledProcessError(129, args, stderr=b'unknown option: --no-lazy-fetch')
+    monkeypatch.setattr(subprocess, 'run', unsupported)
+    with pytest.raises(RuntimeError, match='lazy fetching disabled'):
+        git(tmp_path, 'show', 'HEAD:README.md')
