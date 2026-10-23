@@ -49,13 +49,17 @@ def test_injected_429_frees_workers_and_replays_completed_stages_once():
     assert result['transport_worker_sleep_calls'] == 0
     assert result['maximum_admitted_jobs'] <= 4 and result['maximum_active_workers'] <= 2
     assert result['observed_queued_with_no_active_worker'] is True
-    assert result['minimum_post_reset_request_gap_seconds'] >= .099999
+    assert result['minimum_post_reset_admission_gap_seconds'] >= .099999
     assert result['all_worker_clients_share_quota'] and result['all_worker_sessions_closed']
     assert result['settled_scheduler'] == {'active': 0, 'queued': 0, 'admitted': 0}
-    records = result['requests']
-    first_throttle = next(index for index, row in enumerate(records) if row['status'] == 429)
-    assert all(row['at'] >= records[first_throttle]['at'] + 5.1 - 1e-9
-               for row in records[first_throttle + 1:])
+    assert result['all_post_throttle_admissions_respect_reset']
+    # Transport arrival can occur after a later response even when its quota
+    # permit was obtained earlier. The quota decision is the correct boundary.
+    events = result['quota_events']
+    first_throttle = next(index for index, event in enumerate(events) if event['event'] == 'throttle')
+    ready = events[first_throttle]['ready_at']
+    assert all(event['at'] >= ready - 1e-9 for event in events[first_throttle + 1:]
+               if event['event'] == 'admit' and event['granted'])
 
 
 def test_cancelling_a_deferred_job_releases_it_without_another_request():
@@ -154,3 +158,71 @@ def test_auth_scope_keys_are_opaque_and_changed_auth_cannot_replay_a_response():
                 client.execute('metadata', {'name': 'scoped'})
         assert len(transport.records) == 1
         assert 'fixture-token' not in str(error.value)
+
+
+
+def test_driver_failure_cancels_deferred_jobs_before_producer_join(monkeypatch):
+    from scripts import benchmark_github_quota as benchmark
+    schedulers, failures = [], []
+    def failed_driver(future, clock, scheduler):
+        schedulers.append(scheduler)
+        until(lambda: scheduler.snapshot()['queued'] > 0 and scheduler.snapshot()['active'] == 0)
+        raise AssertionError('intentional driver timeout')
+    monkeypatch.setattr(benchmark, 'advance_until', failed_driver)
+    def run():
+        try:
+            benchmark.measure()
+        except BaseException as error:
+            failures.append(error)
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    try:
+        thread.join(timeout=3)
+        assert not thread.is_alive(), 'driver failure joined a blocked producer before cancelling jobs'
+        assert len(failures) == 1 and str(failures[0]) == 'intentional driver timeout'
+    finally:
+        for scheduler in schedulers:
+            scheduler.cancel()
+        thread.join(timeout=3)
+
+
+def test_overlapping_submitter_waits_after_all_four_job_permits_are_held():
+    from concurrent.futures import TimeoutError as FutureTimeout
+    from acquisition.github_graphql_client import FetchedReadme
+    releases = threading.Event()
+    entered = []
+    lock = threading.Lock()
+    class Client:
+        def get_readme(self, owner, name):
+            with lock:
+                entered.append(name)
+            assert releases.wait(3), 'test did not release active transport'
+            return FetchedReadme('# Fixture')
+        def close(self):
+            pass
+    with ReadmeScheduler(Client, 2) as scheduler, ThreadPoolExecutor(max_workers=1) as callers:
+        try:
+            futures = [scheduler.submit('fixture', str(i)) for i in range(4)]
+            until(lambda: scheduler.snapshot() == {'active': 2, 'queued': 2, 'admitted': 4})
+            started = threading.Event()
+            def fifth():
+                started.set()
+                return scheduler.submit('fixture', 'fifth')
+            pending = callers.submit(fifth)
+            assert started.wait(1)
+            def waiting_or_finished():
+                # Observe the actual semaphore wait, not just a thread scheduled
+                # immediately before submit. A removed ceiling finishes instead.
+                with scheduler._slots._cond:
+                    return bool(scheduler._slots._cond._waiters) or pending.done()
+            until(waiting_or_finished)
+            assert not pending.done(), 'fifth submit bypassed the admission ceiling'
+            with pytest.raises(FutureTimeout):
+                pending.result(timeout=.1)
+            assert scheduler.snapshot()['admitted'] == 4
+            releases.set()
+            futures.append(pending.result(timeout=2))
+            assert all(future.result(timeout=2) for future in futures)
+        finally:
+            releases.set()
+            scheduler.cancel()

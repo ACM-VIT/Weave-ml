@@ -23,7 +23,8 @@ from acquisition import readme_scheduler as scheduling
 
 class Clock:
     def __init__(self):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.quota_events = []
         self.now = 0.
         self.worker_sleep_calls = 0
 
@@ -47,7 +48,25 @@ class Clock:
 def fixture_clock(clock):
     fake_time = SimpleNamespace(monotonic=clock.monotonic, time=clock.wall,
                                 sleep=clock.forbidden_worker_sleep)
+    original_admit = quota.GitHubRateLimitCoordinator.admit
+    original_throttle = quota.GitHubRateLimitCoordinator.throttle
+    def observe_admit(coordinator):
+        # Extend the real registry critical section only through its fixture
+        # observation; freeze synthetic time across decision and timestamp.
+        with quota._registry_lock, clock.lock:
+            result = original_admit(coordinator)
+            clock.quota_events.append({'event': 'admit', 'at': clock.monotonic(),
+                                       'granted': result is None})
+            return result
+    def observe_throttle(coordinator, headers):
+        with quota._registry_lock, clock.lock:
+            result = original_throttle(coordinator, headers)
+            clock.quota_events.append({'event': 'throttle', 'at': clock.monotonic(),
+                                       'ready_at': result})
+            return result
     with ExitStack() as stack:
+        stack.enter_context(patch.object(quota.GitHubRateLimitCoordinator, 'admit', observe_admit))
+        stack.enter_context(patch.object(quota.GitHubRateLimitCoordinator, 'throttle', observe_throttle))
         for module in (quota, graphql, scheduling):
             stack.enter_context(patch.object(module, 'time', fake_time))
         stack.enter_context(patch.object(quota.random, 'uniform', return_value=.1))
@@ -141,15 +160,23 @@ def measure(*, jobs=8, workers=2):
                     return [future.result() for future in scheduler.ordered(
                         ('fixture', f'repository-{index}') for index in range(jobs))]
                 result = producer.submit(consume)
-                samples = advance_until(result, clock, scheduler)
-                values = result.result()
+                try:
+                    samples = advance_until(result, clock, scheduler)
+                    values = result.result()
+                except BaseException:
+                    # The producer can be waiting on deferred jobs whose fake
+                    # clock has stopped. Cancel before its executor joins.
+                    scheduler.cancel()
+                    raise
             final = scheduler.snapshot()
         coordinator = transport.coordinators[0].snapshot()
         shared = all(value is transport.coordinators[0] for value in transport.coordinators)
     elapsed = time.perf_counter() - began
     throttles = [r for r in transport.records if r['status'] == 429]
-    first_reset = throttles[0]['at'] + 5
-    after_reset = sorted(r['at'] for r in transport.records if r['at'] >= first_reset)
+    throttle_index = next(i for i, event in enumerate(clock.quota_events) if event['event'] == 'throttle')
+    first_reset = clock.quota_events[throttle_index]['ready_at']
+    after_reset = [e['at'] for e in clock.quota_events[throttle_index + 1:]
+                   if e['event'] == 'admit' and e['granted']]
     metadata_counts = {name: sum(r['name'] == name and r['stage'] == 'metadata' for r in transport.records)
                        for name in {r['name'] for r in transport.records}}
     return {'scope': __doc__, 'jobs': jobs, 'workers': workers, 'completed_jobs': len(values),
@@ -162,7 +189,9 @@ def measure(*, jobs=8, workers=2):
         'maximum_active_workers': max(s['active'] for s in samples),
         'observed_queued_with_no_active_worker': any(s['queued'] and not s['active'] for s in samples),
         'transport_worker_sleep_calls': clock.worker_sleep_calls,
-        'minimum_post_reset_request_gap_seconds': min((b - a for a, b in zip(after_reset, after_reset[1:])), default=None),
+        'all_post_throttle_admissions_respect_reset': all(at >= first_reset - 1e-9 for at in after_reset),
+        'quota_events': clock.quota_events,
+        'minimum_post_reset_admission_gap_seconds': min((b - a for a, b in zip(after_reset, after_reset[1:])), default=None),
         'all_worker_clients_share_quota': shared, 'coordinator': coordinator,
         'settled_scheduler': final, 'all_worker_sessions_closed': all(s.closed for s in transport.sessions),
         'requests': transport.records,
