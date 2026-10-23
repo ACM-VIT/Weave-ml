@@ -122,6 +122,22 @@ def test_repository_record_normalizes_confirmed_readme_absence_to_null():
     assert record["readme_length"] == 0
 
 
+def test_repository_record_preserves_supported_feature_observations_without_fabricating_missing_values():
+    source = _source()
+    observed = {"pushed_days_ago": 0, "delta_3d": 0, "delta_7d": 7, "delta_30d": 30,
+                "mentionable_users_count": 0, "readme_to_codebase_ratio": 0.0,
+                "recent_commits": [], "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2026-07-15T00:00:00Z", "discovery_category": "systems",
+                "discovery_band": "established"}
+    source.payload.update(observed)
+    record = repository_upsert_record(source)
+    assert {key: record[key] for key in observed} == observed
+    for key in observed:
+        source.payload[key] = None
+    sparse = repository_upsert_record(source)
+    assert all(key not in sparse for key in observed)
+
+
 def test_backend_mapping_is_validated_and_retained_for_the_run():
     session = _Session()
     client = BackendIngestionClient(
