@@ -27,9 +27,15 @@ def test_hybrid_only_candidate_path_never_fetches_repository_vectors():
 
 @pytest.mark.parametrize('overlap', ['low', 'high'])
 def test_required_heavy_ranking_matches_validated_inline_transport_mode(overlap):
-    current = run_case(overlap=overlap)
-    control = run_case(overlap=overlap, inline=True)
+    current = run_case(overlap=overlap, capture_inputs=True)
+    control = run_case(overlap=overlap, inline=True, capture_inputs=True)
     assert current['output'] == control['output']
+    assert current['ranker_inputs'] == control['ranker_inputs']
+    inputs = current['ranker_inputs']
+    assert inputs['user_terms'] and inputs['user_vector']
+    rows = list(inputs['candidates'].values())
+    assert len({tuple(row['embedding']) for row in rows}) == len(rows)
+    assert all(row['topics'] and row['tags'] and row['languages'] for row in rows)
     assert current['ranker_applied'] is control['ranker_applied'] is True
 
 

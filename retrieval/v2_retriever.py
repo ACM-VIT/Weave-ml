@@ -57,7 +57,10 @@ from retrieval.runtime import RetrievalWork, validate_retrieval_runtime
 from retrieval.social_candidates import (
     SocialCandidate, SocialPolicy, lookup_social_ids, select_social_candidates,
 )
-from utils.deadline import CooperativeDeadlineExceeded, check_deadline, current_deadline, qdrant_timeout
+from utils.deadline import (
+    CooperativeDeadlineExceeded, RequestDeadline, check_deadline, current_deadline,
+    deadline_scope, qdrant_timeout,
+)
 from scripts.user_onboarding import TARGET_VECTOR_NAME, USER_PROFILES_COLLECTION
 
 logger = logging.getLogger("pipeline.v2_retrieval")
@@ -74,6 +77,19 @@ _FALLBACK_MESSAGES = {
     "HEAVY_SCORING_FAILED": "heavy ranker scoring failed",
     "CANDIDATE_VECTORS_UNAVAILABLE": "retained candidate vectors are unavailable",
 }
+
+
+class _DiversityShadowDeadline(RequestDeadline):
+    """Optional CPU work has its own expiry and still observes parent cancellation."""
+
+    def __init__(self, seconds: float, parent: RequestDeadline | None):
+        self.parent = parent
+        super().__init__(seconds, clock=parent.clock if parent is not None else time.monotonic)
+
+    def remaining(self) -> float:
+        if self.parent is not None:
+            self.parent.remaining()
+        return super().remaining()
 
 _DISCOVERY_SOURCES = {
     "trend": "trending",
@@ -1663,9 +1679,12 @@ class QdrantV2Retriever:
         budget = self._candidate_read_budget()
         heavy_selected = self._heavy_ranker_selected(user_id)
         social_policy = self.social_policy.for_user(user_id)
+        diversity_cohort = int.from_bytes(hashlib.sha256(str(uuid.UUID(user_id)).encode()).digest()[:8], 'big') % 10000
+        diversity_selected = self.diversity_mode != 'disabled' and diversity_cohort < self.diversity_traffic_percent * 100
         social_rows = social_candidates or []
         social_ids = lookup_social_ids(social_rows, social_policy, excluded)
-        social_ids = social_ids[:budget.reserve(len(social_ids))] if social_ids else []
+        if social_policy.injects and social_ids:
+            social_ids = social_ids[:budget.reserve(len(social_ids))]
         social_points: dict[str, _EligibleRepositoryPoint] = {}
         # Inline is an explicit high-RTT alternative only for required-heavy.
         # It never uses the shared discovery pool or a previous request's pair.
@@ -1678,7 +1697,7 @@ class QdrantV2Retriever:
             extra_fields=_HEAVY_RANKER_PAYLOAD_FIELDS,
             # Social reads were already reserved but are observed by the same
             # request-local proof. Include them without increasing the RPC cap.
-            max_entries=max(1, min(20_000, budget.remaining + len(social_ids))),
+            max_entries=max(1, min(20_000, budget.remaining + (len(social_ids) if social_policy.injects else 0))),
         ) if inline_vectors else None
         if snapshots is not None:
             eligibility_cache = snapshots
@@ -1687,7 +1706,7 @@ class QdrantV2Retriever:
             with RetrievalWork() as work:
                 profile_future = work.submit("profile", self._fetch_user_profile, user_id)
                 social_future = (work.submit("social", self._fetch_social_candidates, social_ids)
-                                 if social_ids else None)
+                                 if social_policy.injects and social_ids else None)
                 # Validate the required profile before any vector-bearing
                 # repository RPC. Deferred mode retains its parallel overlap.
                 if inline_vectors:
@@ -1695,6 +1714,10 @@ class QdrantV2Retriever:
                         user_id, work.result(profile_future),
                     )
                     if user_vector is None:
+                        self._record_ranking_result(
+                            heavy_selected=heavy_selected, ranker_applied=False,
+                            fallback_code="USER_VECTOR_UNAVAILABLE", served=False,
+                        )
                         raise RetrievalDependencyError(
                             "the required V2 heavy ranker needs a compatible user vector"
                         )
@@ -1751,6 +1774,24 @@ class QdrantV2Retriever:
                             metadata[repo_id] = point.payload
                             vectors[repo_id] = point.vector
 
+
+                discovery: list[tuple[str, float, str, dict[str, Any], list[float] | None]] = []
+                try:
+                    discovery_points = self._complete_discovery(
+                        work, discovery_plan, max(limit * 8, 200), eligibility_cache,
+                        include_vectors=inline_vectors, exclude_repo_ids=excluded,
+                        minimum_candidates=limit, existing_repo_ids=set(candidates),
+                    )
+                except RetrievalDependencyError:
+                    if not candidates and not (social_policy.injects and social_future is not None):
+                        raise
+                    discovery_points = []
+                # Shadow evaluation cannot reserve reads needed by serving
+                # retrieval/refills. It may inspect only the remaining budget.
+                if social_policy.mode == 'shadow' and social_ids:
+                    social_ids = social_ids[:budget.reserve(len(social_ids))]
+                    if social_ids:
+                        social_future = work.submit("social", self._fetch_social_candidates, social_ids)
                 if social_future is not None:
                     try:
                         records = work.result(social_future)
@@ -1775,22 +1816,13 @@ class QdrantV2Retriever:
                                 social_points.pop(point_id, None)
                                 continue
                             seen_social.add(point_id)
-                            point = self._eligible_repository_point(record, snapshots, require_vector=False)
+                            point = self._eligible_repository_point(
+                                record, snapshots if social_policy.injects else None, require_vector=False,
+                            )
                             if point is not None and point.repo_id not in excluded:
                                 social_points[point.repo_id] = point
                         record_candidate_read("social", records, len(social_points))
 
-                discovery: list[tuple[str, float, str, dict[str, Any], list[float] | None]] = []
-                try:
-                    discovery_points = self._complete_discovery(
-                        work, discovery_plan, max(limit * 8, 200), eligibility_cache,
-                        include_vectors=inline_vectors, exclude_repo_ids=excluded,
-                        minimum_candidates=limit, existing_repo_ids=set(candidates),
-                    )
-                except RetrievalDependencyError:
-                    if not candidates and not (social_policy.injects and social_points):
-                        raise
-                    discovery_points = []
         finally:
             self._release_discovery(discovery_plan)
         for point, channel_source in discovery_points:
@@ -1876,10 +1908,20 @@ class QdrantV2Retriever:
         ordered_candidates = sorted(candidates.values(), key=lambda item: (-item.score, item.repo_id))
         # Preserve the overall pool bound while allowing genuinely new social IDs
         # to reach heavy ranking rather than disappearing behind the ANN prefix.
-        base_quota = max(0, self.max_candidates - len(reserved_social))
+        reserved_pool = set(reserved_social)
+        if diversity_selected and self.diversity_mode == 'enabled':
+            # Independent candidates must reach fresh hydration/heavy ranking
+            # before the selector can satisfy its required exploration count.
+            required = max(0, min(limit, self.diversity_policy.minimum_exploration, self.max_candidates))
+            independent = [item.repo_id for item in ordered_candidates if item.source != 'semantic'][:required]
+            reserved_pool = set(independent)
+            for item in ordered_candidates:
+                if item.repo_id in reserved_social and len(reserved_pool) < self.max_candidates:
+                    reserved_pool.add(item.repo_id)
+        base_quota = max(0, self.max_candidates - len(reserved_pool))
         hybrid_ranked = sorted(
-            [item for item in ordered_candidates if item.repo_id not in reserved_social][:base_quota]
-            + [item for item in ordered_candidates if item.repo_id in reserved_social],
+            [item for item in ordered_candidates if item.repo_id not in reserved_pool][:base_quota]
+            + [item for item in ordered_candidates if item.repo_id in reserved_pool],
             key=lambda item: (-item.score, item.repo_id),
         )
         heavy_ranked: list[RankedRepository] | None = None
@@ -1970,8 +2012,7 @@ class QdrantV2Retriever:
             target_size=limit,
             input_is_unique=True,
         )
-        cohort = int.from_bytes(hashlib.sha256(str(uuid.UUID(user_id)).encode()).digest()[:8], 'big') % 10000
-        if self.diversity_mode != 'disabled' and cohort < self.diversity_traffic_percent * 100:
+        if diversity_selected:
             def count(name, amount=1):
                 with self._counter_lock:
                     self._ranking_counters[name] = min(_COUNTER_LIMIT, self._ranking_counters[name] + amount)
@@ -1986,20 +2027,34 @@ class QdrantV2Retriever:
                 if self.diversity_mode == 'enabled':
                     raise RetrievalDependencyError('Configured diversity requires qualified vector candidates')
             else:
-                try:
-                    diverse = self.assembler.shape_batch(
-                        assembly_input, seen_repo_ids=excluded, generation_id=generation_seed,
-                        target_size=limit, input_is_unique=True, diversity_policy=self.diversity_policy,
-                        diversity_vectors=vectors, diversity_seed=generation_seed or user_id,
-                        diversity_report=report,
-                    )
-                    if self.diversity_mode == 'enabled':
-                        shaped = diverse
-                        count('diversity_served_requests')
-                except (ValueError, DiversityUnavailableError) as exc:
+                parent = current_deadline()
+                shadow_seconds = min(.01, parent.remaining() - .05) if parent is not None else .01
+                if self.diversity_mode == 'shadow' and shadow_seconds <= 0:
+                    # Preserve a return margin instead of spending the final
+                    # request budget on diagnostics after the baseline is ready.
                     count('diversity_unavailable_requests')
-                    if self.diversity_mode == 'enabled':
-                        raise RetrievalDependencyError('Configured diversity metadata or exploration is unavailable') from exc
+                else:
+                    optional = _DiversityShadowDeadline(shadow_seconds, parent) if self.diversity_mode == 'shadow' else None
+                    try:
+                        with deadline_scope(optional) if optional is not None else nullcontext():
+                            diverse = self.assembler.shape_batch(
+                                assembly_input, seen_repo_ids=excluded, generation_id=generation_seed,
+                                target_size=limit, input_is_unique=True, diversity_policy=self.diversity_policy,
+                                diversity_vectors=vectors, diversity_seed=generation_seed or user_id,
+                                diversity_report=report,
+                            )
+                        if self.diversity_mode == 'enabled':
+                            shaped = diverse
+                            count('diversity_served_requests')
+                    except (CooperativeDeadlineExceeded, ValueError, DiversityUnavailableError) as exc:
+                        count('diversity_unavailable_requests')
+                        if self.diversity_mode == 'enabled':
+                            if isinstance(exc, CooperativeDeadlineExceeded):
+                                raise
+                            raise RetrievalDependencyError('Configured diversity metadata or exploration is unavailable') from exc
+                    # Child expiry never cancels the parent; real request
+                    # cancellation/expiry must nevertheless remain authoritative.
+                    check_deadline()
         items = [
             RankedRepository(
                 repo_id=str(item["repo_id"]),
