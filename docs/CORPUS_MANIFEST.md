@@ -46,3 +46,10 @@ Compatibility and rollback: publish backend first, then ML. Rolling ML back only
 loses the optimization; rolling backend back makes the new client report unavailable
 and perform ordinary enrichment. No old write contract is changed. Never deploy or
 run acquisition against a shared target merely to validate this endpoint.
+
+The owned inventory HTTP path uses cancellable async I/O with the remaining scan
+deadline covering connection, headers and body, including slow Content-Length
+streams. It closes the actual stream before synchronous consumption returns.
+The explicit continuation field is required even on the final page. Accepted
+names are held separately from the downloaded inventory cap, including when the
+manifest already contains 100000 records or inventory is unavailable.

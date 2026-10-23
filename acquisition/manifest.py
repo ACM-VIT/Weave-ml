@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+
+import httpx
 
 from .identity import normalize_repository_name, repository_identity_key
 
@@ -42,20 +45,7 @@ def load_manifest(client: Any) -> dict[str, dict[str, Any]]:
         if remaining <= 0:
             raise ManifestUnavailable("manifest scan exceeded its time budget")
         try:
-            with client.session.get(
-                f"{client.base_url}/api/internal/v2/ingestion/repositories/manifest",
-                params={"limit": 250, **({"cursor": cursor} if cursor else {})},
-                headers={"x-internal-secret": client.internal_secret},
-                timeout=min(client.timeout, 5, remaining),
-                stream=True,
-            ) as response:
-                response.raise_for_status()
-                body = bytearray()
-                for chunk in response.iter_content(16384):
-                    body.extend(chunk)
-                    if len(body) > MAX_PAGE_BYTES or time.monotonic() >= deadline:
-                        raise ValueError("manifest response exceeded its budget")
-                page = json.loads(body)
+            page = _read_page(client, cursor, remaining)
             if (
                 not isinstance(page, dict)
                 or type(page.get("version")) is not int
@@ -126,7 +116,7 @@ def load_manifest(client: Any) -> dict[str, dict[str, Any]]:
                 if item.get("source_updated_at") is not None:
                     timestamp(item["source_updated_at"])
                 records[repo_id] = {**item, "full_name": key}
-            next_cursor = page.get("next_cursor")
+            next_cursor = page["next_cursor"]
             if next_cursor is None:
                 return records
             if (
@@ -144,3 +134,29 @@ def load_manifest(client: Any) -> dict[str, dict[str, Any]]:
                 "backend manifest unavailable or invalid"
             ) from exc
     raise ManifestUnavailable("manifest exceeds the bounded inventory size")
+
+
+def _read_page(client: Any, cursor: str | None, remaining: float):
+    async def read():
+        async with asyncio.timeout(remaining):
+            async with (
+                httpx.AsyncClient(
+                    transport=client.manifest_transport,
+                    timeout=min(client.timeout, 5, remaining),
+                ) as session,
+                session.stream(
+                    "GET",
+                    f"{client.base_url}/api/internal/v2/ingestion/repositories/manifest",
+                    params={"limit": 250, **({"cursor": cursor} if cursor else {})},
+                    headers={"x-internal-secret": client.internal_secret},
+                ) as response,
+            ):
+                response.raise_for_status()
+                body = bytearray()
+                async for chunk in response.aiter_bytes(16384):
+                    body.extend(chunk)
+                    if len(body) > MAX_PAGE_BYTES:
+                        raise ValueError("manifest response exceeded its byte budget")
+                return json.loads(body)
+
+    return asyncio.run(read())

@@ -58,6 +58,7 @@ class BackendIngestionClient:
         max_retries: int = 3,
         session: requests.Session | None = None,
         refresh_after_seconds: int | None = None,
+        manifest_transport: Any | None = None,
     ) -> None:
         self.base_url = str(base_url).strip().rstrip("/")
         self.internal_secret = str(internal_secret).strip()
@@ -70,6 +71,8 @@ class BackendIngestionClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self.session = session or requests.Session()
+        self.manifest_transport = manifest_transport
+        self._accepted_names: set[str] = set()
         self._accepted_count = 0
         self.refresh_after_seconds = (
             int(os.getenv("ACQUISITION_REFRESH_AFTER_SECONDS", "86400"))
@@ -103,7 +106,7 @@ class BackendIngestionClient:
                     "Backend corpus manifest unavailable; proceeding without inventory deduplication"
                 )
         now = datetime.now(timezone.utc)
-        return {
+        return self._accepted_names | {
             item["full_name"] for item in (self._manifest or {}).values()
             if 0 <= (now - timestamp(item["content_updated_at"])).total_seconds() < self.refresh_after_seconds
         }
@@ -152,13 +155,7 @@ class BackendIngestionClient:
                         raise ValueError("content_version must be an integer")
                     result.mappings[github_id] = dict(mapping)
                     result.succeeded.append(name)
-                    if self._manifest is not None and (
-                        mapping["repo_id"] in self._manifest or len(self._manifest) < 100_000
-                    ):
-                        self._manifest[mapping["repo_id"]] = {
-                            "full_name": name.lower(),
-                            "content_updated_at": datetime.now(timezone.utc).isoformat(),
-                        }
+                    self._accepted_names.add(name.casefold())
                     mapped_names.add(name)
                 for name in names:
                     if name not in mapped_names:

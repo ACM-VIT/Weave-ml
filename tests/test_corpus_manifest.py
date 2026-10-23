@@ -4,6 +4,7 @@ import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 import requests
 
@@ -64,8 +65,21 @@ class Session:
 
 def client(pages):
     session = Session(pages)
+
+    async def handler(request):
+        params = dict(request.url.params)
+        if "limit" in params:
+            params["limit"] = int(params["limit"])
+        session.calls.append({"params": params})
+        payload = session.pages.pop(0)
+        session.bytes += len(json.dumps(payload).encode())
+        return httpx.Response(200, json=payload)
+
     return BackendIngestionClient(
-        base_url="http://127.0.0.1", internal_secret="test", session=session
+        base_url="http://127.0.0.1",
+        internal_secret="test",
+        session=session,
+        manifest_transport=httpx.MockTransport(handler),
     ), session
 
 
@@ -171,3 +185,67 @@ def test_manifest_transfer_scales_by_bounded_pages_without_readme(
     record_property("manifest_bytes", session.bytes)
     record_property("avoided_enrichments", count)
     assert session.bytes < count * 400
+
+
+@pytest.mark.parametrize("items", [[], [row(1)]])
+def test_missing_continuation_is_not_verified_complete(items):
+    malformed = page(items)
+    del malformed["next_cursor"]
+    db, _ = client([malformed])
+    assert db.get_existing_repository_names() == set()
+    assert db.manifest_status == "unavailable"
+
+
+def test_newly_accepted_names_are_excluded_even_when_downloaded_inventory_is_full():
+    db, _ = client([page([])])
+    db.get_existing_repository_names()
+    db._manifest = {
+        str(i): {"full_name": f"o/r{i}", "content_updated_at": NOW.isoformat()}
+        for i in range(100_000)
+    }
+    db._post_encoded = lambda *_: {
+        "mappings": [
+            {"github_id": "999999", "repo_id": str(uuid.uuid4()), "content_version": 1}
+        ]
+    }
+    source = {
+        "github_id": "999999",
+        "github_node_id": "R_fixture",
+        "owner_github_id": "1",
+        "full_name": "Owner/New",
+        "owner": "Owner",
+        "name": "New",
+        "url": "https://github.com/Owner/New",
+        "observed_at": NOW.isoformat(),
+    }
+    result = db.upsert_repositories_detailed([source])
+    assert result.succeeded == ["Owner/New"]
+    assert "owner/new" in db.get_existing_repository_names()
+
+
+def test_dripping_manifest_body_cannot_outlive_total_scan_deadline():
+    import asyncio
+    import time
+
+    from acquisition import manifest
+
+    closed = []
+
+    class Drip(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                yield b" "
+
+        async def aclose(self):
+            closed.append(True)
+
+    async def handler(_):
+        return httpx.Response(200, stream=Drip(), headers={"Content-Length": "100"})
+
+    db, _ = client([])
+    db.manifest_transport = httpx.MockTransport(handler)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        manifest._read_page(db, None, 0.1)
+    assert time.monotonic() - started < 0.4 and closed == [True]
