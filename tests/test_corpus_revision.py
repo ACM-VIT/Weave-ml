@@ -279,3 +279,16 @@ def test_enabled_production_authority_rejects_unscoped_transport_before_client_c
     monkeypatch.setattr(redis,'from_url',lambda *a,**k: pytest.fail('invalid config must not connect'))
     with pytest.raises(ValueError,match='production ACL'):
         authority_from_environment(collection='corpus',vector='repo_embedding')
+
+
+@pytest.mark.integration
+def test_explicit_invalidation_fences_rollback_without_forgetting_unknown_work(authority):
+    authority.bootstrap(proof())
+    token=authority.begin()
+    authority.invalidate()
+    assert authority.read() is None
+    assert authority.status()=={'state':'UNTRUSTED','writers':1}
+    with pytest.raises(CorpusAuthorityUnavailable): authority.begin()
+    with pytest.raises(CorpusAuthorityUnavailable): authority.finish(token,completed=True)
+    authority.bootstrap(proof())  # Explicit proof, never a timer or a token expiry.
+    assert authority.read() is not None

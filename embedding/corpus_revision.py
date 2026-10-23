@@ -88,6 +88,10 @@ if state~='READY' and state~='DIRTY' and state~='UNTRUSTED' then return {'UNAVAI
 if state=='READY' and count~=0 then return {'UNAVAILABLE'} end
 if state=='DIRTY' and count==0 then return {'UNAVAILABLE'} end
 if op=='status' then return {'STATUS',state,tostring(count)} end
+if op=='invalidate' then
+ redis.call('HSET',KEYS[1],'state','UNTRUSTED')
+ return {'OK'}
+end
 if op=='read' then
  if state=='READY' then return {'READY',corpus,eligibility} end
  return {'UNAVAILABLE'}
@@ -164,6 +168,11 @@ class CorpusRevisionAuthority:
         if len(result) == 3 and result[0] == 'STATUS':
             return {'state': result[1], 'writers': int(result[2])}
         return {'state': 'UNAVAILABLE', 'writers': None}
+
+    def invalidate(self) -> None:
+        """Explicitly disable reuse/writes before managed rollback or maintenance."""
+        if self._call('invalidate') != ['OK']:
+            raise CorpusAuthorityUnavailable('corpus authority invalidation not confirmed')
 
     def bootstrap(self, proof: MaintenanceProof) -> None:
         if not isinstance(proof, MaintenanceProof):
