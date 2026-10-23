@@ -70,6 +70,7 @@ def run_acquisition_detailed(
     cancel_event: threading.Event | None = None,
     on_batch: Callable[[AcquisitionRunResult], None] | None = None,
     on_targets: Callable[[list[str]], None] | None = None,
+    on_discovery: Callable[[AcquisitionRunResult], None] | None = None,
 ) -> AcquisitionRunResult:
     """Discover and enrich repositories with structured audit information."""
     _validate_inputs(token=token, limit=limit, batch_size=batch_size, workers=workers)
@@ -103,6 +104,9 @@ def run_acquisition_detailed(
         len(discovered), duplicates_removed, skipped_existing, len(targets),
     )
 
+    if on_discovery is not None:
+        on_discovery(AcquisitionRunResult(discovered_count=len(discovered),
+            skipped_existing_count=skipped_existing, duplicates_removed=duplicates_removed))
     if on_targets is not None:
         # Persist only lightweight retry identities before admitting source work.
         on_targets([repository_name_from_candidate(item) for item in targets])

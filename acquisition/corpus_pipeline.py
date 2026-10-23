@@ -107,6 +107,16 @@ class CorpusPipeline:
             before_count = current_count
             enriched_count = 0
             persisted_count = 0
+            discovery_published = False
+
+            def discovered(audit: AcquisitionRunResult) -> None:
+                nonlocal discovery_published
+                if discovery_published:
+                    raise ValueError("Discovery totals were already published for this cycle")
+                report.discovered += audit.discovered_count
+                report.skipped_existing += audit.skipped_existing_count
+                report.duplicates_removed += audit.duplicates_removed
+                discovery_published = True
 
             def consume(acquired: AcquisitionRunResult) -> None:
                 nonlocal enriched_count, persisted_count
@@ -128,7 +138,8 @@ class CorpusPipeline:
                     approved, database_ready=database_ready, report=report,
                 )
                 persisted_count += len(persisted)
-                self.checkpoint.save()
+                if not approved or not database_ready:
+                    self.checkpoint.save()
                 if self.streaming and approved and not persisted:
                     raise RuntimeError("Backend delivery made no progress; remaining identities stay retryable")
 
@@ -143,14 +154,15 @@ class CorpusPipeline:
             try:
                 if self.streaming:
                     acquired = self._as_acquisition_result(self.acquire(
-                        **kwargs, on_batch=consume, on_targets=selected,
+                        **kwargs, on_batch=consume, on_targets=selected, on_discovery=discovered,
                     ))
                 else:
                     acquired = self._as_acquisition_result(self.acquire(**kwargs))
                     consume(acquired)
-                report.discovered += acquired.discovered_count
-                report.skipped_existing += acquired.skipped_existing_count
-                report.duplicates_removed += acquired.duplicates_removed
+                if not discovery_published:
+                    # Compatibility acquire callables may not expose the early
+                    # audit callback; successful returns still retain totals.
+                    discovered(acquired)
             finally:
                 # Includes cancellation/BaseException; accepted subsets were
                 # cleared batch-wise, all remaining identities stay retryable.
@@ -220,7 +232,8 @@ class CorpusPipeline:
             before = report.persisted
             persisted = self._persist_and_index(approved, database_ready=True, report=report)
             report.resumed_persistence += report.persisted - before
-            self.checkpoint.save()
+            if not approved:
+                self.checkpoint.save()
             if self.streaming and approved and not persisted:
                 raise RuntimeError("Backend delivery made no progress; remaining identities stay retryable")
 

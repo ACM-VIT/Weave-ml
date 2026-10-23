@@ -218,3 +218,69 @@ def test_restart_stops_retry_admission_on_backend_outage(tmp_path):
         p.run(limit=1, batch_size=4, workers=1, min_readme_chars=1)
     assert calls == [names[:4]]
     assert CorpusCheckpoint(tmp_path / 'state.json').pending_persistence == names
+
+
+def test_interrupted_real_discovery_preserves_audit_totals(tmp_path, monkeypatch):
+    from acquisition.pipeline import run_acquisition_detailed
+    from acquisition.github_discovery import GitHubDiscoveryEngine
+    event = threading.Event()
+    monkeypatch.setattr(GitHubDiscoveryEngine, 'discover', lambda *_, **__: [
+        'owner/one', 'owner/one', 'owner/existing', 'owner/two',
+    ])
+    monkeypatch.setattr(RepositoryEnricher, 'get_repositories_batch',
+                        lambda _self, names: [source(n) for n in names])
+    class Interrupted(Database):
+        def get_existing_repository_names(self): return {'owner/existing'}
+        def upsert_repositories_detailed(self, sources):
+            result = super().upsert_repositories_detailed(sources)
+            event.set()
+            return result
+    def acquire(**kwargs):
+        return run_acquisition_detailed('test', cancel_event=event, **kwargs)
+    with pytest.raises(CancelledError):
+        pipeline(tmp_path, acquire, Interrupted()).run(limit=3, batch_size=1, workers=1, min_readme_chars=1)
+    checkpoint = CorpusCheckpoint(tmp_path / 'state.json')
+    report = checkpoint.data['last_run']
+    assert report['discovered'] == 4 and report['skipped_existing'] == 1 and report['duplicates_removed'] == 1
+    assert report['persisted'] == 1 and checkpoint.pending_persistence == ['owner/two']
+
+
+def test_successful_batches_bound_checkpoint_fsyncs(tmp_path, monkeypatch):
+    import os
+    calls = []
+    fsync = os.fsync
+    def measured(fd):
+        calls.append(fd)
+        fsync(fd)
+    monkeypatch.setattr('acquisition.checkpoint.os.fsync', measured)
+    names = [f'owner/repo{i}' for i in range(10)]
+    def acquire(*, on_batch, on_targets, **_):
+        on_targets(names)
+        for name in names:
+            on_batch(AcquisitionRunResult(repositories=[source(name)]))
+        return AcquisitionRunResult(discovered_count=len(names))
+    pipeline(tmp_path, acquire, Database()).run(limit=10, batch_size=1, workers=1, min_readme_chars=1)
+    # Per-batch stage+ack writes and three run-level writes. An additional
+    # unchanged fsync after every acknowledgement violates this IO budget.
+    assert len(calls) <= 2 * len(names) + 3
+    assert CorpusCheckpoint(tmp_path / 'state.json').pending_persistence == []
+
+
+def test_delivered_objects_are_released_before_replacement_enrichment(monkeypatch):
+    import weakref
+    class Source:
+        def __init__(self, name):
+            self.repo_id = name
+            self.warnings = []
+            self.payload = {'readme': name + 'x' * 60_000}
+    prior = []
+    def enrich(_self, names):
+        assert all(ref() is None for ref in prior), 'previous batch escaped the bounded workset'
+        items = [Source(name) for name in names]
+        prior.extend(weakref.ref(item) for item in items)
+        return items
+    monkeypatch.setattr(RepositoryEnricher, 'get_repositories_batch', enrich)
+    received = []
+    enrich_repositories('test', [f'owner/repo{i}' for i in range(40)], batch_size=2, workers=1,
+                        on_batch=lambda batch: received.extend(item.repo_id for item in batch.repositories))
+    assert len(received) == 40 and all(ref() is None for ref in prior)
