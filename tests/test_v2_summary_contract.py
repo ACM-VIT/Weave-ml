@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 import uuid
@@ -17,6 +18,7 @@ from api.contracts import RepositoryJob, RepositoryRefreshJob
 from api.v2 import _embed_repository_job_locked, _refresh_repository_job_locked, _repository_embedding_payload
 from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
 from embedding.qdrant_store import QdrantRepositoryStore
+from ingestion.features import activity_score, score_code_health, trend_velocity
 from summarization.contracts import (
     CARD_SUMMARY_FALLBACK_MODEL_VERSION,
     CARD_SUMMARY_PAYLOAD_FIELDS,
@@ -582,7 +584,7 @@ def test_pre_summary_point_refreshes_without_erasing_a_concurrent_summary(concur
     expected = client.retrieve(store.collection_name, [REPO_ID], with_payload=True)[0]
     request = RepositoryRefreshJob(
         schema_version=2, job_id=uuid.uuid4(), repo_id=REPO_ID,
-        feature_version=2, features={"star_count": 42, "activity_score": 0.75},
+        feature_version=2, features={"star_count": 42},
     )
     original_cas = store.compare_and_set_features
 
@@ -600,10 +602,215 @@ def test_pre_summary_point_refreshes_without_erasing_a_concurrent_summary(concur
         stored = client.retrieve(store.collection_name, [REPO_ID], with_payload=True)[0]
         assert response["status"] == "applied"
         assert stored.payload["star_count"] == 42
-        assert stored.payload["activity_score"] == 0.75
+        assert stored.payload["activity_score"] == 0.0
         assert stored.payload["feature_version"] == 2
         assert card_summary_from_payload(stored.payload) == (_artifact() if concurrent_summary else None)
         assert not set(CARD_SUMMARY_PAYLOAD_FIELDS).intersection(expected.payload)
+    finally:
+        client.close()
+
+
+def _indexed_feature_refresh_fixture():
+    body = _job().model_dump(mode="json")
+    body["repository"].update(
+        {
+            "fork_count": 2,
+            "open_issues_count": 4,
+            "pushed_days_ago": 30,
+            "mentionable_users_count": 4,
+            "delta_3d": 3,
+            "delta_7d": 7,
+            "delta_30d": 30,
+            "recent_commits": [datetime.now(timezone.utc).isoformat()],
+            "updated_at": "2026-01-02T00:00:00Z",
+            "pushed_at": "2026-01-01T00:00:00Z",
+        }
+    )
+    pipeline = RepositoryEmbeddingPipeline(embedder=FakeEmbedder())
+    result = pipeline.embed_repository(
+        RepositoryJob.model_validate(body).repository.model_dump(mode="json")
+    )
+    client, store = _qdrant_store()
+    store.upsert([result])
+    point = client.retrieve(
+        store.collection_name,
+        [REPO_ID],
+        with_payload=True,
+        with_vectors=True,
+    )[0]
+    return client, store, point
+
+
+@pytest.mark.parametrize(
+    ("feature_patch", "affected_scores"),
+    [
+        ({"fork_count": 8, "open_issues_count": 2}, {"code_health"}),
+        ({"pushed_days_ago": 0}, {"code_health", "activity_score"}),
+        ({"delta_3d": 30}, {"trend_velocity"}),
+        ({"star_count": 42}, set()),
+        (
+            {
+                "updated_at": "2026-06-02T00:00:00Z",
+                "pushed_at": "2026-06-01T00:00:00Z",
+            },
+            set(),
+        ),
+    ],
+    ids=["counts", "recency", "delta", "unrelated-count", "timestamps"],
+)
+def test_feature_refresh_derives_only_dependent_scores_without_reembedding(
+    feature_patch, affected_scores,
+) -> None:
+    client, store, expected = _indexed_feature_refresh_fixture()
+    request = RepositoryRefreshJob(
+        schema_version=2,
+        job_id=uuid.uuid4(),
+        repo_id=REPO_ID,
+        feature_version=1,
+        features=feature_patch,
+    )
+    embedding_pipeline = MagicMock()
+
+    try:
+        with patch("api.v2._repository_points", return_value=[expected]), patch(
+            "api.v2.repository_store", return_value=store
+        ), patch(
+            "api.v2.repository_embedding_pipeline", embedding_pipeline
+        ):
+            response = _refresh_repository_job_locked(request, OwnedLock())
+        stored = client.retrieve(
+            store.collection_name,
+            [REPO_ID],
+            with_payload=True,
+            with_vectors=True,
+        )[0]
+        resulting_observation = {**expected.payload, **feature_patch}
+        expected_scores = {
+            field: expected.payload[field]
+            for field in ("code_health", "activity_score", "trend_velocity")
+        }
+        if "code_health" in affected_scores:
+            expected_scores["code_health"] = score_code_health(resulting_observation)
+        if "activity_score" in affected_scores:
+            expected_scores["activity_score"] = activity_score(
+                {**resulting_observation, "recent_commits": []}
+            )
+        if "trend_velocity" in affected_scores:
+            expected_scores["trend_velocity"] = trend_velocity(
+                resulting_observation
+            )
+
+        assert response["status"] == "applied"
+        assert expected.payload["activity_score"] != activity_score(
+            {**expected.payload, "recent_commits": []}
+        )
+        for field, score in expected_scores.items():
+            assert stored.payload[field] == score
+        assert stored.payload["pushed_days_ago"] == feature_patch.get(
+            "pushed_days_ago", expected.payload["pushed_days_ago"]
+        )
+        assert stored.vector == expected.vector
+        embedding_pipeline.assert_not_called()
+    finally:
+        client.close()
+
+
+def test_unrelated_refresh_does_not_evaluate_signed_trend_observations() -> None:
+    client, store, _ = _indexed_feature_refresh_fixture()
+    signed_deltas = {
+        "delta_3d": -2_147_483_648,
+        "delta_7d": -2_147_483_648,
+        "delta_30d": -2_147_483_648,
+    }
+    client.set_payload(
+        store.collection_name,
+        payload=signed_deltas,
+        points=[REPO_ID],
+        wait=True,
+    )
+    expected = client.retrieve(
+        store.collection_name,
+        [REPO_ID],
+        with_payload=True,
+        with_vectors=True,
+    )[0]
+    request = RepositoryRefreshJob(
+        schema_version=2,
+        job_id=uuid.uuid4(),
+        repo_id=REPO_ID,
+        feature_version=1,
+        features={"star_count": 42},
+    )
+
+    try:
+        with patch("api.v2._repository_points", return_value=[expected]), patch(
+            "api.v2.repository_store", return_value=store
+        ), patch("api.v2.calculate_trend_velocity") as trend_calculator:
+            response = _refresh_repository_job_locked(request, OwnedLock())
+        stored = client.retrieve(
+            store.collection_name,
+            [REPO_ID],
+            with_payload=True,
+        )[0]
+
+        assert response["status"] == "applied"
+        assert stored.payload["trend_velocity"] == expected.payload["trend_velocity"]
+        trend_calculator.assert_not_called()
+    finally:
+        client.close()
+
+
+def test_feature_refresh_rejects_inconsistent_caller_derived_scores() -> None:
+    client, store, expected = _indexed_feature_refresh_fixture()
+    request = RepositoryRefreshJob(
+        schema_version=2,
+        job_id=uuid.uuid4(),
+        repo_id=REPO_ID,
+        feature_version=1,
+        features={"pushed_days_ago": 0, "activity_score": 0.1234},
+    )
+
+    try:
+        with patch("api.v2._repository_points", return_value=[expected]), patch(
+            "api.v2.repository_store", return_value=store
+        ), pytest.raises(HTTPException) as exc_info:
+            _refresh_repository_job_locked(request, OwnedLock())
+
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.detail == (
+            "Repository derived features are inconsistent with the resulting "
+            "observation; expected activity_score=0.6325."
+        )
+        stored = client.retrieve(
+            store.collection_name,
+            [REPO_ID],
+            with_payload=True,
+        )[0]
+        assert "feature_version" not in stored.payload
+    finally:
+        client.close()
+
+
+def test_unrelated_refresh_validates_echo_against_preserved_score() -> None:
+    client, store, expected = _indexed_feature_refresh_fixture()
+    request = RepositoryRefreshJob(
+        schema_version=2,
+        job_id=uuid.uuid4(),
+        repo_id=REPO_ID,
+        feature_version=1,
+        features={"star_count": 42, "activity_score": 0.0},
+    )
+
+    try:
+        with patch("api.v2._repository_points", return_value=[expected]), patch(
+            "api.v2.repository_store", return_value=store
+        ), pytest.raises(HTTPException) as exc_info:
+            _refresh_repository_job_locked(request, OwnedLock())
+
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.detail.endswith(
+            f"expected activity_score={expected.payload['activity_score']}."
+        )
     finally:
         client.close()
 
@@ -617,7 +824,7 @@ def test_feature_refresh_still_rejects_missing_core_payload_fields() -> None:
     point = SimpleNamespace(id=REPO_ID, payload=result.payload)
     request = RepositoryRefreshJob(
         schema_version=2, job_id=uuid.uuid4(), repo_id=REPO_ID,
-        feature_version=2, features={"activity_score": 0.5},
+        feature_version=2, features={"pushed_days_ago": 5},
     )
     with patch("api.v2._repository_points", return_value=[point]), pytest.raises(ValueError, match="star_count"):
         _refresh_repository_job_locked(request, OwnedLock())

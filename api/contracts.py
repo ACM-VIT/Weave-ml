@@ -331,18 +331,44 @@ class RepositoryJob(StrictModel):
 
 
 class RepositoryFeaturePatch(StrictModel):
+    """Mutable observations plus optional, validated derived-score echoes.
+
+    ``pushed_days_ago`` is the producer's age at its observation anchor. The
+    refresh service never advances it from wall-clock time or infers it from
+    ``pushed_at``. Ranking scores are server-owned; callers may include them
+    for compatibility, but the refresh service requires exact agreement with
+    the effective score. It recomputes a score only when one of that score's
+    source observations changes.
+    """
+
     star_count: NonNegativeCount | None = None
     fork_count: NonNegativeCount | None = None
     open_issues_count: NonNegativeCount | None = None
-    pushed_days_ago: Annotated[int, Field(ge=0, le=100_000)] | None = None
+    pushed_days_ago: Annotated[
+        int,
+        Field(
+            ge=0,
+            le=100_000,
+            description="Repository push age at the producer's observation anchor.",
+        ),
+    ] | None = None
     delta_3d: DeltaCount | None = None
     delta_7d: DeltaCount | None = None
     delta_30d: DeltaCount | None = None
     mentionable_users_count: NonNegativeCount | None = None
     doc_quality: UnitScore | None = None
-    code_health: UnitScore | None = None
-    activity_score: UnitScore | None = None
-    trend_velocity: UnitScore | None = None
+    code_health: Annotated[
+        UnitScore,
+        Field(description="Optional echo of the server-derived code health score."),
+    ] | None = None
+    activity_score: Annotated[
+        UnitScore,
+        Field(description="Optional echo of the server-derived activity score."),
+    ] | None = None
+    trend_velocity: Annotated[
+        UnitScore,
+        Field(description="Optional echo of the server-derived trend velocity."),
+    ] | None = None
     updated_at: datetime | None = None
     pushed_at: datetime | None = None
     discovery_category: MediumText | None = None
