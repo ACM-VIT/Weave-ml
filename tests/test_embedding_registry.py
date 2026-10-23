@@ -69,3 +69,40 @@ def test_registry_switching_uses_only_pinned_config():
     with pytest.raises(ValueError, match='unknown'): registry.get('missing')
     with pytest.raises(ValueError, match='unique'):
         Registry.model_validate({'schema_version': 1, 'models': [registry.models[0].model_dump()] * 2})
+
+
+def test_invalid_fixture_cannot_start_model_work():
+    import copy
+    from scripts.compare_embedding_models import validate_fixture
+    fixture = json.loads((Path(__file__).parent / 'fixtures/readme_retrieval.json').read_text())
+    validate_fixture(fixture)
+    for mutation in ['duplicate', 'unknown_relevant', 'bad_text', 'blank_query', 'no_provenance']:
+        changed = copy.deepcopy(fixture)
+        if mutation == 'duplicate': changed['repositories'].append(changed['repositories'][0])
+        if mutation == 'unknown_relevant': changed['queries'][0]['relevant_repo_ids'] = ['not-in-corpus']
+        if mutation == 'bad_text': changed['repositories'][0]['readme'] = 1
+        if mutation == 'blank_query': changed['queries'][0]['query'] = ' '
+        if mutation == 'no_provenance': changed['provenance'] = ''
+        with pytest.raises(ValueError): validate_fixture(changed)
+
+
+def test_runner_rejects_invalid_budget_and_missing_model_before_loading(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+    from scripts import compare_embedding_models as runner
+    worker = MagicMock(side_effect=AssertionError('must not load any model'))
+    monkeypatch.setattr(runner, 'run_worker', worker)
+    output = tmp_path / 'report.json'
+    assert runner.main(['--worker', '--output', str(output), '--threads', '0']) == 2
+    assert runner.main(['--worker', '--output', str(output), '--models', 'missing']) == 2
+    assert not output.exists()
+    worker.assert_not_called()
+
+
+def test_worker_failure_preserves_previous_aggregate_report(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts import compare_embedding_models as runner
+    output = tmp_path / 'report.json'
+    output.write_text('previous complete evidence')
+    monkeypatch.setattr(runner.subprocess, 'run', lambda *args, **kwargs: SimpleNamespace(returncode=1, stderr='test failure'))
+    assert runner.main(['--output', str(output), '--models', 'minilm-384']) == 2
+    assert output.read_text() == 'previous complete evidence'
