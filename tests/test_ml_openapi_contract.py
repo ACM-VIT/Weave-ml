@@ -73,12 +73,13 @@ def test_validation_contract_matches_integrated_application_errors(monkeypatch, 
 
     monkeypatch.setenv('INTERNAL_API_SECRET', 'isolated-validation-secret')
     response = TestClient(app).post(path,
-        headers={'x-internal-secret': 'isolated-validation-secret'}, json={})
+        headers={'x-internal-secret': 'isolated-validation-secret', 'x-request-id': 'backend-request-123'}, json={})
     assert response.status_code == 422
     body = response.json()
     assert isinstance(body['detail'], str)
     assert body['details'] and all(set(error) == {'path', 'message', 'type'} for error in body['details'])
     assert response.headers['x-request-id'] == body['request_id']
+    assert body['request_id'] == 'backend-request-123'
     published = app.openapi()['paths'][path]['post']['responses']['422']['content']['application/json']['schema']
     assert published == {'$ref': '#/components/schemas/RequestValidationResponse'}
     from api.contracts import RequestValidationResponse

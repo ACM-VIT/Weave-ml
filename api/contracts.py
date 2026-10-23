@@ -63,7 +63,9 @@ class RequestValidationResponse(StrictModel):
     code: Literal["REQUEST_VALIDATION_FAILED"]
     message: str
     retryable: Literal[False]
-    request_id: uuid.UUID
+    # Compatibility response IDs also accept bounded legacy backend IDs.
+    # Trace correlation separately requires UUIDs and never adopts these IDs.
+    request_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
     details: list[RequestValidationDetail]
 
 
