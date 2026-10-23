@@ -328,7 +328,7 @@ def test_pipeline_counts_unavailable_coordination_before_acquisition(coordinator
     assert session.calls == 0 and admission.metrics["coordination_unavailable"] == 1
 
 
-def test_slow_stream_is_actually_closed_before_probe_lease_can_expire():
+def test_slow_stream_is_actually_closed_before_probe_lease_can_expire(monkeypatch):
     import asyncio
 
     import httpx
@@ -350,6 +350,7 @@ def test_slow_stream_is_actually_closed_before_probe_lease_can_expire():
     async def handler(_request):
         return httpx.Response(200, stream=Drip(), headers={"Content-Length": "50"})
 
+    monkeypatch.delattr(asyncio, "timeout", raising=False)
     transport = BoundedSummarySession(transport=httpx.MockTransport(handler))
     started = time.monotonic()
     with pytest.raises(requests.RequestException, match="deadline"):
