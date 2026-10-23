@@ -64,11 +64,19 @@ def test_sustained_outage_stops_after_one_retry_budget_and_allows_one_fenced_pro
         admission=policy,
     )
     durations = []
-    for _ in range(50):
+    pipeline = CardSummaryPipeline(settings=config, provider=provider)
+    fallbacks = 0
+    for index in range(50):
+        repo = {
+            "repo_id": f"outage-job-{index}",
+            "content_hash": f"content-{index}",
+            "description": "A tool for reviewing repository changes.",
+        }
         started = time.perf_counter()
-        with pytest.raises(SummaryProviderError):
-            provider.generate("Repository overview for a local fixture.")
+        artifact = pipeline.summarize(repo, repo)
+        fallbacks += artifact.source == "description_fallback"
         durations.append(time.perf_counter() - started)
+    assert fallbacks == 50
     assert session.calls == 3
     assert policy.metrics["circuit_rejected"] == 49
     clock[0] += 31
@@ -90,7 +98,7 @@ def test_sustained_outage_stops_after_one_retry_budget_and_allows_one_fenced_pro
     record_property("outage_jobs", 50)
     record_property("provider_calls", session.calls)
     record_property("retry_amplification", session.calls / 50)
-    record_property("fallback_rate", 1.0)
+    record_property("fallback_rate", fallbacks / 50)
     record_property("outage_job_p95_seconds", sorted(durations)[47])
     assert sorted(durations)[47] < 0.1
 
