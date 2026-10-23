@@ -8,7 +8,8 @@ import re
 
 from qdrant_client import QdrantClient
 
-from config import QDRANT_API_KEY, QDRANT_URL
+from config import QDRANT_API_KEY, QDRANT_COLLECTION_NAME, QDRANT_URL, QDRANT_VECTOR_NAME
+from embedding.corpus_revision import authority_from_environment
 from embedding.qdrant_store import QdrantRepositoryStore
 from embedding.user_profile_store import QdrantUserProfileStore
 
@@ -30,14 +31,18 @@ def bootstrap() -> dict[str, object]:
         api_key=QDRANT_API_KEY,
         timeout=timeout,
     )
+    authority = None
     try:
+        authority = authority_from_environment(
+            collection=QDRANT_COLLECTION_NAME, vector=QDRANT_VECTOR_NAME, endpoint=QDRANT_URL,
+        )
         version_info = client.info()
         server_version = str(getattr(version_info, "version", ""))
         if _version(server_version) < MINIMUM_QDRANT_VERSION:
             raise RuntimeError(
                 "Qdrant server 1.18.0 or newer is required before collection bootstrap"
             )
-        repository = QdrantRepositoryStore(client=client)
+        repository = QdrantRepositoryStore(client=client, corpus_authority=authority)
         users = QdrantUserProfileStore(client=client, timeout=max(1, int(timeout)))
         repository.ensure_collection()
         # Never auto-create the user collection in production: a misspelled
@@ -57,7 +62,11 @@ def bootstrap() -> dict[str, object]:
             "user_collection": users.contract.collection_name,
         }
     finally:
-        client.close()
+        try:
+            if authority is not None:
+                authority.close()
+        finally:
+            client.close()
 
 
 def main() -> int:

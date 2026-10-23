@@ -68,6 +68,8 @@ jobs:
           --baseline tests/fixtures/recommendation_benchmark/baseline.json \
           --policy tests/fixtures/recommendation_benchmark/policy.json \
           --output "$RUNNER_TEMP/recommendation-diagnostic.json"
+    - name: Check versioned ML contract drift
+      run: uv run python -m scripts.export_ml_openapi --check
 
     - name: Set up test environment
       run: |
