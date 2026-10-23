@@ -5,7 +5,7 @@ Unknown relevance is reported explicitly; no fixture qualifies a serving model.
 """
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime
 import hashlib
 import json
@@ -206,18 +206,32 @@ def evaluate(bundle: Bundle, run: Run, *, k: int) -> dict:
     if len(run.outputs) != len(profiles) or {o.profile_id for o in run.outputs} != set(profiles):
         raise ValueError('run profiles must match every frozen profile exactly once')
     repos = {r.repo_id: r for r in bundle.repositories}
-    judgments = {(j.profile_id, j.repo_id): j.grade for j in bundle.judgments}
+    labels_by_profile = defaultdict(dict)
+    for row in bundle.judgments:
+        labels_by_profile[row.profile_id][row.repo_id] = row.grade
+    # Reuse positive identities and ideal DCG across all three stages.
+    quality_by_profile = {}
+    for profile_id in profiles:
+        labels = labels_by_profile[profile_id]
+        relevant = {repo_id for repo_id, grade in labels.items() if grade > 0}
+        ideal = sorted((2**grade - 1 for grade in labels.values()), reverse=True)[:k]
+        quality_by_profile[profile_id] = (
+            relevant, sum(g / math.log2(i + 2) for i, g in enumerate(ideal)),
+        )
     eligible_count = sum(not r.archived for r in bundle.repositories)
     popularity_total = sum(r.popularity + 1 for r in bundle.repositories)
     stages = {}
     for stage in STAGES:
-        recalls, ndcgs, mrrs, similarities, novelties, owners, topics = [], [], [], [], [], [], []
+        recalls, ndcgs, mrrs, novelties, owners, topics = [], [], [], [], [], []
+        similarity_sum = 0.
+        similarity_pairs = 0
         returned = unjudged = repeats = excluded = archived = forks = owner_known = topic_known = family_known = 0
         sources = Counter()
         catalogue = set()
         latencies = []
         for output in run.outputs:
             profile = profiles[output.profile_id]
+            labels = labels_by_profile[profile.profile_id]
             rows = output.stages[stage][:k]
             if any(row.repo_id not in repos for row in output.stages[stage]):
                 raise ValueError('run contains an unknown repository identity')
@@ -229,19 +243,17 @@ def evaluate(bundle: Bundle, run: Run, *, k: int) -> dict:
             excluded += sum(repo_id in exclusions for repo_id in ids)
             archived += sum(repos[repo_id].archived for repo_id in ids)
             catalogue.update(repo_id for repo_id in ids if not repos[repo_id].archived)
-            unjudged += sum((profile.profile_id, repo_id) not in judgments for repo_id in ids)
+            unjudged += sum(repo_id not in labels for repo_id in ids)
             # Repeated IDs can never earn gain/recall more than once.
             encountered = set()
             gains = []
             for repo_id in ids:
-                grade = judgments.get((profile.profile_id, repo_id), 0)
+                grade = labels.get(repo_id, 0)
                 gains.append(2**grade - 1 if repo_id not in encountered else 0)
                 encountered.add(repo_id)
-            relevant = {j.repo_id for j in bundle.judgments if j.profile_id == profile.profile_id and j.grade > 0}
-            ideal = sorted((2**j.grade - 1 for j in bundle.judgments if j.profile_id == profile.profile_id), reverse=True)[:k]
+            relevant, denominator = quality_by_profile[profile.profile_id]
             if relevant:
                 recalls.append(len(unique_ids & relevant) / len(relevant))
-                denominator = sum(g / math.log2(i + 2) for i, g in enumerate(ideal))
                 ndcgs.append(sum(g / math.log2(i + 2) for i, g in enumerate(gains)) / denominator)
                 mrrs.append(next((1 / (i + 1) for i, g in enumerate(gains) if g > 0), 0.))
             selected = [repos[repo_id] for repo_id in ids]
@@ -262,7 +274,8 @@ def evaluate(bundle: Bundle, run: Run, *, k: int) -> dict:
                 topics.append(max(topic_counts.values(), default=0) / len(selected))
             for i, a in enumerate(selected):
                 for b in selected[i + 1:]:
-                    similarities.append(max(-1., min(1., sum(x * y for x, y in zip(a.vector, b.vector)))))
+                    similarity_sum += max(-1., min(1., sum(x * y for x, y in zip(a.vector, b.vector))))
+                    similarity_pairs += 1
             sources.update(row.source for row in rows)
             latencies.append(output.latency_ms[stage])
         ratio = lambda count: count / returned if returned else 0.
@@ -271,7 +284,7 @@ def evaluate(bundle: Bundle, run: Run, *, k: int) -> dict:
                 'judged_recall_at_k': _mean(recalls), 'judged_ndcg_at_k': _mean(ndcgs),
                 'judged_mrr_at_k': _mean(mrrs), 'judgment_coverage': 1 - ratio(unjudged) if returned else 0.,
                 'catalogue_coverage': len(catalogue) / eligible_count,
-                'intra_list_similarity': _mean(similarities), 'novelty_bits': _mean(novelties),
+                'intra_list_similarity': similarity_sum / similarity_pairs if similarity_pairs else None, 'novelty_bits': _mean(novelties),
                 'owner_concentration': _mean(owners), 'topic_concentration': _mean(topics),
                 'fork_metadata_coverage': ratio(family_known), 'owner_metadata_coverage': ratio(owner_known), 'topic_metadata_coverage': ratio(topic_known),
                 'repeat_rate': ratio(repeats), 'excluded_rate': ratio(excluded),
@@ -279,7 +292,7 @@ def evaluate(bundle: Bundle, run: Run, *, k: int) -> dict:
                 'latency_p50_ms': _quantile(latencies, .5), 'latency_p95_ms': _quantile(latencies, .95),
             },
             'counts': {'profiles': len(profiles), 'quality_profiles': len(recalls), 'returned': returned,
-                       'unjudged_returned': unjudged, 'similarity_pairs': len(similarities), 'latency_samples': len(latencies)},
+                       'unjudged_returned': unjudged, 'similarity_pairs': similarity_pairs, 'latency_samples': len(latencies)},
             'source_share': {source: ratio(count) for source, count in sorted(sources.items())},
         }
     return {'schema_version': 1, 'bundle_sha256': digest(bundle), 'run_sha256': digest(run),
