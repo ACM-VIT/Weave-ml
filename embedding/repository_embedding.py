@@ -44,6 +44,7 @@ from .vector_contract import (
     resolve_repository_identity,
     validate_embedding_vector,
     validate_repository_payload,
+    validate_diversity_metadata,
 )
 from ingestion.features import (
     activity_score,
@@ -362,6 +363,7 @@ def build_vector_payload(
     artifact = card_summary or description_fallback_artifact(
         normalized_repo,
     )
+    payload.update({key: value for key, value in validate_diversity_metadata(normalized_repo).items() if value is not None})
     payload.update(card_summary_payload(artifact))
     validate_repository_payload(payload, require_serving_eligibility=False)
     return payload

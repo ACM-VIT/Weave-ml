@@ -32,6 +32,7 @@ from .graphql_queries import (
     GET_README_BLOB_QUERY,
     build_readme_manifest_query,
     GET_REPOSITORY_QUERY,
+    repository_metadata_query,
     README_CANDIDATES,
     build_batch_metadata_query,
 )
@@ -313,10 +314,17 @@ class GitHubGraphQLClient:
             credential = f"{credential or ''}\0session-auth:{id(self.session)}:{id(auth)}"
         return github_coordination_key(self.url, credential)
 
+    @staticmethod
+    def _lineage_enabled() -> bool:
+        raw = os.getenv('ACQUISITION_LINEAGE_ENABLED', 'false').strip().casefold()
+        if raw not in {'true', 'false'}:
+            raise ValueError('ACQUISITION_LINEAGE_ENABLED must be true or false')
+        return raw == 'true'
+
     def get_repository(self, owner: str, name: str) -> dict[str, Any] | None:
         """Fetches a single repository using GraphQL."""
         variables = {"owner": owner, "name": name}
-        response = self.execute(GET_REPOSITORY_QUERY, variables)
+        response = self.execute(repository_metadata_query(include_lineage=self._lineage_enabled()), variables)
         if not response:
             return None
         # This legacy single-repository query also selects README aliases.
@@ -572,7 +580,7 @@ class GitHubGraphQLClient:
         if not repos:
             return {}
 
-        query = build_batch_metadata_query(repos, projection=projection)
+        query = build_batch_metadata_query(repos, projection=projection, include_lineage=self._lineage_enabled())
         response = self.execute(query)
         if not response:
             return {}

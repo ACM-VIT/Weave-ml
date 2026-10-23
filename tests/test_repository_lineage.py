@@ -49,3 +49,44 @@ def test_contradictions_cycles_and_missing_timestamps_fail():
         lineage_from_graphql(cyclic, observed_at=NOW)
     with pytest.raises(ValueError, match='timezone'):
         lineage_from_rest({'id': 30, 'owner': {'id': 7}}, observed_at=NOW.replace(tzinfo=None))
+
+
+def test_observed_metadata_survives_strict_api_and_atomic_vector_payload():
+    from api.contracts import RepositorySource
+    from embedding.repository_embedding import RepositoryEmbeddingConfig, build_vector_payload
+    from embedding.vector_contract import validate_diversity_metadata
+    source = RepositorySource(full_name='owner/repository',github_id='30',owner_github_id='7',
+        is_fork=True,fork_parent_github_id='20',fork_family_github_id='10',
+        lineage_source='github-graphql-repository',lineage_observed_at=NOW)
+    payload = build_vector_payload(source.model_dump(),repo_id='00000000-0000-4000-8000-000000000001',
+        final_embedding=[1.0]+[0.0]*383,readme_chunks=0,source_hash='source',config=RepositoryEmbeddingConfig())
+    assert payload['owner_github_id']=='7' and payload['fork_family_github_id']=='10'
+    assert payload['lineage_observed_at']==NOW.isoformat()
+    assert 'serving_eligibility_version' not in payload
+    assert all(value is None for value in validate_diversity_metadata({}).values())
+    for patch in [{'fork_family_github_id':'30'},{'lineage_source':None},{'is_fork':None},
+                  {'owner_github_id':str(2**63)},{'lineage_observed_at':'2026-10-23T00:00:00'}]:
+        with pytest.raises(ValueError): RepositorySource.model_validate({**source.model_dump(),**patch})
+
+
+def test_lineage_acquisition_is_opt_in_and_uses_existing_graphql_queries(monkeypatch):
+    from acquisition.graphql_queries import build_batch_metadata_query, repository_metadata_query
+    from acquisition.github_graphql_client import GitHubGraphQLClient
+    from acquisition.repository_enricher import RepositoryEnricher
+    from acquisition.backend_client import repository_upsert_record
+    base = build_batch_metadata_query([('owner','repository')],projection='delivery')
+    assert 'isFork' not in base and 'isFork' not in repository_metadata_query()
+    rich = build_batch_metadata_query([('owner','repository')],projection='delivery',include_lineage=True)
+    assert rich.count('parent {') == 4 and 'isFork' in repository_metadata_query(include_lineage=True)
+    monkeypatch.delenv('ACQUISITION_LINEAGE_ENABLED',raising=False)
+    assert not GitHubGraphQLClient._lineage_enabled()
+    monkeypatch.setenv('ACQUISITION_LINEAGE_ENABLED','true')
+    assert GitHubGraphQLClient._lineage_enabled()
+    data = {'id':'node30','databaseId':30,'nameWithOwner':'owner/repository','name':'repository',
+        'description':'Actual fixture description','url':'https://github.com/owner/repository',
+        'owner':{'databaseId':7,'login':'owner'},'isFork':True,'parent':{'databaseId':10,'isFork':False},
+        'defaultBranchRef':{'name':'main','target':{'history':{'nodes':[]}}}}
+    result = RepositoryEnricher(graphql_client=object())._process_graphql_data(data,None,None,readme_text='# Fixture')
+    record = repository_upsert_record(result)
+    assert record['owner_github_id']=='7' and record['is_fork'] is True and record['fork_family_github_id']=='10'
+    assert record['lineage_source']=='github-graphql-repository'
