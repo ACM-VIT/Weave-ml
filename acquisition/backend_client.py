@@ -304,6 +304,13 @@ def repository_upsert_record(source: Any) -> dict[str, Any]:
         "open_issues_count": max(int(payload.get("open_issues_count") or 0), 0),
         "pushed_at": payload.get("pushed_at"),
         "observed_at": payload.get("observed_at"),
+        # Preserve supported observations, including meaningful zero/empty values.
+        # Missing metadata must remain absent rather than invented as zero here.
+        **{field: payload[field] for field in (
+            "pushed_days_ago", "delta_3d", "delta_7d", "delta_30d",
+            "mentionable_users_count", "readme_to_codebase_ratio", "recent_commits",
+            "created_at", "updated_at", "discovery_category", "discovery_band",
+        ) if payload.get(field) is not None},
     }
 
 
