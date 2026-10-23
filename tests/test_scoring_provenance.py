@@ -106,12 +106,14 @@ def test_selected_inputs_are_bound_to_actual_scored_ids_and_base_score_api_is_un
 
 
 @pytest.mark.parametrize('character', ['🚀', '\x00'])
-def test_exact_wire_budget_holds_for_every_allowed_output_size_including_max_versions_and_escaping(character):
+@pytest.mark.parametrize('opaque_hash', [False, True])
+def test_exact_wire_budget_holds_for_every_allowed_output_size_including_max_versions_and_escaping(character, opaque_hash):
     ctx=context().model_copy(update={'model_version':character*512,'embedding_model':character*128,
         'feed_version':str(2**63-1),'profile_version':str(2**63-1),'feedback_version':str(2**63-1),'feedback_state_revision':str(2**63-1),
         'user_embedding_version':character*128,'scored_at':'2026-10-23T00:00:00.'+'1'*19+'Z',
         'repository_embedding_versions':tuple(character*127+str(i) for i in range(8))})
     frames=tuple(replace(frame(i,ctx),snapshot=frame(i,ctx).snapshot.model_copy(update={
+        'content_hash':character*128 if opaque_hash else 'a'*64,
         'content_version':str(2**63-1),'feature_version':str(2**63-1),'embedding_version_index':i%8})) for i in range(150))
     sizes=[]
     for count in range(151):
@@ -123,10 +125,15 @@ def test_exact_wire_budget_holds_for_every_allowed_output_size_including_max_ver
         for row in base['items']:
             row.update(source=character*128,score=-1.7976931348623157e308,
                 retrieval_scores={chr(97+i)*32:-1.7976931348623157e308 for i in range(16)})
-        wire=seal_scoring_response(base,ctx,frames)
-        assert len(wire)<=1_000_000
-        assert len(wire)==len(json.dumps(json.loads(wire),ensure_ascii=False,allow_nan=False,sort_keys=True,separators=(',',':')).encode())
-        sizes.append(len(wire))
+        expected={**base,'items':[{**row,'scored_input':packet_for_frame(frames[i],ctx).model_dump(mode='json')}
+            for i,row in enumerate(base['items'])],'scoring_context':ctx.model_dump(mode='json'),
+            'scoring_metadata_complete':ctx.user_embedding_version is not None}
+        encoded=json.dumps(expected,ensure_ascii=False,allow_nan=False,sort_keys=True,separators=(',',':')).encode()
+        if len(encoded)>1_000_000:
+            with pytest.raises(ValueError,match='byte budget'):seal_scoring_response(base,ctx,frames)
+        else:
+            assert seal_scoring_response(base,ctx,frames)==encoded
+        sizes.append(len(encoded))
     assert sizes==sorted(sizes) and sizes[-1]>sizes[0]+900_000
     with pytest.raises(ValueError,match='bounds'):seal_scoring_response(response(151),context(),frames)
 
@@ -339,3 +346,30 @@ def test_copied_context_on_owner_thread_cannot_record_after_scope_exit(actual_ca
     assert capture.frames==()
     assert packet_for_frame(saved[0],ctx).snapshot.repo_id==saved[0].snapshot.repo_id
     assert len(ranker.score_batch_compact(user,[],actual_candidates(ranker,1)))==1
+
+
+@pytest.mark.parametrize('content_hash',['legacy-content-v1','A'*128,'\x00'*128])
+def test_private_capture_preserves_authoritative_bounded_content_hash(actual_capture_ranker,content_hash):
+    import numpy as np
+    from inference.scoring_provenance import capture_scored_inputs
+    ranker=actual_capture_ranker
+    candidate=actual_candidates(ranker,1)[0]
+    candidate['content_hash']=content_hash
+    user=np.frombuffer(frame(0).input_bytes[:1536],dtype='<f4').copy()
+    ctx=actual_context(ranker,user=user)
+    baseline=ranker.score_batch_compact(user,['python'],[candidate])
+    with capture_scored_inputs(ctx) as capture:
+        assert ranker.score_batch_compact(user,['python'],[candidate])==baseline
+        assert capture.frames[0].snapshot.content_hash==content_hash
+        packet=packet_for_frame(capture.frames[0],ctx)
+        assert packet.snapshot.content_hash==content_hash
+        assert decode_owned_packet(packet,ctx,owner_user_id=ctx.user_id,
+            generation_id=ctx.generation_id,repo_id=candidate['id'])==capture.frames[0].input_bytes
+
+
+@pytest.mark.parametrize('content_hash', ['', 'x'*129, None, 123])
+def test_content_hash_contract_keeps_strict_nonempty_bounded_strings(content_hash):
+    snapshot=frame(0).snapshot.model_dump()
+    snapshot['content_hash']=content_hash
+    with pytest.raises(ValueError):
+        RepositorySnapshot.model_validate(snapshot)

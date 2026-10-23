@@ -611,6 +611,9 @@ def _validate_card_summary(v: _Validator) -> None:
 
 
 def _validate_ranker_and_retrieval(v: _Validator) -> None:
+    device = v.environ.get("V2_HEAVY_RANKER_DEVICE", "auto").strip().casefold()
+    if device not in {"auto", "cpu", "cuda"}:
+        v.issue("V2_HEAVY_RANKER_DEVICE", "must be auto, cpu or cuda")
     enabled = v.boolean("V2_HEAVY_RANKER_ENABLED")
     required = v.boolean("V2_HEAVY_RANKER_REQUIRED")
     if enabled is not True:
