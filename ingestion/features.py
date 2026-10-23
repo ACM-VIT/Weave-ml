@@ -183,16 +183,20 @@ def activity_score(repo: dict) -> float:
 
 
 def trend_velocity(repo: dict) -> float:
-    """Quantifies current social popularity traction across multi-stage window intervals."""
+    """Growth-only score in [0, 1]; signed raw deltas remain in the payload.
+
+    Nonpositive weighted growth contributes zero popularity rather than an
+    invalid logarithm. Positive inputs retain the existing scale and boost.
+    """
     r3  = repo.get("delta_3d",  0) / 3.0
     r7  = repo.get("delta_7d",  0) / 7.0
     r30 = repo.get("delta_30d", 0) / 30.0
     
     blend = 0.50 * r3 + 0.30 * r7 + 0.20 * r30
-    vel   = min(math.log1p(blend) / math.log1p(500), 1.0)
+    vel   = min(math.log1p(max(0.0, blend)) / math.log1p(500), 1.0)
     
     # Acceleration boost flag for sudden exponential breakouts
-    if r30 > 0 and r3 > r30:
+    if blend > 0 and r30 > 0 and r3 > r30:
         vel = min(vel + 0.15 * min((r3 - r30) / max(r30, 1), 1.0), 1.0)
     return round(vel, 4)
 

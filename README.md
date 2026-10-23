@@ -229,6 +229,21 @@ replace the runtime model/cache rather than mutating them in place. Bump
 `TOWER_PREPROCESSING_VERSION` when changing tower projection/chunk/aggregation
 semantics. Direct pipelines without a supplied model-owned cache stay uncached.
 
+Numeric boundary correction (#148): `trend_velocity` is a growth-only [0, 1]
+feature. Nonpositive weighted growth maps to zero; signed raw deltas remain
+unchanged, so declining and missing observations remain distinguishable in the
+payload. The positive logarithmic scale is unchanged. No ranker feature-order
+or serving-schema migration is introduced.
+
+The corrected metadata builder preserves `pushed_days_ago=0` separately from
+missing recency (999). Pipelines retain the original text for existing embedding
+identities. Opt into `repo-embedding-v2-zero-recency-v1` only after qualifying a
+separate corpus, matching ranker manifest and backend expected version; it uses
+the existing v2 README strategy with corrected recency text. Coordinate with
+#25's planned removal of numeric semantic inputs before scheduling a reindex,
+to avoid rebuilding the corpus twice. No automatic reindex or default-version
+change occurs; roll back by retaining the prior qualified identity/corpus.
+
 Production configuration uses `V2_HEAVY_RANKER_ENABLED=true`,
 `V2_HEAVY_RANKER_REQUIRED=true`, and traffic percent `100`. In that mode every
 request with an onboarding profile traverses V2 semantic/discovery retrieval,
