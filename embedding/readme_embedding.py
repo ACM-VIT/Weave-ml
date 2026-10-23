@@ -23,9 +23,21 @@ SECTION_CHUNK_LIMITS = {"purpose": 32, "neutral": 24, "setup": 8}
 # Match only the prefix: overlapping trailing whitespace/hash expressions can
 # otherwise backtrack for seconds on a single bounded but adversarial line.
 _ATX_PREFIX = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+|$)")
-_SETEXT = re.compile(r"^ {0,3}(=+|-+)\s*$")
+_SETEXT = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _BLOCK_START = re.compile(r"^ {0,3}(?:>|[-+*][ \t]|[0-9]{1,9}[.)][ \t]|\|)")
+# GFM HTML block starts 1-6 can interrupt paragraphs/reference candidates.
+# Type 7 (arbitrary complete tags) cannot. Finite tag alternatives and a fixed
+# delimiter avoid treating <division>, <div=...> or inline '<' as boundaries.
+_HTML_BLOCK_START = re.compile(
+    r"^ {0,3}(?:<(?:script|pre|style)(?=[ \t>]|$)|<!--|<\?|<!(?-i:[A-Z])|<!(?-i:\[CDATA\[)|"
+    r"</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|"
+    r"colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|"
+    r"form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|"
+    r"menu|menuitem|nav|noframes|ol|optgroup|option|p|param|section|source|summary|"
+    r"table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?=[ \t>]|/>|$))",
+    re.IGNORECASE | re.ASCII,
+)
 _OMIT = re.compile(
     r"(?:licen[cs]es?(?: information)?|copyright(?: notice)?|sponsors?|sponsorship|"
     r"changelog|change log|release notes?|contributors?|contributing|"
@@ -128,7 +140,7 @@ def _reference_definition_end(text: str, start: int, limit: int | None = None) -
     """Scan one leading GFM reference definition without regex backtracking.
 
     The caller bounds the source interval at blank lines and interrupting
-    blocks. References are resolved before ambiguous Setext underlines. A
+    blocks, including Setext underlines and interrupting HTML. A
     failed next-line optional title leaves the destination-only definition.
     """
     limit = len(text) if limit is None else limit
@@ -205,6 +217,7 @@ def _reference_block_boundary(line: str) -> bool:
     fence = _FENCE.match(line)
     valid_fence = fence and not (fence[1][0] == "`" and "`" in line[fence.end():])
     return bool(not line.strip() or _ATX_PREFIX.match(line) or valid_fence
+                or _SETEXT.fullmatch(line) or _HTML_BLOCK_START.match(line)
                 or _is_thematic_break(line) or _BLOCK_START.match(line))
 
 
@@ -303,9 +316,9 @@ def _sections(markdown: str) -> list[tuple[str, str]]:
             begin_section(len(heading[1]), title)
             continue
         if not paragraph and line.lstrip(" ").startswith("[") and not line.startswith("    "):
-            # Resolve leading definitions before Setext: '=' can occur inside
-            # a multiline label/title or be a destination itself. Source and
-            # interrupting-block offsets are shared across all attempts.
+            # Resolve complete leading definitions before Setext, stopping at
+            # actual paragraph boundaries. Source and boundary offsets are
+            # shared across all attempts, including malformed definitions.
             consumed = _reference_prefix_end(text, line_starts[index], reference_limits[index])
             if consumed > line_starts[index]:
                 skip_until = bisect_left(line_starts, consumed)
