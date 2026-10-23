@@ -114,19 +114,9 @@ class QdrantUserProfileStore:
     ) -> None:
         """Normalize and upsert one user using its deterministic point ID."""
         canonical_user_id = canonical_backend_uuid(user_id, field_name="user_id")
-        point_id = user_point_id(canonical_user_id)
-        self.client.upsert(
-            collection_name=self.contract.collection_name,
-            points=[
-                self._validated_user_point(
-                    canonical_user_id,
-                    point_id,
-                    vector,
-                    payload,
-                )
-            ],
-            wait=True,
-        )
+        existing = self.retrieve_user(canonical_user_id)
+        if not self.compare_and_set_user(canonical_user_id, vector, payload=payload or {}, expected_point=existing):
+            raise RuntimeError("user profile changed during direct profile write")
 
     def compare_and_set_user(
         self,
@@ -171,6 +161,8 @@ class QdrantUserProfileStore:
             kwargs["update_mode"] = self.models.UpdateMode.INSERT_ONLY
         else:
             expected_payload = dict(expected_point.payload or {})
+            if "model_policy_sha256" in expected_payload:
+                raise ValueError("negotiated user model requires the ordered model-operation lane")
             desired_payload = dict(point.payload or {})
             current_version = self._stored_version(
                 expected_payload,

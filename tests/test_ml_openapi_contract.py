@@ -9,6 +9,8 @@ PRODUCT_OPERATIONS = {
     '/api/v2/repositories/refresh': 200,
     '/api/v2/users/onboard': 200,
     '/api/v2/search/repositories': 200,
+    '/api/v2/model-operations': 200,
+    '/api/v2/model-authority': 200,
 }
 
 

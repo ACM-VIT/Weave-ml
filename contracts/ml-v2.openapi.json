@@ -1,6 +1,143 @@
 {
   "components": {
     "schemas": {
+      "AppliedModelContext": {
+        "additionalProperties": false,
+        "properties": {
+          "applied_feedback_version": {
+            "maxLength": 19,
+            "not": {
+              "pattern": "[^0-9]"
+            },
+            "pattern": "^(?:0|[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+            "title": "Applied Feedback Version",
+            "type": "string"
+          },
+          "applied_operation_version": {
+            "maxLength": 19,
+            "not": {
+              "pattern": "[^0-9]"
+            },
+            "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+            "title": "Applied Operation Version",
+            "type": "string"
+          },
+          "as_of_ms": {
+            "maxLength": 19,
+            "not": {
+              "pattern": "[^0-9]"
+            },
+            "pattern": "^(?:0|[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+            "title": "As Of Ms",
+            "type": "string"
+          },
+          "effective_vector_sha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Effective Vector Sha256",
+            "type": "string"
+          },
+          "epoch": {
+            "maxLength": 19,
+            "not": {
+              "pattern": "[^0-9]"
+            },
+            "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+            "title": "Epoch",
+            "type": "string"
+          },
+          "explicit_negative_repo_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 256,
+            "title": "Explicit Negative Repo Ids",
+            "type": "array"
+          },
+          "head": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Head",
+            "type": "string"
+          },
+          "policy_sha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Policy Sha256",
+            "type": "string"
+          },
+          "profile_version": {
+            "maxLength": 19,
+            "not": {
+              "pattern": "[^0-9]"
+            },
+            "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+            "title": "Profile Version",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "session_id": {
+            "format": "uuid",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "session_witness_sha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Session Witness Sha256",
+            "type": "string"
+          },
+          "state_sha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "State Sha256",
+            "type": "string"
+          },
+          "user_id": {
+            "format": "uuid",
+            "title": "User Id",
+            "type": "string"
+          },
+          "valid_until_ms": {
+            "maxLength": 19,
+            "not": {
+              "pattern": "[^0-9]"
+            },
+            "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+            "title": "Valid Until Ms",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "user_id",
+          "session_id",
+          "epoch",
+          "profile_version",
+          "applied_operation_version",
+          "applied_feedback_version",
+          "state_sha256",
+          "head",
+          "policy_sha256",
+          "effective_vector_sha256",
+          "session_witness_sha256",
+          "as_of_ms",
+          "valid_until_ms",
+          "explicit_negative_repo_ids"
+        ],
+        "title": "AppliedModelContext",
+        "type": "object"
+      },
       "CapturedRecommendationItem": {
         "additionalProperties": false,
         "properties": {
@@ -101,6 +238,16 @@
             "minItems": 1,
             "title": "Items",
             "type": "array"
+          },
+          "model_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AppliedModelContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "model_version": {
             "maxLength": 512,
@@ -410,6 +557,219 @@
         "title": "FeedbackResponse",
         "type": "object"
       },
+      "ModelAuthorityRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "model_context": {
+            "$ref": "#/components/schemas/ModelRecommendationContext"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "user_id": {
+            "format": "uuid",
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "user_id",
+          "model_context"
+        ],
+        "title": "ModelAuthorityRequest",
+        "type": "object"
+      },
+      "ModelAuthorityResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "model_context": {
+            "$ref": "#/components/schemas/AppliedModelContext"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "schema_version",
+          "model_context"
+        ],
+        "title": "ModelAuthorityResponse",
+        "type": "object"
+      },
+      "ModelOperationAcknowledgement": {
+        "additionalProperties": false,
+        "properties": {
+          "model_operation_version": {
+            "title": "Model Operation Version",
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "source_envelope_sha256": {
+            "title": "Source Envelope Sha256",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "accepted",
+              "duplicate"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "model_operation_version",
+          "source_envelope_sha256",
+          "status"
+        ],
+        "title": "ModelOperationAcknowledgement",
+        "type": "object"
+      },
+      "ModelOperationBatch": {
+        "additionalProperties": false,
+        "properties": {
+          "operations": {
+            "items": {
+              "$ref": "#/components/schemas/ModelOperationInput"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Operations",
+            "type": "array"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "schema_version",
+          "operations"
+        ],
+        "title": "ModelOperationBatch",
+        "type": "object"
+      },
+      "ModelOperationInput": {
+        "additionalProperties": false,
+        "properties": {
+          "operation_json": {
+            "maxLength": 131072,
+            "minLength": 1,
+            "title": "Operation Json",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_json"
+        ],
+        "title": "ModelOperationInput",
+        "type": "object"
+      },
+      "ModelOperationResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "operations": {
+            "items": {
+              "$ref": "#/components/schemas/ModelOperationAcknowledgement"
+            },
+            "title": "Operations",
+            "type": "array"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "schema_version",
+          "operations"
+        ],
+        "title": "ModelOperationResponse",
+        "type": "object"
+      },
+      "ModelRecommendationContext": {
+        "additionalProperties": false,
+        "properties": {
+          "as_of_ms": {
+            "maxLength": 19,
+            "not": {
+              "pattern": "[^0-9]"
+            },
+            "pattern": "^(?:0|[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+            "title": "As Of Ms",
+            "type": "string"
+          },
+          "epoch": {
+            "maxLength": 19,
+            "not": {
+              "pattern": "[^0-9]"
+            },
+            "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+            "title": "Epoch",
+            "type": "string"
+          },
+          "minimum_applied_operation_version": {
+            "maxLength": 19,
+            "not": {
+              "pattern": "[^0-9]"
+            },
+            "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+            "title": "Minimum Applied Operation Version",
+            "type": "string"
+          },
+          "policy_sha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Policy Sha256",
+            "type": "string"
+          },
+          "required_profile_version": {
+            "maxLength": 19,
+            "not": {
+              "pattern": "[^0-9]"
+            },
+            "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+            "title": "Required Profile Version",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "session_id": {
+            "maxLength": 36,
+            "minLength": 36,
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "session_id",
+          "epoch",
+          "policy_sha256",
+          "minimum_applied_operation_version",
+          "required_profile_version",
+          "as_of_ms"
+        ],
+        "title": "ModelRecommendationContext",
+        "type": "object"
+      },
       "OnboardingJob": {
         "additionalProperties": false,
         "properties": {
@@ -694,6 +1054,9 @@
                 "minimum": 1.0,
                 "type": "integer"
               },
+              "model_context": {
+                "type": "null"
+              },
               "scoring_capture": {
                 "type": "null"
               }
@@ -720,6 +1083,29 @@
             "required": [
               "feed_version",
               "scoring_capture"
+            ]
+          },
+          {
+            "properties": {
+              "feed_version": {
+                "maxLength": 19,
+                "minLength": 1,
+                "not": {
+                  "pattern": "[^0-9]"
+                },
+                "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$",
+                "type": "string"
+              },
+              "model_context": {
+                "$ref": "#/components/schemas/ModelRecommendationContext"
+              },
+              "scoring_capture": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "feed_version",
+              "model_context"
             ]
           }
         ],
@@ -761,6 +1147,16 @@
             "minimum": 1.0,
             "title": "Limit",
             "type": "integer"
+          },
+          "model_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelRecommendationContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "schema_version": {
             "const": 2,
@@ -874,6 +1270,16 @@
             "maxItems": 150,
             "title": "Items",
             "type": "array"
+          },
+          "model_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AppliedModelContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "model_version": {
             "maxLength": 512,
@@ -2300,6 +2706,16 @@
             "title": "Items",
             "type": "array"
           },
+          "model_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AppliedModelContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "model_version": {
             "maxLength": 512,
             "minLength": 1,
@@ -2423,6 +2839,98 @@
           }
         ],
         "summary": "Submit Feedback",
+        "tags": [
+          "v2"
+        ]
+      }
+    },
+    "/api/v2/model-authority": {
+      "post": {
+        "operationId": "read_model_authority_api_v2_model_authority_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelAuthorityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelAuthorityResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestValidationResponse"
+                }
+              }
+            },
+            "description": "Request validation failed"
+          }
+        },
+        "security": [
+          {
+            "InternalSecret": []
+          }
+        ],
+        "summary": "Read Model Authority",
+        "tags": [
+          "v2"
+        ]
+      }
+    },
+    "/api/v2/model-operations": {
+      "post": {
+        "operationId": "submit_model_operations_api_v2_model_operations_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelOperationBatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelOperationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestValidationResponse"
+                }
+              }
+            },
+            "description": "Request validation failed"
+          }
+        },
+        "security": [
+          {
+            "InternalSecret": []
+          }
+        ],
+        "summary": "Submit Model Operations",
         "tags": [
           "v2"
         ]

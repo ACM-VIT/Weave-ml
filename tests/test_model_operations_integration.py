@@ -1,0 +1,448 @@
+"""Opt-in real HTTP/Redis/Qdrant acceptance, confined to owned Docker.
+
+No service URL or actual.env is accepted. Names, images, loopback ports and
+ownership labels are checked on the pinned local Unix daemon before cleanup.
+"""
+from contextlib import contextmanager
+from dataclasses import replace
+import json
+import os
+import subprocess
+import time
+import uuid
+
+import pytest
+import redis
+from qdrant_client import QdrantClient, models
+
+from tests.test_model_operations import policy, wire, parse, uid, basis, profile_payload, begin_payload, feedback_payload, runtime_config
+from feedback.model_runtime import ModelRuntime
+from feedback.model_stream import OperationBytesConflict, OperationCapacity
+from feedback.model_journal import JournalConflict, JournalMissing, CasConflict
+from feedback import long_session as model
+from feedback.model_serving import Context, owned_input
+from feedback.v2_settings import V2FeedbackSettings
+from feedback.user_lock import LockLostError
+from config import REPOSITORY_EMBEDDING_VERSION, REPOSITORY_FEATURE_SPEC_VERSION, REPOSITORY_EMBEDDING_MODEL, EMBEDDING_MODEL_REVISION
+from embedding.vector_contract import REPOSITORY_SERVING_ELIGIBILITY_FIELD, REPOSITORY_SERVING_ELIGIBILITY_VERSION
+
+pytestmark = pytest.mark.integration
+DAEMON = 'unix:///var/run/docker.sock'
+
+
+def docker(*args):
+    env = {key: value for key, value in os.environ.items() if not key.startswith('DOCKER_')}
+    return subprocess.check_output(['docker', '--host', DAEMON, *args], env=env, text=True, timeout=40).strip()
+
+
+@contextmanager
+def service(image, port):
+    image_id = json.loads(docker('image', 'inspect', image))[0]['Id']
+    owner = uuid.uuid4().hex
+    name = 'weave-model-test-' + owner[:12]
+    container = docker('run', '--pull=never', '-d', '--name', name, '--label', 'weave.model-test-owner='+owner,
+                       '-p', f'127.0.0.1::{port}', image_id)
+    try:
+        state = json.loads(docker('inspect', container))[0]
+        assert state['Image'] == image_id and state['Config']['Labels']['weave.model-test-owner'] == owner
+        binding = state['NetworkSettings']['Ports'][f'{port}/tcp'][0]
+        assert binding['HostIp'] == '127.0.0.1'
+        yield '127.0.0.1:' + binding['HostPort']
+    finally:
+        state = json.loads(docker('inspect', container))[0]
+        assert state['Image'] == image_id and state['Config']['Labels']['weave.model-test-owner'] == owner
+        docker('rm', '-f', container)
+
+
+@pytest.fixture
+def runtime(request):
+    if os.getenv('RUN_MODEL_OPERATION_INTEGRATION') != '1':
+        pytest.skip('set RUN_MODEL_OPERATION_INTEGRATION=1 for owned local Docker acceptance')
+    with service('redis:7.4.5-alpine', 6379) as redis_address, service('qdrant/qdrant:v1.18.2', 6333) as qdrant_address:
+        r = redis.Redis.from_url('redis://'+redis_address, decode_responses=True)
+        q = QdrantClient(url='http://'+qdrant_address, api_key=None, timeout=3)
+        for attempt in range(100):
+            try:
+                r.ping(); q.get_collections(); break
+            except Exception:
+                if attempt == 99: raise
+                time.sleep(.05)
+        p = policy(**getattr(request, "param", {}))
+        for name, vectors in [('fixture_model_users', models.VectorParams(size=384, distance=models.Distance.COSINE)),
+                              ('fixture_model_journal', {}), ('fixture_model_repositories', {'repo_embedding': models.VectorParams(size=384, distance=models.Distance.COSINE)})]:
+            q.create_collection(name, vectors_config=vectors)
+        settings = replace(V2FeedbackSettings.from_env(), redis_url='redis://'+redis_address,
+            qdrant_url='http://'+qdrant_address, qdrant_api_key=None,
+            user_collection='fixture_model_users', repository_collection='fixture_model_repositories',
+            user_lock_prefix='fixture-model-lock', user_lock_ttl_seconds=1.0,
+            user_lock_renew_interval_seconds=.1, user_lock_wait_seconds=.1)
+        q.upsert(settings.repository_collection, points=[models.PointStruct(id=uid(100), vector={'repo_embedding': basis(1)}, payload={
+            'repo_id':uid(100), REPOSITORY_SERVING_ELIGIBILITY_FIELD:REPOSITORY_SERVING_ELIGIBILITY_VERSION,
+            'content_version':1, 'feature_version':1, 'embedding_model':REPOSITORY_EMBEDDING_MODEL,
+            'embedding_model_revision':EMBEDDING_MODEL_REVISION, 'embedding_version':REPOSITORY_EMBEDDING_VERSION,
+            'embedding_dim':384, 'feature_spec_version':REPOSITORY_FEATURE_SPEC_VERSION})], wait=True)
+        active = ModelRuntime(runtime_config(p), redis=r, qdrant=q, encoder=lambda context: basis(0), settings=settings)
+        try:
+            yield active
+        finally:
+            active.close()
+
+
+def apply(runtime, raw):
+    runtime.stream.admit(raw)
+    assert runtime.consumer().run_once() == 1
+
+
+def initialize(runtime):
+    p=runtime.policy
+    apply(runtime, wire(p, 'profile', 1, profile_payload()))
+    apply(runtime, wire(p, 'begin', 2, begin_payload()))
+
+
+def test_actual_genesis_begin_feedback_reset_end_and_exact_rebuild(runtime):
+    initialize(runtime); p=runtime.policy
+    checkpoint=runtime.processor.coordinator.checkpoint(uid(1))
+    apply(runtime, wire(p, 'feedback', 3, feedback_payload(session=uid(50))))
+    snapshot=runtime.users.read(uid(1))
+    point=runtime.qdrant.retrieve(runtime.settings.user_collection, ids=[uid(1)], with_payload=True, with_vectors=True)[0]
+    effective=owned_input(point,runtime.users,p,Context(uid(1),uid(50),1,p.sha256,3,1,3))
+    assert effective.vector[1]>0 and snapshot.state.feedback_version==1
+    apply(runtime,wire(p,'reset',4,dict(session_id=uid(50),old_epoch='1',new_epoch='2',new_epoch_started_ms='4',witness_sha256='c'*64)))
+    state=runtime.users.read(uid(1)).state
+    assert state.long_entries and not state.sessions[0].entries
+    apply(runtime,wire(p,'end',5,dict(session_id=uid(50),epoch='2',epoch_started_ms='4',retired=True,witness_sha256='d'*64)))
+    final=runtime.users.read(uid(1)); assert not final.state.sessions
+    restored=runtime.processor.coordinator.rebuild(checkpoint,final.head,expected_user_id=uid(1))
+    assert restored==final
+    first=wire(p,'profile',1,profile_payload())
+    assert runtime.processor(parse(first,p),lambda:None)=='duplicate'
+    assert runtime.stream.admit(first)['status']=='duplicate'
+    conflict=json.loads(first); conflict['operation']['original_profile_context']['interests']=['other']
+    from feedback.model_wire import canonical_json
+    with pytest.raises(OperationBytesConflict):runtime.stream.admit(canonical_json(conflict))
+
+
+def test_applied_then_lost_ack_reclaims_by_reachable_head(runtime):
+    initialize(runtime);p=runtime.policy
+    raw=wire(p,'feedback',3,feedback_payload());runtime.stream.admit(raw)
+    consumer=runtime.consumer()
+    original=runtime.stream.acknowledge
+    runtime.stream.acknowledge=lambda _:(_ for _ in ()).throw(RuntimeError('crash after CAS before ACK'))
+    with pytest.raises(RuntimeError):consumer.run_once()
+    before=runtime.users.read(uid(1));assert before.state.feedback_version==1
+    runtime.stream.acknowledge=original
+    time.sleep(.02)
+    assert runtime.consumer().run_once()==1
+    assert runtime.users.read(uid(1))==before
+    assert runtime.redis.xlen(runtime.stream.stream)==0
+
+
+def test_lock_loss_before_cas_leaves_prepared_only_pending(runtime):
+    initialize(runtime);p=runtime.policy
+    raw=wire(p,'feedback',3,feedback_payload());before=runtime.users.read(uid(1))
+    calls=0
+    def lose():
+        nonlocal calls
+        calls+=1
+        if calls==2:raise LockLostError('fixture loss before CAS')
+    with pytest.raises(LockLostError):runtime.processor(parse(raw,p),lose)
+    assert runtime.users.read(uid(1))==before
+    assert runtime.processor(parse(raw,p),lambda:None)=='applied'
+
+
+def test_gap_missing_dependency_capacity_and_foreign_genesis_do_not_advance(runtime):
+    initialize(runtime);p=runtime.policy;before=runtime.users.read(uid(1))
+    with pytest.raises(model.OperationGap):runtime.processor(parse(wire(p,'feedback',4,feedback_payload()),p),lambda:None)
+    assert runtime.users.read(uid(1))==before
+    runtime.qdrant.delete(runtime.settings.repository_collection,points_selector=models.PointIdsList(points=[uid(100)]),wait=True)
+    from feedback.v2 import MissingVectorError
+    with pytest.raises(MissingVectorError):runtime.processor(parse(wire(p,'feedback',3,feedback_payload()),p),lambda:None)
+    assert runtime.users.read(uid(1))==before
+    runtime.stream.limits=replace(runtime.stream.limits,max_pending=1)
+    runtime.stream.admit(wire(p,'feedback',3,feedback_payload(kind='unsave')))
+    with pytest.raises(OperationCapacity):runtime.stream.admit(wire(p,'feedback',4,feedback_payload(2,kind='unsave')))
+    assert runtime.users.read(uid(1))==before
+
+
+def test_registered_http_provider_delivers_acceptance_without_claiming_application(runtime,monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from api.v2 import router
+    import feedback.model_runtime as provider
+    monkeypatch.setattr(provider,'model_runtime',lambda:runtime)
+    monkeypatch.setenv('INTERNAL_API_SECRET','fixture-secret')
+    app=FastAPI();app.include_router(router);client=TestClient(app)
+    raw=wire(runtime.policy,'profile',1,profile_payload())
+    response=client.post('/api/v2/model-operations',headers={'x-internal-secret':'fixture-secret'},
+        json={'schema_version':1,'operations':[{'operation_json':raw}]})
+    assert response.status_code==200,response.text
+    assert response.json()['operations'][0]['status']=='accepted'
+    with pytest.raises(JournalMissing):runtime.users.read(uid(1))
+    assert runtime.consumer().run_once()==1
+    assert runtime.users.read(uid(1)).state.operation_version==1
+    assert client.post('/api/v2/model-operations',json={'schema_version':1,'operations':[{'operation_json':raw}]}).status_code==401
+
+
+def test_two_devices_profile_order_dislike_and_sequential_retirement(runtime):
+    initialize(runtime);p=runtime.policy
+    apply(runtime,wire(p,'begin',3,begin_payload(3,uid(51))))
+    apply(runtime,wire(p,'feedback',4,feedback_payload(kind='dislike',session=uid(50))))
+    state=runtime.users.read(uid(1)).state
+    assert model.norm(model.recommendation_view(state,p,session_id=uid(51),epoch=1,as_of_ms=4).session)==0
+    assert model.recommendation_view(state,p,session_id=uid(51),epoch=1,as_of_ms=4).explicit_negative_repo_ids==(uid(100),)
+    apply(runtime,wire(p,'profile',5,profile_payload(False,2)))
+    snapshot=runtime.users.read(uid(1))
+    assert snapshot.state.feedback_version==1 and snapshot.state.baseline.content_version==2
+    assert json.loads(snapshot.complete)['legacy']['payload']['last_feedback_version']==1
+    # Retire both current sessions, then exceed max_live_sessions sequentially.
+    version=5
+    for session,start in [(uid(50),2),(uid(51),3)]:
+        version+=1;apply(runtime,wire(p,'end',version,dict(session_id=session,epoch='1',epoch_started_ms=str(start),retired=True,witness_sha256='d'*64)))
+    for index in range(p.max_sessions+2):
+        version+=1;session=uid(60+index);start=version;apply(runtime,wire(p,'begin',version,begin_payload(start,session)))
+        version+=1;apply(runtime,wire(p,'end',version,dict(session_id=session,epoch='1',epoch_started_ms=str(start),retired=True,witness_sha256='d'*64)))
+    assert runtime.users.read(uid(1)).state.sessions==()
+    assert runtime.users.read(uid(1)).state.long_entries
+
+
+from tests.test_scoring_provider import trained_ranker
+
+
+def test_actual_ann_and_captured_trained_tensor_use_identical_one_read_input(runtime,trained_ranker,monkeypatch):
+    from fastapi.testclient import TestClient
+    from api import main,v2
+    import feedback.model_runtime as provider
+    from embedding.vector_contract import repository_payload_defaults
+    from retrieval.v2_retriever import QdrantV2Retriever
+    from inference.scoring_provenance import decode_owned_packet
+    from api.contracts import CapturedRecommendationResponse
+    initialize(runtime);p=runtime.policy
+    apply(runtime,wire(p,'feedback',3,feedback_payload(session=uid(50))))
+    for index in range(12):
+        repo=uid(100+index);payload=repository_payload_defaults()
+        payload.update(repo_id=repo,full_name=f'diagnostic/repo-{index}',content_version=1,content_hash='a'*64,
+            source_hash='b'*64,indexed_at='2026-10-24T00:00:00Z',star_count=index*100,primary_language='Python',
+            languages=['Python'],topics=['Python'],pushed_days_ago=1,delta_7d=1,activity_score=.5)
+        runtime.qdrant.upsert(runtime.settings.repository_collection,points=[models.PointStruct(id=repo,
+            vector={'repo_embedding':basis(index+1)},payload=payload)],wait=True)
+    retriever=QdrantV2Retriever(client=runtime.qdrant,user_collection=runtime.settings.user_collection,
+        repository_collection=runtime.settings.repository_collection,ranker=trained_ranker,heavy_ranker_enabled=True,
+        heavy_ranker_required=True,heavy_ranker_traffic_percent=100.,minimum_eligible_repositories=1)
+    monkeypatch.setattr(provider,'model_runtime',lambda:runtime);monkeypatch.setattr(v2,'retriever',lambda:retriever)
+    for key,value in {'INTERNAL_API_SECRET':'fixture-secret','SCORING_CAPTURE_ENABLED':'true','SCORING_CAPTURE_CAPABILITY':'7'*64,
+                      'SCORING_CAPTURE_CODE_COMMIT':'a'*40,'BAKED_ML_RELEASE_ID':'a'*40}.items():monkeypatch.setenv(key,value)
+    reads=[];queries=[];matrices=[]
+    original_read=runtime.qdrant.retrieve;original_query=runtime.qdrant.query_points
+    def read(*args,**kwargs):
+        rows=original_read(*args,**kwargs)
+        if kwargs.get('collection_name')==runtime.settings.user_collection:reads.append(kwargs)
+        return rows
+    def query(*args,**kwargs):
+        if 'query' in kwargs:queries.append(kwargs['query'])
+        return original_query(*args,**kwargs)
+    monkeypatch.setattr(runtime.qdrant,'retrieve',read);monkeypatch.setattr(runtime.qdrant,'query_points',query)
+    import feedback.model_serving as serving
+    original_owned = serving.owned_input
+    def own_then_mutate_caller(point, *args, **kwargs):
+        effective = original_owned(point, *args, **kwargs)
+        point.payload['embedding_model'] = 'mutated-caller-alias'
+        point.payload['interests'] = ['mutated-caller-alias']
+        return effective
+    monkeypatch.setattr(serving, 'owned_input', own_then_mutate_caller)
+    hook=trained_ranker.model.register_forward_pre_hook(lambda _model,args:matrices.append(args[0].detach().cpu().numpy().copy()))
+    try:
+        response=TestClient(main.app).post('/api/v2/recommendations/generate',headers={
+            'x-internal-secret':'fixture-secret','x-scoring-capture-capability':'7'*64},json={
+            'schema_version':2,'user_id':uid(1),'generation_id':uid(3000),'feed_version':'1','limit':5,
+            'exclude_repo_ids':[],'social_repo_ids':[],'context':{'cold_start':False},
+            'scoring_capture':{'schema_version':1,'encoding':'float32-le-v1'},'model_context':{
+            'schema_version':1,'session_id':uid(50),'epoch':'1','policy_sha256':p.sha256,
+            'minimum_applied_operation_version':'3','required_profile_version':'1','as_of_ms':'3'}})
+    finally:hook.remove()
+    assert response.status_code==200,response.text
+    body=response.json();assert len(reads)==1 and reads[0]['with_payload'] is True
+    import numpy as np,hashlib
+    user_bytes=np.asarray(queries[0],dtype='<f4').tobytes()
+    assert matrices and all(row[:384].astype('<f4').tobytes()==user_bytes for matrix in matrices for row in matrix)
+    assert body['model_context']['effective_vector_sha256']==hashlib.sha256(user_bytes).hexdigest()
+    assert body['scoring_context']['user_vector_sha256']==hashlib.sha256(user_bytes).hexdigest()
+    assert body['model_context']['applied_operation_version']=='3'
+    parsed=CapturedRecommendationResponse.model_validate_json(response.content)
+    for item in parsed.items:
+        assert decode_owned_packet(item.scored_input,parsed.scoring_context,owner_user_id=uid(1),generation_id=uid(3000),repo_id=str(item.repo_id))[:1536]==user_bytes
+
+
+@pytest.mark.parametrize('runtime',[{'max_repositories':1}],indirect=True)
+def test_real_prepared_rejection_is_not_authority_until_head_cas(runtime,monkeypatch):
+    initialize(runtime);p=runtime.policy
+    apply(runtime,wire(p,'feedback',3,feedback_payload()))
+    checkpoint=runtime.processor.coordinator.checkpoint(uid(1));before=runtime.users.read(uid(1))
+    point=runtime.qdrant.retrieve(runtime.settings.repository_collection,ids=[uid(100)],with_payload=True,with_vectors=True)[0]
+    runtime.qdrant.upsert(runtime.settings.repository_collection,points=[models.PointStruct(id=uid(101),vector=point.vector,
+        payload={**point.payload,'repo_id':uid(101)})],wait=True)
+    from feedback.model_wire import canonical_json
+    payload=feedback_payload(2);event=json.loads(payload['original_feedback_json']);event['repo_id']=uid(101)
+    payload['original_feedback_json']=canonical_json(event);raw=wire(p,'feedback',4,payload)
+    original=runtime.users.compare_and_set
+    monkeypatch.setattr(runtime.users,'compare_and_set',lambda *_:(_ for _ in ()).throw(RuntimeError('crash after DLQ before CAS')))
+    with pytest.raises(RuntimeError):runtime.processor(parse(raw,p),lambda:None)
+    rows=runtime.redis.xrange(runtime.stream.limits.namespace+':dlq')
+    assert len(rows)==1
+    prepare=rows[0][1]['prepare_sha256']
+    assert runtime.processor.coordinator.rejection_status(prepare)=='prepared_not_committed'
+    assert runtime.users.read(uid(1))==before
+    monkeypatch.setattr(runtime.users,'compare_and_set',original)
+    assert runtime.processor(parse(raw,p),lambda:None)=='rejected'
+    assert runtime.processor.coordinator.rejection_status(prepare)=='committed_rejection'
+    after=runtime.users.read(uid(1));assert after.state.feedback_version==2 and after.state.long_entries==before.state.long_entries
+    assert runtime.redis.xlen(runtime.stream.limits.namespace+':dlq')==1
+    assert runtime.processor.coordinator.rebuild(checkpoint,after.head,expected_user_id=uid(1))==after
+
+
+def test_rebuild_dryrun_staged_insert_only_and_stale_head_refusal(runtime):
+    from scripts.rebuild_user_model import verify_and_stage
+    initialize(runtime);p=runtime.policy
+    checkpoint=runtime.processor.coordinator.checkpoint(uid(1));old_head=runtime.users.read(uid(1)).head
+    apply(runtime,wire(p,'feedback',3,feedback_payload()))
+    head=runtime.users.read(uid(1)).head
+    target='fixture_model_restore_target';runtime.qdrant.create_collection(target,vectors_config=models.VectorParams(size=384,distance=models.Distance.COSINE))
+    assert verify_and_stage(runtime,user_id=uid(1),checkpoint_sha256=checkpoint,expected_head=head)['status']=='verified_dry_run'
+    with pytest.raises(JournalConflict):verify_and_stage(runtime,user_id=uid(1),checkpoint_sha256=checkpoint,expected_head=old_head,target_collection=target,stage_copy=True)
+    assert runtime.qdrant.retrieve(target,ids=[uid(1)])==[]
+    result=verify_and_stage(runtime,user_id=uid(1),checkpoint_sha256=checkpoint,expected_head=head,target_collection=target,stage_copy=True)
+    assert result['status']=='verified_staged_copy' and result['serving_cutover'] is False
+    with pytest.raises(ValueError):verify_and_stage(runtime,user_id=uid(1),checkpoint_sha256=checkpoint,expected_head=head,target_collection=runtime.settings.user_collection,stage_copy=True)
+
+
+@pytest.mark.parametrize('stage',['before_prepare','before_cas','after_cas_before_ack'])
+def test_abrupt_worker_process_death_keeps_pending_and_reuses_frozen_sources(runtime,tmp_path,stage):
+    from dataclasses import asdict
+    from pathlib import Path
+    import sys
+    initialize(runtime);p=runtime.policy;before=runtime.users.read(uid(1))
+    raw=wire(p,'feedback',3,feedback_payload());runtime.stream.admit(raw)
+    target=tmp_path/'owned-settings.json';target.write_text(json.dumps({'config':runtime_config(p),'settings':asdict(runtime.settings)}))
+    result=subprocess.run([sys.executable,'-m','tests.fixtures.model_operation_worker',str(target),stage],
+        cwd=Path(__file__).parents[1],capture_output=True,text=True,timeout=20)
+    assert result.returncode==71,result.stderr
+    observed=runtime.users.read(uid(1))
+    if stage=='after_cas_before_ack':assert observed.state.feedback_version==1
+    else:assert observed==before
+    assert runtime.redis.xpending(runtime.stream.stream,runtime.stream.group)['pending']==1
+    # Change the source after the dead worker pinned it. A retry must use the
+    # old source, not this current vector or revision.
+    point=runtime.qdrant.retrieve(runtime.settings.repository_collection,ids=[uid(100)],with_vectors=True,with_payload=True)[0]
+    runtime.qdrant.upsert(runtime.settings.repository_collection,points=[models.PointStruct(id=uid(100),
+        vector={'repo_embedding':basis(2)},payload={**point.payload,'content_version':2,'feature_version':2})],wait=True)
+    time.sleep(1.05)  # Natural death of the owned worker's renewable one-second lock.
+    assert runtime.consumer().run_once()==1
+    final=runtime.users.read(uid(1))
+    assert final.state.feedback_version==1 and final.state.operation_version==3
+    source=final.state.long_entries[0].signals[0].source
+    assert source.content_version==1 and source.feature_version==1 and source.vector==tuple(basis(1))
+    assert runtime.redis.xlen(runtime.stream.stream)==0
+
+
+@pytest.mark.parametrize('runtime',[{'max_sessions':1}],indirect=True)
+def test_full_dlq_keeps_next_control_pending_and_rejected_begin_has_no_authority(runtime,monkeypatch):
+    from dataclasses import replace
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from api.v2 import router
+    import feedback.model_runtime as provider
+    initialize(runtime);p=runtime.policy
+    runtime.stream.limits=replace(runtime.stream.limits,max_dead_letters=1)
+    assert runtime.processor(parse(wire(p,'begin',3,begin_payload(3,uid(51))),p),lambda:None)=='rejected'
+    before=runtime.users.read(uid(1));assert before.state.operation_version==3 and before.state.feedback_version==0
+    with pytest.raises(OperationCapacity):runtime.processor(parse(wire(p,'begin',4,begin_payload(4,uid(52))),p),lambda:None)
+    assert runtime.users.read(uid(1))==before
+    monkeypatch.setattr(provider,'model_runtime',lambda:runtime);monkeypatch.setenv('INTERNAL_API_SECRET','fixture-secret')
+    app=FastAPI();app.include_router(router)
+    response=TestClient(app).post('/api/v2/model-authority',headers={'x-internal-secret':'fixture-secret'},json={
+        'schema_version':1,'user_id':uid(1),'model_context':{'schema_version':1,'session_id':uid(51),'epoch':'1',
+        'policy_sha256':p.sha256,'minimum_applied_operation_version':'3','required_profile_version':'1','as_of_ms':'3'}})
+    assert response.status_code==503,response.text
+
+
+def test_late_cas_loser_cannot_overwrite_newer_complete_state_and_retries_as_duplicate(runtime,monkeypatch):
+    import threading
+    initialize(runtime);p=runtime.policy
+    original_raw=wire(p,'feedback',3,feedback_payload());operation=parse(original_raw,p)
+    runtime.journal.pin_input(operation.header,operation.kind,p,original_raw.encode(),lambda:runtime.processor._resolve(operation))
+    reached=threading.Event();release=threading.Event();errors=[]
+    original_cas=runtime.users.compare_and_set
+    def cas(before,after):
+        if threading.current_thread().name=='late-worker':
+            reached.set();assert release.wait(10)
+        return original_cas(before,after)
+    monkeypatch.setattr(runtime.users,'compare_and_set',cas)
+    def lose():
+        try:runtime.processor(operation,lambda:None)
+        except Exception as exc:errors.append(exc)
+    thread=threading.Thread(target=lose,name='late-worker');thread.start()
+    assert reached.wait(10)
+    runtime.processor(operation,lambda:None)
+    runtime.processor(parse(wire(p,'feedback',4,feedback_payload(2,kind='unsave')),p),lambda:None)
+    winner=runtime.users.read(uid(1));release.set();thread.join(10);assert not thread.is_alive()
+    assert len(errors)==1 and isinstance(errors[0],CasConflict)
+    assert runtime.users.read(uid(1))==winner
+    assert runtime.processor(operation,lambda:None)=='duplicate'
+
+
+def test_old_direct_feedback_and_profile_writers_refuse_active_new_model(runtime):
+    from embedding.user_profile_store import QdrantUserProfileStore
+    from feedback.v2 import FeedbackStateError
+    initialize(runtime);before=runtime.users.read(uid(1))
+    with pytest.raises(FeedbackStateError):runtime.legacy.apply(json.loads(feedback_payload()['original_feedback_json']))
+    # Use the real existing store write method against the actual owned point.
+    store=QdrantUserProfileStore(client=runtime.qdrant)
+    store.contract=replace(store.contract,collection_name=runtime.settings.user_collection)
+    with pytest.raises(ValueError):store.upsert_user(uid(1),basis(2),payload={'profile_version':2,'job_id':uid(99)})
+    assert runtime.users.read(uid(1))==before
+
+
+def test_one_user_gap_does_not_starve_another_owner_or_later_predecessor(runtime):
+    from feedback.model_wire import canonical_json
+    initialize(runtime);p=runtime.policy
+    # Missing common operation3 for owner1 remains pending while another owner
+    # establishes its own independent profile and session using common1/2.
+    runtime.stream.admit(wire(p,'feedback',4,feedback_payload()))
+    consumer=runtime.consumer()
+    with pytest.raises(model.OperationGap):consumer.run_once()
+    for version,kind,payload in [(1,'profile',profile_payload()),(2,'begin',begin_payload(2,uid(52)))]:
+        value=json.loads(wire(p,kind,version,payload,user=uid(2)))
+        value['operation_id']=uid(21000+version)
+        runtime.stream.admit(canonical_json(value))
+    for _ in range(8):
+        try:consumer.run_once()
+        except model.OperationGap:pass
+    other=runtime.users.read(uid(2));assert other.state.operation_version==2 and other.state.sessions[0].session_id==uid(52)
+    assert runtime.users.read(uid(1)).state.operation_version==2
+    runtime.stream.admit(wire(p,'feedback',3,feedback_payload(kind='unsave')))
+    for _ in range(8):
+        try:consumer.run_once()
+        except model.OperationGap:pass
+        except Exception as exc:
+            # Operation4 deliberately has the same feedback version1 and must
+            # remain pending after operation3 consumed it, never be skipped.
+            assert isinstance(exc,model.ModelError)
+    assert runtime.users.read(uid(1)).state.operation_version==3
+    assert runtime.users.read(uid(2))==other
+
+
+def test_applied_authority_is_exact_and_pending_profile_future_epoch_refused(runtime,monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from api.v2 import router
+    import feedback.model_runtime as provider
+    initialize(runtime);p=runtime.policy
+    monkeypatch.setattr(provider,'model_runtime',lambda:runtime);monkeypatch.setenv('INTERNAL_API_SECRET','fixture-secret')
+    app=FastAPI();app.include_router(router);client=TestClient(app)
+    context={'schema_version':1,'session_id':uid(50),'epoch':'1','policy_sha256':p.sha256,
+             'minimum_applied_operation_version':'2','required_profile_version':'1','as_of_ms':'2'}
+    def post(value):return client.post('/api/v2/model-authority',headers={'x-internal-secret':'fixture-secret'},
+        json={'schema_version':1,'user_id':uid(1),'model_context':value})
+    success=post(context);assert success.status_code==200,success.text
+    body=success.json()['model_context'];assert body['applied_operation_version']=='2' and body['applied_feedback_version']=='0'
+    for field,value in [('minimum_applied_operation_version','3'),('required_profile_version','2'),('epoch','2'),('as_of_ms','1')]:
+        assert post({**context,field:value}).status_code==503

@@ -992,6 +992,8 @@ class OrderedFeedbackApplier:
         next attempt reads the newer profile and reapplies the ordered event.
         """
 
+        if "model_policy_sha256" in expected_payload:
+            raise FeedbackStateError("negotiated user model requires the ordered model-operation lane")
         try:
             self.qdrant.upsert(
                 collection_name=self.settings.user_collection,
@@ -1025,10 +1027,29 @@ class OrderedFeedbackApplier:
 
     def apply(self, event: Mapping[str, Any]) -> ApplyResult:
         normalized = self.normalize_event(event)
+        user = self._user(normalized["user_id"])
+        if "model_policy_sha256" in self._payload(user):
+            raise FeedbackStateError("negotiated user model requires the ordered model-operation lane")
+        # Legacy callers retain exactly one read and the existing fenced write.
+        # The enabled coordinator calls prepare directly with pinned sources.
+        result, point = self.prepare(normalized, user=user, repository_vector=self._repository_vector)
+        if point is not None:
+            self._upsert(point, expected_payload=self._payload(user))
+        return result
+
+    def prepare(self, event: Mapping[str, Any], *, user: Any, repository_vector) -> tuple[ApplyResult, Any | None]:
+        """Compute the exact legacy transition from owned pinned inputs, without IO.
+
+        The negotiated model-operation coordinator supplies its one coherent
+        user snapshot and immutable repository input. It includes the returned
+        complete point in the same CAS as the new ledger; never calls apply.
+        """
+        normalized = self.normalize_event(event)
         user_id = normalized["user_id"]
         repo_id = normalized["repo_id"]
         version = normalized["feedback_version"]
-        user = self._user(user_id)
+        if str(user.id) != user_point_id(user_id):
+            raise FeedbackStateError("prepared legacy snapshot owner differs")
         payload = self._payload(user)
         if self._feedback_state_bytes(payload) > self.settings.max_user_state_bytes:
             raise FeedbackStateError("stored user feedback state exceeds its byte limit")
@@ -1062,7 +1083,7 @@ class OrderedFeedbackApplier:
                     ),
                 )
             if version > pending_version:
-                return ApplyResult("gap", last)
+                return ApplyResult("gap", last), None
         if version < last:
             history = payload.get(REJECTIONS_KEY, [])
             matching = next(
@@ -1083,7 +1104,7 @@ class OrderedFeedbackApplier:
                         or "feedback was previously rejected"
                     ),
                 )
-            return ApplyResult("duplicate", last)
+            return ApplyResult("duplicate", last), None
         if version == last:
             if str(payload.get("last_feedback_event_id") or "") == normalized["event_id"]:
                 if payload.get("last_feedback_status") == "rejected":
@@ -1105,10 +1126,10 @@ class OrderedFeedbackApplier:
                             or "feedback was previously rejected"
                         ),
                     )
-                return ApplyResult("duplicate", last)
+                return ApplyResult("duplicate", last), None
             raise VersionEventConflict()
         if version != last + 1:
-            return ApplyResult("gap", last)
+            return ApplyResult("gap", last), None
 
         user_vector, user_vector_name = self._vector(user.vector, self.settings.user_vector_name)
         dimension = self.settings.vector_dimension if self._enforce_dimension else len(user_vector)
@@ -1135,7 +1156,7 @@ class OrderedFeedbackApplier:
             return self._finite_vector(
                 vector_delta(
                     accumulator,
-                    self._repository_vector(repo_id, dimension),
+                    repository_vector(repo_id, dimension),
                     self._alpha(normalized),
                 ),
                 dimension,
@@ -1189,11 +1210,9 @@ class OrderedFeedbackApplier:
         payload["last_feedback_status"] = "applied"
         payload[FEEDBACK_STATE_REVISION_FIELD] = state_revision + 1
         stored_vector: Any = vector if user_vector_name is None else {user_vector_name: vector}
-        self._upsert(
-            PointStruct(id=user.id, vector=stored_vector, payload=payload),
-            expected_payload=self._payload(user),
+        return ApplyResult("applied", version, cursor_advanced=True), PointStruct(
+            id=user.id, vector=stored_vector, payload=payload,
         )
-        return ApplyResult("applied", version, cursor_advanced=True)
 
     def reject(self, event: Mapping[str, Any], *, code: str, reason: str) -> ApplyResult:
         """Record and skip one terminal event only when it is exactly next.
@@ -1215,6 +1234,8 @@ class OrderedFeedbackApplier:
             raise PermanentFeedbackError("feedback_version must be a positive integer")
         user = self._user(user_id)
         payload = self._payload(user)
+        if "model_policy_sha256" in payload:
+            raise FeedbackStateError("negotiated user model requires the ordered model-operation lane")
         last = self._last_version(payload)
         if version <= last:
             return ApplyResult("rejected_duplicate", last)

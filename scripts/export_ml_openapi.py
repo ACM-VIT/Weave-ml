@@ -10,6 +10,7 @@ PRODUCT_PATHS = (
     '/api/v2/recommendations/generate', '/api/v2/feedback/batch',
     '/api/v2/repositories/embed', '/api/v2/repositories/refresh',
     '/api/v2/users/onboard', '/api/v2/search/repositories',
+    '/api/v2/model-operations', '/api/v2/model-authority',
 )
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / 'contracts/ml-v2.openapi.json'
 
