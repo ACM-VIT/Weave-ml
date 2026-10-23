@@ -205,3 +205,25 @@ def test_diversity_does_not_add_repository_vector_reads_to_hybrid_and_rejects_en
     monkeypatch.setenv('V2_DIVERSITY_MODE','enabled')
     with pytest.raises(ValueError,match='strict-heavy'):
         _corpus_retriever(corpus,heavy=False)
+
+
+@pytest.mark.parametrize('mode', ['disabled', 'shadow', 'enabled'])
+def test_full_semantic_pool_retains_independent_exploration_only_when_enabled(diversity_corpus, mode):
+    corpus = diversity_corpus
+    independent = set(corpus.repo_ids[300:450])
+    corpus.client.set_payload(corpus.repository_collection,
+        payload={'star_count': 10000, 'trend_velocity': 10000., 'activity_score': 1.},
+        points=sorted(independent))
+    retriever = _corpus_retriever(corpus, heavy=True)
+    retriever.diversity_mode = mode
+    retriever.diversity_traffic_percent = 100
+    retriever.diversity_policy = DiversityPolicy(minimum_exploration=2)
+    batch = retriever.recommend_batch(corpus.user_id, 30, [], 'full-pool')
+    ranked_ids = {row['id'] for row in retriever.ranker.calls[-1][2]}
+    assert len(ranked_ids) == 150
+    if mode == 'enabled':
+        assert len(ranked_ids & independent) >= 2
+        assert len({row.repo_id for row in batch.items} & independent) >= 2
+        assert batch.ranker_applied
+    else:
+        assert not ranked_ids.intersection(independent)

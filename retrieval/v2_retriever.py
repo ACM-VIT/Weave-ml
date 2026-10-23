@@ -1663,6 +1663,8 @@ class QdrantV2Retriever:
         budget = self._candidate_read_budget()
         heavy_selected = self._heavy_ranker_selected(user_id)
         social_policy = self.social_policy.for_user(user_id)
+        diversity_cohort = int.from_bytes(hashlib.sha256(str(uuid.UUID(user_id)).encode()).digest()[:8], 'big') % 10000
+        diversity_selected = self.diversity_mode != 'disabled' and diversity_cohort < self.diversity_traffic_percent * 100
         social_rows = social_candidates or []
         social_ids = lookup_social_ids(social_rows, social_policy, excluded)
         if social_policy.injects and social_ids:
@@ -1890,10 +1892,20 @@ class QdrantV2Retriever:
         ordered_candidates = sorted(candidates.values(), key=lambda item: (-item.score, item.repo_id))
         # Preserve the overall pool bound while allowing genuinely new social IDs
         # to reach heavy ranking rather than disappearing behind the ANN prefix.
-        base_quota = max(0, self.max_candidates - len(reserved_social))
+        reserved_pool = set(reserved_social)
+        if diversity_selected and self.diversity_mode == 'enabled':
+            # Independent candidates must reach fresh hydration/heavy ranking
+            # before the selector can satisfy its required exploration count.
+            required = max(0, min(limit, self.diversity_policy.minimum_exploration, self.max_candidates))
+            independent = [item.repo_id for item in ordered_candidates if item.source != 'semantic'][:required]
+            reserved_pool = set(independent)
+            for item in ordered_candidates:
+                if item.repo_id in reserved_social and len(reserved_pool) < self.max_candidates:
+                    reserved_pool.add(item.repo_id)
+        base_quota = max(0, self.max_candidates - len(reserved_pool))
         hybrid_ranked = sorted(
-            [item for item in ordered_candidates if item.repo_id not in reserved_social][:base_quota]
-            + [item for item in ordered_candidates if item.repo_id in reserved_social],
+            [item for item in ordered_candidates if item.repo_id not in reserved_pool][:base_quota]
+            + [item for item in ordered_candidates if item.repo_id in reserved_pool],
             key=lambda item: (-item.score, item.repo_id),
         )
         heavy_ranked: list[RankedRepository] | None = None
@@ -1984,8 +1996,7 @@ class QdrantV2Retriever:
             target_size=limit,
             input_is_unique=True,
         )
-        cohort = int.from_bytes(hashlib.sha256(str(uuid.UUID(user_id)).encode()).digest()[:8], 'big') % 10000
-        if self.diversity_mode != 'disabled' and cohort < self.diversity_traffic_percent * 100:
+        if diversity_selected:
             def count(name, amount=1):
                 with self._counter_lock:
                     self._ranking_counters[name] = min(_COUNTER_LIMIT, self._ranking_counters[name] + amount)
