@@ -20,6 +20,7 @@ from pydantic import (
 )
 
 from feedback.v2_settings import V2FeedbackSettings
+from embedding.vector_contract import validate_diversity_metadata
 from summarization.contracts import CardSummaryArtifact
 
 
@@ -202,6 +203,12 @@ class RepositorySource(StrictModel):
     # owner/name/node ID remain source metadata and are not used as Qdrant IDs.
     repo_id: uuid.UUID | None = None
     github_id: str | None = Field(default=None, pattern=r"^[0-9]{1,32}$")
+    owner_github_id: str | None = Field(default=None, pattern=r'^[1-9][0-9]{0,18}$')
+    is_fork: Annotated[bool, Field(strict=True)] | None = None
+    fork_parent_github_id: str | None = Field(default=None, pattern=r'^[1-9][0-9]{0,18}$')
+    fork_family_github_id: str | None = Field(default=None, pattern=r'^[1-9][0-9]{0,18}$')
+    lineage_observed_at: datetime | None = None
+    lineage_source: Literal['github-graphql-repository', 'github-rest-repository'] | None = None
     github_node_id: MediumText | None = None
     full_name: str = Field(min_length=3, max_length=256, pattern=r"^[^/\s]+/[^/\s]+$")
     owner: ShortText | None = None
@@ -240,6 +247,11 @@ class RepositorySource(StrictModel):
     discovery_category: MediumText | None = None
     discovery_band: MediumText | None = None
     content_hash: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode='after')
+    def observed_diversity_identity(self):
+        validate_diversity_metadata(self.model_dump())
+        return self
 
     @field_validator("created_at", "updated_at", "pushed_at", "observed_at")
     @classmethod
