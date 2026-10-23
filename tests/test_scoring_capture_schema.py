@@ -71,3 +71,17 @@ def test_generated_decimal_maximum_pattern_at_every_prefix_boundary():
         else:
             with pytest.raises(ValidationError):
                 RecommendationRequest.model_validate_json(json.dumps(body))
+
+
+def test_capture_variant_keeps_the_complete_reusable_object_contract():
+    # Code generators consume each oneOf arm independently. An anonymous
+    # object loses its field types even when the common schema is strict.
+    document = main.app.openapi()
+    request = document["components"]["schemas"]["RecommendationRequest"]
+    branch = next(row for row in request["oneOf"] if "scoring_capture" in row["required"])
+    capture = branch["properties"]["scoring_capture"]
+    validator = Draft202012Validator({**capture, "components": document["components"]})
+    assert validator.is_valid({"schema_version": 1, "encoding": "float32-le-v1"})
+    assert not validator.is_valid({})
+    assert not validator.is_valid({"unexpected": "field"})
+    assert not validator.is_valid({"schema_version": 1, "encoding": "wrong"})

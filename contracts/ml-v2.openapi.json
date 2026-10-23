@@ -714,7 +714,7 @@
                 "type": "string"
               },
               "scoring_capture": {
-                "type": "object"
+                "$ref": "#/components/schemas/ScoringCaptureRequest"
               }
             },
             "required": [

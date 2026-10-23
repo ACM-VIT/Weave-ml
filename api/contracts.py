@@ -142,6 +142,8 @@ _CAPTURE_FEED_VERSION_PATTERN = _bounded_decimal_pattern(2**63 - 1)
 def _recommendation_request_schema(schema: dict) -> None:
     # The common properties still enforce the complete capture object schema.
     # Branches express negotiation without changing the public Python model.
+    capture_reference = next(choice["$ref"] for choice in
+        schema["properties"]["scoring_capture"]["anyOf"] if "$ref" in choice)
     schema["oneOf"] = [
         {"required": ["feed_version"], "properties": {
             "feed_version": {"type": "integer", "minimum": 1, "maximum": 2**53-1},
@@ -150,7 +152,7 @@ def _recommendation_request_schema(schema: dict) -> None:
             "feed_version": {"type": "string", "minLength": 1, "maxLength": 19,
                 "pattern": _CAPTURE_FEED_VERSION_PATTERN,
                 "not": {"pattern": "[^0-9]"}},
-            "scoring_capture": {"type": "object"}}},
+            "scoring_capture": {"$ref": capture_reference}}},
     ]
 
 
