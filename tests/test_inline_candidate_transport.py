@@ -180,3 +180,23 @@ def test_shadow_metadata_conflict_cannot_remove_a_valid_inline_pair():
         shadow = retriever.recommend_batch(client.user_id, 10, [], 'same', social_candidates=[social])
         assert shadow.items == baseline.items
         assert retriever.ranker.candidates == inputs
+
+
+def test_missing_profile_has_equal_failure_counters_in_both_transports():
+    class Missing(WireQdrant):
+        def retrieve(self, **kwargs):
+            if kwargs['ids'] == [self.user_id]:
+                return self.exchange('profile', [])
+            return super().retrieve(**kwargs)
+
+    for mode in ('deferred', 'inline'):
+        client = Missing()
+        with isolated_io():
+            retriever = QdrantV2Retriever(client=client, ranker=FixtureRanker(),
+                candidate_vector_mode=mode, heavy_ranker_enabled=True, heavy_ranker_required=True,
+                minimum_eligible_repositories=0)
+            with pytest.raises(RetrievalDependencyError):
+                retriever.recommend_batch(client.user_id, 10, [])
+            counts = retriever._ranking_counter_snapshot()
+        assert counts['requests_total'] == counts['heavy_selected'] == counts['fallback_user_vector_unavailable'] == 1
+        assert counts['heavy_served'] == counts['hybrid_served'] == 0

@@ -1673,6 +1673,10 @@ class QdrantV2Retriever:
                         user_id, work.result(profile_future),
                     )
                     if user_vector is None:
+                        self._record_ranking_result(
+                            heavy_selected=heavy_selected, ranker_applied=False,
+                            fallback_code="USER_VECTOR_UNAVAILABLE", served=False,
+                        )
                         raise RetrievalDependencyError(
                             "the required V2 heavy ranker needs a compatible user vector"
                         )
