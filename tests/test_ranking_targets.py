@@ -185,3 +185,22 @@ def test_dictionary_and_cli_share_exact_version_weights_and_fail_safely(tmp_path
                          capture_output=True, text=True)
     assert run.returncode != 0
     assert "secret-user-row" not in run.stderr
+
+
+@pytest.mark.parametrize("malformed", ["duplicate_coverage", "excessive_nesting"])
+def test_cli_rejects_conflicting_or_deep_raw_json_without_output_or_traceback(tmp_path, malformed):
+    path = tmp_path / "observations.json"
+    if malformed == "duplicate_coverage":
+        # Raw JSON is essential: a Python dict cannot represent repeated keys.
+        raw = json.dumps(dataset()).replace('"coverage": {"ctr": true',
+                                            '"coverage": {"ctr": false, "ctr": true')
+    else:
+        raw = '{"private-export-field":' + '[' * 20000 + '0' + ']' * 20000 + '}'
+    path.write_text(raw)
+    run = subprocess.run([sys.executable, "-m", "scripts.evaluate_ranking_targets", str(path)],
+                         capture_output=True, text=True, timeout=10)
+    assert run.returncode == 2
+    assert run.stdout == ""
+    assert "invalid target dataset" in run.stderr
+    assert "Traceback" not in run.stderr
+    assert "private-export-field" not in run.stderr
