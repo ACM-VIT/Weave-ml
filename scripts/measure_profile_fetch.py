@@ -11,11 +11,13 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import time
 from typing import Any
+from unittest.mock import patch
 import uuid
 
 import numpy as np
@@ -37,10 +39,13 @@ FIXTURE_REVISION = "c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
 
 def fixture_reader(client):
     """Use the existing profile method with an explicit isolated MiniLM contract."""
-    reader = QdrantV2Retriever(client=client, user_collection=FIXTURE_COLLECTION,
-        heavy_ranker_enabled=False, heavy_ranker_required=False,
-        heavy_ranker_traffic_percent=0, allow_unqualified_ranker=False,
-        minimum_eligible_repositories=0, candidate_vector_mode="deferred")
+    # This profile-only fixture does not run the required-heavy diversity path.
+    # Isolate the constructor policy without changing the caller's environment.
+    with patch.dict(os.environ, {"V2_DIVERSITY_MODE": "disabled"}):
+        reader = QdrantV2Retriever(client=client, user_collection=FIXTURE_COLLECTION,
+            heavy_ranker_enabled=False, heavy_ranker_required=False,
+            heavy_ranker_traffic_percent=0, allow_unqualified_ranker=False,
+            minimum_eligible_repositories=0, candidate_vector_mode="deferred")
     # Only the profile read is measured, not recommendation construction/health.
     # A developer's unrelated collection/dimension overrides must not change the
     # synthetic contract used by both writer and actual profile validation.
