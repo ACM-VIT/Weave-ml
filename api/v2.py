@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ingestion.lifecycle import LIFECYCLE_FIELDS, merge_lifecycle
+
 import asyncio
 import copy
 import logging
@@ -839,6 +841,15 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
             if field in expected_payload:
                 result.payload[field] = copy.deepcopy(expected_payload[field])
 
+    # Lifecycle uses observation time, not content version. A stale content job
+    # must never erase a newer status or revive an archived repository.
+    for field in LIFECYCLE_FIELDS:
+        result.payload.pop(field, None)
+    result.payload.update(_validated_lifecycle_merge(
+        dict(expected_point.payload or {}) if expected_point is not None else {},
+        request.repository.lifecycle,
+    ))
+
     lock.assert_owned()
     stored = repository_store().compare_and_set_content(
         result,
@@ -934,6 +945,13 @@ def _repository_embedding_payload(request: RepositoryJob) -> dict[str, Any]:
     return payload
 
 
+def _validated_lifecycle_merge(stored, observation):
+    try:
+        return merge_lifecycle(stored, observation)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 def _refresh_repository_job(request: RepositoryRefreshJob) -> dict[str, Any]:
     repo_id = str(request.repo_id)
     try:
@@ -959,22 +977,39 @@ def _refresh_repository_job_locked(
             status_code=404, detail=f"Repository {repo_id} is not indexed."
         )
     expected_point = _single_repository_point(points)
-    job_status, current = _repository_job_status(
-        points,
-        version_field="feature_version",
-        job_field="feature_job_id",
-        requested_version=request.feature_version,
-        job_id=job_id,
-    )
+    stored_payload = dict(expected_point.payload or {})
+    current = int(stored_payload.get("feature_version") or 0)
+    try:
+        job_status, current = _repository_job_status(
+            points, version_field="feature_version", job_field="feature_job_id",
+            requested_version=request.feature_version, job_id=job_id,
+        )
+    except HTTPException:
+        # A delayed authoritative status must not disappear behind a newer
+        # unrelated stats job. Preserve the old job-ID misuse check.
+        if (request.features.lifecycle is None or request.feature_version >= current
+                or stored_payload.get("feature_job_id") == job_id):
+            raise
+        job_status = "current"
     if job_status != "apply":
+        lifecycle_features = _validated_lifecycle_merge(stored_payload, request.features.lifecycle)
+        if any(stored_payload.get(field) != value for field, value in lifecycle_features.items()):
+            lock.assert_owned()
+            stored = repository_store().compare_and_set_lifecycle(
+                expected_point=expected_point, lifecycle_payload=lifecycle_features,
+            )
+            lock.assert_owned()
+            actual = dict(stored.payload or {}) if stored is not None else {}
+            if any(actual.get(field) != value for field, value in lifecycle_features.items()):
+                raise HTTPException(status_code=503, detail="Repository lifecycle state changed; retry the request.")
         return {
-            "accepted": True,
-            "status": job_status,
-            "repo_id": repo_id,
-            "feature_version": current,
+            "accepted": True, "status": job_status,
+            "repo_id": repo_id, "feature_version": current,
         }
 
     requested_features = request.features.model_dump(mode="json", exclude_none=True)
+    lifecycle = requested_features.pop("lifecycle", None)
+    lifecycle_features = _validated_lifecycle_merge(dict(expected_point.payload or {}), lifecycle)
     observed_features = {
         field: value
         for field, value in requested_features.items()
@@ -1049,7 +1084,7 @@ def _refresh_repository_job_locked(
                 for field in inconsistent
             ],
         )
-    features = {**observed_features, **derived_features}
+    features = {**observed_features, **derived_features, **lifecycle_features}
     updated = {
         **dict(expected_point.payload or {}),
         **features,

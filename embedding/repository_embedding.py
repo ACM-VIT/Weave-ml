@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ingestion.lifecycle import merge_lifecycle
+
 import hashlib
 import json
 import math
@@ -373,6 +375,7 @@ def build_vector_payload(
         normalized_repo,
     )
     payload.update({key: value for key, value in validate_diversity_metadata(normalized_repo).items() if value is not None})
+    payload.update(merge_lifecycle({}, repo.get("lifecycle")))
     payload.update(card_summary_payload(artifact))
     validate_repository_payload(payload, require_serving_eligibility=False)
     return payload

@@ -316,3 +316,9 @@ def test_exhausted_metadata_server_failure_does_not_retry_singletons(projection)
     assert results == []
     assert len(client.metadata_queries) == 1
     assert client.metadata_queries[0].count(": repository(") == 2
+
+
+def test_metadata_projects_authoritative_lifecycle_flags_for_delivery():
+    for projection in ('legacy', 'delivery'):
+        query = build_batch_metadata_query([('owner', 'repository')], projection=projection)
+        assert 'isArchived' in query and 'isDisabled' in query

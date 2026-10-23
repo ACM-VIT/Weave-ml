@@ -401,6 +401,13 @@ class RepositoryEnricher:
             "_discovery_band": discovery_band,
         }
         
+        if isinstance(data.get('isArchived'), bool) and isinstance(data.get('isDisabled'), bool):
+            raw_repository['lifecycle'] = {
+                'status': 'verified', 'source': 'github-graphql-repository',
+                'observed_at': datetime.now(timezone.utc).isoformat(),
+                'archived': data['isArchived'], 'disabled': data['isDisabled'],
+            }
+
         if 'isFork' in data:
             lineage = lineage_from_graphql(data, observed_at=datetime.now(timezone.utc))
             raw_repository.update({
@@ -494,6 +501,7 @@ class RepositoryEnricher:
             "created_at": repository.get("created_at"),
             "updated_at": repository.get("updated_at"),
             "pushed_at": repository.get("pushed_at"),
+            **({"lifecycle": repository["lifecycle"]} if "lifecycle" in repository else {}),
             "observed_at": datetime.now(timezone.utc).isoformat(),
             "discovery_category": repository.get("_discovery_category"),
             "discovery_band": repository.get("_discovery_band"),
