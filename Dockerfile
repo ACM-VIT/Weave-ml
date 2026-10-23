@@ -1,10 +1,27 @@
-# Keep the human-readable Python line and immutable manifest digest together.
-# Renovation must update both stages in one reviewed change.
-FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de AS builder
+# Share the verified Python/OS trust store and patched pip across both stages.
+FROM python:3.12-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704 AS python-base
+
+# Bootstrap the patched vendored trust bundle with the independently published
+# PSF wheel hash, even when the base image's pip still carries the old CA.
+RUN python -m pip install --no-cache-dir --no-deps \
+    "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+
+# Fail the build if either loaded CA bundle regresses to the compromised root.
+RUN python - <<'PY'
+import hashlib
+import ssl
+from pip._vendor import certifi
+bad = "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b"
+for bundle in (None, certifi.where()):
+    roots = ssl.create_default_context(cafile=bundle).get_ca_certs(binary_form=True)
+    assert roots and bad not in {hashlib.sha256(root).hexdigest() for root in roots}
+PY
+
+FROM python-base AS builder
 
 WORKDIR /app
 
-ARG UV_VERSION=0.11.29
+ARG UV_VERSION=0.13.4
 ARG EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
 ARG EMBEDDING_MODEL_REVISION=c9745ed1d9f207416be6d2e6f8de32d1f16199bf
 ENV EMBEDDING_MODEL=${EMBEDDING_MODEL}
@@ -26,7 +43,7 @@ RUN UV_PROJECT_ENVIRONMENT=.venv uv sync --locked --no-dev
 RUN .venv/bin/python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ['EMBEDDING_MODEL'], revision=os.environ['EMBEDDING_MODEL_REVISION'])"
 
 # Runner stage
-FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de AS runner
+FROM python-base AS runner
 
 WORKDIR /app
 
