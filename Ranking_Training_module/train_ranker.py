@@ -66,7 +66,7 @@ def training_array_sha256(arrays):
         checksum.update(len(header).to_bytes(8, "big"))
         checksum.update(header)
         checksum.update(value.nbytes.to_bytes(8, "big"))
-        checksum.update(value.tobytes(order="C"))
+        checksum.update(memoryview(value).cast("B"))
     return checksum.hexdigest()
 
 

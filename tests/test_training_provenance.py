@@ -55,3 +55,16 @@ def test_training_source_drift_fails_before_any_artifact_publication(monkeypatch
     with pytest.raises(ValueError,match='source changed'):
         trainer.train(data_path=data,epochs=1,lr=.001,batch_size=4,output_dir=output)
     assert not output.exists()
+
+
+def test_hashing_contiguous_training_arrays_does_not_copy_full_buffer():
+    import tracemalloc
+    arrays={key:np.zeros((1,),dtype=np.float32) for key in trainer.DATA_KEYS}
+    arrays['user_embs']=np.zeros((8192,384),dtype=np.float32)
+    tracemalloc.start()
+    try:
+        trainer.training_array_sha256(arrays)
+        _, peak=tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 1024*1024

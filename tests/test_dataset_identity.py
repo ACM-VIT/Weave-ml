@@ -96,7 +96,7 @@ def test_actual_candidate_report_gates_against_fixed_dated_baseline():
         evaluate(snapshot.bundle,Run.model_validate({**changed,'embedding':{**changed['embedding'],'revision':'e'*40}}),k=policy.k)
 
 
-@pytest.mark.parametrize('field',['identity','dimension','feature_schema','weights','scaler','file_drift','unsupported_runtime'])
+@pytest.mark.parametrize('field',['identity','dimension','feature_schema','weights','scaler','file_drift','unsupported_runtime','serving_model','serving_revision','serving_version','serving_compatible'])
 def test_cross_encoder_cli_requires_actual_manifest_contract(tmp_path,field,monkeypatch):
     # Deliberately synthetic declarations test validation only. These tiny byte
     # artifacts are not models and can never yield qualification evidence.
@@ -117,13 +117,18 @@ def test_cross_encoder_cli_requires_actual_manifest_contract(tmp_path,field,monk
          'model_sha256':hashlib.sha256(model.read_bytes()).hexdigest(),'scaler_sha256':hashlib.sha256(scaler.read_bytes()).hexdigest()}
     manifest={'embedding_identity':deepcopy(run['embedding']),'embedding_dim':run['embedding']['dimension'],
               'model_sha256':run['model_sha256'],'scaler_sha256':run['scaler_sha256'],'feature_spec_version':run['feature_schema'],'feature_count':10,'input_dim':778}
+    manifest.update(embedding_model=run['embedding']['model'], embedding_model_revision=run['embedding']['revision'], embedding_version=run['embedding']['recipe'], compatible_embedding_versions=[run['embedding']['recipe']])
     good_manifest=deepcopy(manifest)
     if field=='identity':manifest['embedding_identity']['query_prompt']='wrong-role-prompt'
     elif field=='dimension':manifest['embedding_dim']=1024
     elif field=='feature_schema':manifest['feature_spec_version']='wrong-schema'
     elif field=='weights':manifest['model_sha256']='a'*64
     elif field=='scaler':manifest['scaler_sha256']='b'*64
-    elif field=='file_drift':manifest['embedding_identity']['query_prompt']='different hashed input'
+    elif field=='file_drift':pass # Hash valid bytes, then swap at the actual read boundary.
+    elif field=='serving_model':manifest['embedding_model']='stale-model'
+    elif field=='serving_revision':manifest['embedding_model_revision']='a'*40
+    elif field=='serving_version':manifest['embedding_version']='stale-version'
+    elif field=='serving_compatible':manifest['compatible_embedding_versions']=['stale-version']
     elif field=='unsupported_runtime':
         run['embedding']['dimension']=1024
         snapshot['bundle']['embedding']['dimension']=1024
@@ -131,13 +136,17 @@ def test_cross_encoder_cli_requires_actual_manifest_contract(tmp_path,field,monk
         manifest['embedding_identity']=deepcopy(run['embedding'])
         manifest['embedding_dim']=1024;manifest['input_dim']=2058
     manifest_path=tmp_path/'manifest.json';manifest_path.write_text(json.dumps(manifest));run['manifest_sha256']=hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    swapped=[]
     if field=='file_drift':
-        original=cli.file_sha256
-        def replace_after_hash(path):
-            result=original(path)
-            if path==manifest_path:manifest_path.write_text(json.dumps(good_manifest))
-            return result
-        monkeypatch.setattr(cli,'file_sha256',replace_after_hash)
+        original=cli.read_regular
+        def replace_before_read(path, limit):
+            if path==manifest_path:
+                changed=deepcopy(good_manifest)
+                changed['embedding_identity']['query_prompt']='swapped wrong prompt'
+                manifest_path.write_text(json.dumps(changed))
+                swapped.append(True)
+            return original(path,limit)
+        monkeypatch.setattr(cli,'read_regular',replace_before_read)
     bundle=Bundle.model_validate(snapshot['bundle']);parsed=Run.model_validate(run);report=evaluate(bundle,parsed,k=policy.k)
     baseline={'schema_version':1,'status':'diagnostic','reference':'synthetic manifest-mechanics only',
         'policy_sha256':digest(policy),'report_sha256':digest(report),'report':report}
@@ -147,5 +156,7 @@ def test_cross_encoder_cli_requires_actual_manifest_contract(tmp_path,field,monk
     output=tmp_path/'out.json'
     assert cli.main([*argv,'--output',str(output),'--qualify','--model-artifact',str(model),'--scaler-artifact',str(scaler),'--manifest-artifact',str(manifest_path)])==1
     payload=json.loads(output.read_text())
-    assert 'candidate manifest embedding/feature/model compatibility mismatch' in payload['assessment']['failures']
+    expected='actual candidate manifest digest mismatch' if field=='file_drift' else 'candidate manifest embedding/feature/model compatibility mismatch'
+    assert expected in payload['assessment']['failures']
+    if field=='file_drift':assert swapped==[True]
     assert payload['qualification_manifest'] is None
