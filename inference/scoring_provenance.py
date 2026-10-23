@@ -8,6 +8,8 @@ served-exposure linkage belong to the backend and remain separate prerequisites.
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import hashlib
@@ -224,3 +226,75 @@ def seal_scoring_response(response: dict, context: ScoringContext, frames: tuple
             raise ValueError('Scored response exceeds exact wire byte budget')
         pieces.append(encoded)
     return b''.join(pieces)
+
+
+class ScoredInputCapture:
+    """One private inference scope, bounded to150 exact candidate rows.
+
+    The caller must derive context from the profile actually loaded and perform
+    any authorized sealing/archive work before scope exit. No API uses this yet.
+    """
+    def __init__(self, context: ScoringContext):
+        self.context = context
+        self._frames: list[ScoredFrame] = []
+        self._ids: set[str] = set()
+
+    @property
+    def frames(self) -> tuple[ScoredFrame, ...]:
+        return tuple(self._frames)
+
+    def record(self, ranker, candidates, matrix):
+        if (ranker.model_version != self.context.model_version
+                or ranker.embedding_model != self.context.embedding_model
+                or ranker.embedding_model_revision != self.context.embedding_revision
+                or any(ranker.loaded_artifact_sha256.get(key) != getattr(self.context,key)
+                       for key in ('model_sha256','scaler_sha256','manifest_sha256'))):
+            raise ValueError('Captured context does not identify actual loaded ranker artifacts')
+        if (matrix.dtype.kind != 'f' or matrix.dtype.itemsize != 4 or not matrix.flags.c_contiguous):
+            raise ValueError('Actual scored capture requires contiguous float32 input')
+        if len(self._frames)+len(candidates)>MAX_ITEMS or matrix.shape != (len(candidates),DIMENSIONS):
+            raise ValueError('Scored capture exceeds bounded request input')
+        pending=[]
+        for candidate,row in zip(candidates,matrix):
+            version = candidate.get('embedding_version')
+            if version not in self.context.repository_embedding_versions:
+                raise ValueError('Actual scored repository embedding version is unknown')
+            repo_id = _canonical(candidate.get('id'))
+            if repo_id in self._ids or any(frame.snapshot.repo_id == repo_id for frame in pending):
+                raise ValueError('Duplicate actual scored repository input')
+            def exact_version(key):
+                value=candidate[key]
+                if type(value) is int: return str(value)
+                if isinstance(value,str): return value
+                raise ValueError('Actual repository version must be exact decimal or integer')
+            snapshot=RepositorySnapshot(repo_id=repo_id,content_version=exact_version('content_version'),
+                feature_version=exact_version('feature_version'),content_hash=candidate['content_hash'],
+                source_hash=candidate['source_hash'],embedding_version_index=self.context.repository_embedding_versions.index(version))
+            frame=ScoredFrame(self.context.user_id,self.context.generation_id,snapshot,row.astype('<f4',copy=False).tobytes())
+            _validate_input(frame.input_bytes,self.context)
+            pending.append(frame)
+        self._frames.extend(pending)
+        self._ids.update(frame.snapshot.repo_id for frame in pending)
+
+
+_capture: ContextVar[ScoredInputCapture | None] = ContextVar('private_scored_input_capture',default=None)
+
+@contextmanager
+def capture_scored_inputs(context: ScoringContext):
+    """Private opt-in lifetime; never activated by untrusted request/config fields."""
+    if _capture.get() is not None:
+        raise ValueError('Nested scored-input capture is ambiguous')
+    capture=ScoredInputCapture(context)
+    token=_capture.set(capture)
+    try:
+        yield capture
+    finally:
+        _capture.reset(token)
+        capture._frames.clear()
+        capture._ids.clear()
+
+
+def capture_ranker_input(ranker, candidates, matrix):
+    capture=_capture.get()
+    if capture is not None:
+        capture.record(ranker,candidates,matrix)

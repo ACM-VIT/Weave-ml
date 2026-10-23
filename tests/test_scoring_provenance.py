@@ -149,3 +149,116 @@ def test_exact_decimal_version_fields_reject_lossy_or_noncanonical_values():
     for field in ('content_version','feature_version'):
         for value in (1,'01','-1',str(2**63)):
             with pytest.raises(ValueError):RepositorySnapshot.model_validate({**snapshot,field:value})
+
+@pytest.fixture(scope='module')
+def actual_capture_ranker():
+    from pathlib import Path
+    import torch
+    from inference.ranker_service import RankerService
+    root=Path(__file__).resolve().parents[1]/'inference'
+    ranker=RankerService(model_path=str(root/'heavy_ranker.pt'),scaler_path=str(root/'feature_scaler.json'),
+        manifest_path=str(root/'model_manifest.json'),require_production_manifest=True)
+    ranker.device=torch.device('cpu');ranker.model.to(ranker.device)
+    return ranker
+
+
+def actual_context(ranker,user_id=identifier(1),generation_id=identifier(2),user=None):
+    import numpy as np
+    if user is None:user=np.frombuffer(frame(0).input_bytes[:1536],dtype='<f4').copy()
+    return context().model_copy(update={**ranker.loaded_artifact_sha256,'model_version':ranker.model_version,
+        'embedding_model':ranker.embedding_model,'embedding_revision':ranker.embedding_model_revision,
+        'repository_embedding_versions':(ranker.embedding_version,),
+        'user_id':user_id,'generation_id':generation_id,
+        'user_vector_sha256':hashlib.sha256(user.astype('<f4',copy=False).tobytes()).hexdigest()})
+
+
+def actual_candidates(ranker,count=2):
+    import numpy as np
+    return [{'id':identifier(100+i),'embedding':np.full(384,.01+i/100,dtype=np.float32),
+        'content_version':1,'feature_version':0,'content_hash':'a'*64,'source_hash':'b'*64,
+        'embedding_version':ranker.embedding_version,'topics':['python'],'star_count':10**30,
+        'readme_length':250,'doc_quality':.7} for i in range(count)]
+
+
+def test_actual_trained_artifact_capture_matches_forward_tensor_and_exact_score_replay(actual_capture_ranker):
+    import numpy as np
+    import torch
+    from inference.scoring_provenance import capture_scored_inputs
+    ranker=actual_capture_ranker;user=np.frombuffer(frame(0).input_bytes[:1536],dtype='<f4').copy()
+    candidates=actual_candidates(ranker);ctx=actual_context(ranker,user=user)
+    baseline=ranker.score_batch_compact(user,['python'],candidates)
+    forwarded=[]
+    hook=ranker.model.register_forward_pre_hook(lambda _module,args:forwarded.append(args[0].detach().cpu().numpy().astype('<f4').tobytes()))
+    try:
+        with capture_scored_inputs(ctx) as capture:
+            scored=ranker.score_batch_compact(user,['python'],candidates)
+            assert scored==baseline
+            frames=capture.frames
+            assert b''.join(row.input_bytes for row in frames)==forwarded[0]
+            assert len(frames)==2
+            replay=np.frombuffer(forwarded[0],dtype='<f4').reshape(2,778).copy()
+            assert ranker._rank_results(torch.from_numpy(replay),candidates)==scored
+            # The extreme dense star count is captured after scaler+clip, not raw.
+            from inference.ranker_service import STANDARDIZED_FEATURE_CLIP
+            assert abs(replay[0,771])<=STANDARDIZED_FEATURE_CLIP
+            candidates[0]['embedding'][:]=99;user[:]=99
+            packet=packet_for_frame(frames[0],ctx)
+            assert decode_owned_packet(packet,ctx,owner_user_id=ctx.user_id,generation_id=ctx.generation_id,
+                repo_id=frames[0].snapshot.repo_id)==frames[0].input_bytes
+        assert capture.frames==()
+        assert len(forwarded)==2
+    finally:hook.remove()
+
+
+def test_concurrent_actual_ranker_scopes_remain_owner_isolated(actual_capture_ranker):
+    import numpy as np
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from inference.scoring_provenance import capture_scored_inputs
+    ranker=actual_capture_ranker;barrier=Barrier(2)
+    def run(owner):
+        user=np.full(384,owner/100,dtype=np.float32)
+        ctx=actual_context(ranker,user_id=identifier(owner),generation_id=identifier(10+owner),user=user)
+        with capture_scored_inputs(ctx) as capture:
+            barrier.wait(timeout=5)
+            ranker.score_batch_compact(user,[],actual_candidates(ranker,1))
+            frame=capture.frames[0]
+            assert frame.user_id==ctx.user_id and frame.generation_id==ctx.generation_id
+            assert frame.input_bytes[:1536]==user.astype('<f4').tobytes()
+        assert capture.frames==()
+        return frame
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a,b=list(pool.map(run,[1,2]))
+    assert a.user_id!=b.user_id and a.input_bytes!=b.input_bytes
+
+
+def test_capture_rejects_false_artifacts_or_unknown_actual_metadata_and_resets_scope(actual_capture_ranker):
+    import numpy as np
+    from inference.scoring_provenance import capture_scored_inputs
+    ranker=actual_capture_ranker;user=np.zeros(384,dtype=np.float32);ctx=actual_context(ranker,user=user)
+    with pytest.raises(ValueError,match='actual loaded'):
+        with capture_scored_inputs(ctx.model_copy(update={'model_sha256':'0'*64})):
+            ranker.score_batch_compact(user,[],actual_candidates(ranker,1))
+    candidates=actual_candidates(ranker,1);del candidates[0]['source_hash']
+    with pytest.raises(KeyError):
+        with capture_scored_inputs(ctx) as capture:
+            ranker.score_batch_compact(user,[],candidates)
+    assert capture.frames==()
+    # No leaked failed scope changes the ordinary compact score API afterward.
+    assert len(ranker.score_batch_compact(user,[],actual_candidates(ranker,1)))==1
+
+
+def test_capture_is_atomic_bounded_and_never_coerces_other_input_types(actual_capture_ranker):
+    import numpy as np
+    from inference.scoring_provenance import capture_scored_inputs
+    ranker=actual_capture_ranker;ctx=actual_context(ranker,user=np.zeros(384,dtype=np.float32))
+    with capture_scored_inputs(ctx) as capture:
+        with pytest.raises(ValueError,match='Nested'):
+            with capture_scored_inputs(ctx):pass
+        with pytest.raises(ValueError,match='float32'):
+            capture.record(ranker,actual_candidates(ranker,1),np.zeros((1,778),dtype=np.float64))
+        with pytest.raises(ValueError,match='bounded'):
+            capture.record(ranker,actual_candidates(ranker,151),np.zeros((151,778),dtype=np.float32))
+        candidates=actual_candidates(ranker,2);del candidates[1]['source_hash']
+        with pytest.raises(KeyError):capture.record(ranker,candidates,np.zeros((2,778),dtype=np.float32))
+        assert capture.frames==()
