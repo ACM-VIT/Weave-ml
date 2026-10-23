@@ -308,9 +308,9 @@ class CardSummaryPipeline:
                     )
                 except SummaryValidationError as exc:
                     repair_feedback = str(exc)
-                except SummaryProviderError:
+                except SummaryProviderError as exc:
                     defer = getattr(self.provider, "defer_fallback", None)
-                    if callable(defer):
+                    if exc.defer_upgrade and callable(defer):
                         defer(repo)
                     break
                 except (ValueError, TypeError):

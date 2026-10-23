@@ -53,3 +53,13 @@ For real Lua and separate-process quota coverage, start a disposable Redis on
 loopback port6397, then set `SUMMARY_TEST_REDIS_URL=redis://127.0.0.1:6397/0`.
 The fixture rejects other hosts/ports, uses unique namespaces and never clears a
 shared database. No external provider calls or production credentials are needed.
+
+The owned provider transport uses cancellable async HTTP I/O behind its synchronous
+worker facade. A total attempt deadline covers headers and streamed body, bounded
+to 64 KiB, and closes the actual stream before returning; a slow trickle cannot
+outlive the probe lease by repeatedly resetting an idle-read timer. Injected
+custom transports must provide equivalent total-deadline behavior. Caller
+completion-reserve exhaustion does not mark otherwise healthy content for shared
+upgrade deferral. Redis lookup failures are counted even when the pipeline
+short-circuits before quota acquisition. Replay deferral uses only canonical
+ID/content hash; README projection remains inside the actual upgrade path.

@@ -278,3 +278,80 @@ def test_preflight_deadline_abandons_probe_without_reporting_provider_failure():
     policy.report(probe, None)
     assert policy.acquire(1).probe
     assert policy.metrics["failed"] == 1 and policy.metrics["abandoned"] == 1
+
+
+def test_caller_deadline_does_not_defer_other_healthy_upgrade_jobs():
+    config = settings(max_retries=0)
+    policy = LocalSummaryAdmission(config)
+    session = Session()
+    provider = OpenRouterSummaryProvider(
+        config, session=session, limiter=NoWait(), admission=policy
+    )
+    pipeline = CardSummaryPipeline(settings=config, provider=provider)
+    repo = {
+        "repo_id": "canonical",
+        "content_hash": "same",
+        "description": "A tool for reviewing changes.",
+    }
+    fallback = pipeline.summarize(repo, repo, deadline=time.monotonic() + 1)
+    assert fallback.source == "description_fallback" and session.calls == 0
+    assert pipeline.should_upgrade(fallback, repo=repo)
+
+
+@pytest.mark.parametrize("coordinator", ["missing", "unavailable"])
+def test_pipeline_counts_unavailable_coordination_before_acquisition(coordinator):
+    from redis.exceptions import ConnectionError
+
+    class Unavailable:
+        def exists(self, _):
+            raise ConnectionError("isolated fixture")
+
+    config = settings()
+    admission = RedisSummaryAdmission(
+        config, None if coordinator == "missing" else Unavailable()
+    )
+    session = Session(200)
+    provider = OpenRouterSummaryProvider(
+        config, session=session, admission=admission, limiter=NoWait()
+    )
+    repo = {
+        "repo_id": "canonical",
+        "content_hash": "same",
+        "description": "A tool for reviewing changes.",
+    }
+    assert (
+        CardSummaryPipeline(settings=config, provider=provider)
+        .summarize(repo, repo)
+        .source
+        == "description_fallback"
+    )
+    assert session.calls == 0 and admission.metrics["coordination_unavailable"] == 1
+
+
+def test_slow_stream_is_actually_closed_before_probe_lease_can_expire():
+    import asyncio
+
+    import httpx
+    import requests
+
+    from summarization.transport import BoundedSummarySession
+
+    closed = []
+
+    class Drip(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                yield b" "
+
+        async def aclose(self):
+            closed.append(True)
+
+    async def handler(_request):
+        return httpx.Response(200, stream=Drip(), headers={"Content-Length": "50"})
+
+    transport = BoundedSummarySession(transport=httpx.MockTransport(handler))
+    started = time.monotonic()
+    with pytest.raises(requests.RequestException, match="deadline"):
+        transport.post("https://summary.invalid", json={}, headers={}, timeout=0.1)
+    assert time.monotonic() - started < 0.4 and closed == [True]

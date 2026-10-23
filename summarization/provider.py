@@ -12,6 +12,7 @@ import requests
 
 from .prompt import RESPONSE_JSON_SCHEMA, SYSTEM_PROMPT, user_prompt
 from .settings import SummarySettings
+from .transport import BoundedSummarySession
 from .admission import AdmissionDenied, LocalSummaryAdmission, fallback_key
 
 
@@ -26,6 +27,10 @@ SUMMARY_COMPLETION_RESERVE_SECONDS = 10.0
 
 class SummaryProviderError(RuntimeError):
     """Provider or transport failure safe for description fallback."""
+
+    def __init__(self, message: str, *, defer_upgrade: bool = True):
+        super().__init__(message)
+        self.defer_upgrade = defer_upgrade
 
 
 class SummaryProvider(Protocol):
@@ -78,7 +83,7 @@ class OpenRouterSummaryProvider:
         if not settings.provider_enabled:
             raise ValueError("SUMMARY_API_KEY is required to enable the summary provider")
         self.settings = settings
-        self.session = session or requests.Session()
+        self.session = session or BoundedSummarySession()
         self.limiter = limiter or SummaryRateLimiter(settings.rpm_limit)
         self.sleeper = sleeper
         self.admission = admission or LocalSummaryAdmission(settings)
@@ -218,6 +223,7 @@ class OpenRouterSummaryProvider:
         remaining = deadline - time.monotonic() - SUMMARY_COMPLETION_RESERVE_SECONDS
         if remaining < 0.1:
             raise SummaryProviderError(
-                "summary generation would consume the embedding completion reserve"
+                "summary generation would consume the embedding completion reserve",
+                defer_upgrade=False,
             )
         return remaining

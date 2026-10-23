@@ -286,6 +286,7 @@ class RedisSummaryAdmission:
 
     def deferred(self, key: str) -> bool:
         if self.client is None:
+            self.metrics["coordination_unavailable"] += 1
             return True
         try:
             result = bool(self.client.exists(f"{self.prefix}:fallback:{key}"))
@@ -293,6 +294,7 @@ class RedisSummaryAdmission:
                 self.metrics["fallback_deferred"] += 1
             return result
         except (RedisError, OSError):
+            self.metrics["coordination_unavailable"] += 1
             return True  # Keep an accepted durable fallback during Redis failure.
 
 
