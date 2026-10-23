@@ -284,3 +284,33 @@ def test_delivered_objects_are_released_before_replacement_enrichment(monkeypatc
     enrich_repositories('test', [f'owner/repo{i}' for i in range(40)], batch_size=2, workers=1,
                         on_batch=lambda batch: received.extend(item.repo_id for item in batch.repositories))
     assert len(received) == 40 and all(ref() is None for ref in prior)
+
+
+@pytest.mark.parametrize('cancel', [False, True])
+def test_interrupted_restart_records_current_progress_instead_of_previous_run(tmp_path, cancel):
+    checkpoint = CorpusCheckpoint(tmp_path / 'state.json')
+    names = ['owner/first', 'owner/retry']
+    checkpoint.add_pending_persistence(names)
+    checkpoint.record_run({'persisted': 999})
+    checkpoint.save()
+    attempts = []
+    class Partial(Database):
+        def upsert_repositories_detailed(self, sources):
+            if sources[0].repo_id == names[1]:
+                return RepositoryDeliveryResult(failed={names[1]: 'HTTP503'})
+            return super().upsert_repositories_detailed(sources)
+    def retry(batch):
+        attempts.append(batch)
+        if cancel and batch == names[1:]:
+            raise CancelledError('cancel second retry')
+        return AcquisitionRunResult(repositories=[source(n) for n in batch])
+    p = pipeline(tmp_path, lambda **_: pytest.fail('restart must stop before new discovery'), Partial(), checkpoint=checkpoint)
+    p.acquire_retries = retry
+    with pytest.raises(CancelledError if cancel else RuntimeError):
+        p.run(limit=2, batch_size=1, workers=1, min_readme_chars=1)
+    saved = CorpusCheckpoint(tmp_path / 'state.json')
+    assert saved.data['last_run']['persisted'] == 1
+    assert saved.data['last_run']['resumed_persistence'] == 1
+    assert saved.pending_persistence == names[1:]
+    if not cancel:
+        assert names[1] in saved.data['last_run']['failures']

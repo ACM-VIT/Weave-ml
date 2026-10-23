@@ -75,116 +75,120 @@ class CorpusPipeline:
             self.database.init_db()
 
         report = CorpusRunReport()
-        if database_ready:
-            self._resume_indexing(report)
-            self._resume_persistence(
-                report,
-                min_readme_chars=min_readme_chars,
-                batch_size=batch_size,
-            )
-
-        current_count = self.database.get_repo_count() if database_ready else 0
-        for _cycle in range(self.settings.max_cycles):
-            if database_ready and current_count >= self.settings.target_count:
-                logger.info(
-                    "Corpus target reached: %d/%d repositories.",
-                    current_count,
-                    self.settings.target_count,
-                )
-                break
-
-            cycle_limit = (
-                min(limit, self.settings.target_count - current_count)
-                if database_ready
-                else limit
-            )
-            existing = (
-                self.database.get_existing_repository_names()
-                if database_ready
-                else set()
-            )
-            report.manifest_status = getattr(self.database, "manifest_status", "not_supported")
-            before_count = current_count
-            enriched_count = 0
-            persisted_count = 0
-            discovery_published = False
-
-            def discovered(audit: AcquisitionRunResult) -> None:
-                nonlocal discovery_published
-                if discovery_published:
-                    raise ValueError("Discovery totals were already published for this cycle")
-                report.discovered += audit.discovered_count
-                report.skipped_existing += audit.skipped_existing_count
-                report.duplicates_removed += audit.duplicates_removed
-                discovery_published = True
-
-            def consume(acquired: AcquisitionRunResult) -> None:
-                nonlocal enriched_count, persisted_count
-                enriched_count += len(acquired.repositories)
-                report.enriched += len(acquired.repositories)
-                for failure in acquired.failures:
-                    report.failures[failure.repository] = f"{failure.stage}: {failure.error}"
-                    self.checkpoint.record_failure(failure.repository, failure.stage, failure.error)
-                    self.checkpoint.add_pending_persistence([failure.repository])
-                approved, rejected = self.quality_filter(
-                    acquired.repositories, min_readme_chars=min_readme_chars,
-                )
-                report.rejected += len(rejected)
-                for source, reasons in rejected:
-                    name = _source_name(source)
-                    self.checkpoint.record_rejection(name, reasons)
-                    self.checkpoint.clear_pending_persistence([name])
-                persisted = self._persist_and_index(
-                    approved, database_ready=database_ready, report=report,
-                )
-                persisted_count += len(persisted)
-                if not approved or not database_ready:
-                    self.checkpoint.save()
-                if self.streaming and approved and not persisted:
-                    raise RuntimeError("Backend delivery made no progress; remaining identities stay retryable")
-
-            def selected(names: list[str]) -> None:
-                # Identities only; no README/token staging. Save before workers
-                # start so interruption retains even not-yet-enriched work.
-                self.checkpoint.add_pending_persistence(names)
-                self.checkpoint.save()
-
-            kwargs = dict(limit=cycle_limit, batch_size=batch_size,
-                          workers=workers, existing_repos=existing)
-            try:
-                if self.streaming:
-                    acquired = self._as_acquisition_result(self.acquire(
-                        **kwargs, on_batch=consume, on_targets=selected, on_discovery=discovered,
-                    ))
-                else:
-                    acquired = self._as_acquisition_result(self.acquire(**kwargs))
-                    consume(acquired)
-                if not discovery_published:
-                    # Compatibility acquire callables may not expose the early
-                    # audit callback; successful returns still retain totals.
-                    discovered(acquired)
-            finally:
-                # Includes cancellation/BaseException; accepted subsets were
-                # cleared batch-wise, all remaining identities stay retryable.
-                self.checkpoint.record_run(report.as_dict())
-                self.checkpoint.save()
-
-            if not enriched_count:
-                logger.warning("Acquisition made no progress; ending this bounded run.")
-                break
+        try:
             if database_ready:
-                current_count = self.database.get_repo_count()
-                if not persisted_count or current_count <= before_count:
-                    logger.warning(
-                        "Corpus persistence made no forward progress; stopping safely."
+                self._resume_indexing(report)
+                self._resume_persistence(
+                    report,
+                    min_readme_chars=min_readme_chars,
+                    batch_size=batch_size,
+                )
+
+            current_count = self.database.get_repo_count() if database_ready else 0
+            for _cycle in range(self.settings.max_cycles):
+                if database_ready and current_count >= self.settings.target_count:
+                    logger.info(
+                        "Corpus target reached: %d/%d repositories.",
+                        current_count,
+                        self.settings.target_count,
                     )
                     break
-            else:
-                break
 
-        self.checkpoint.record_run(report.as_dict())
-        self.checkpoint.save()
-        return report
+                cycle_limit = (
+                    min(limit, self.settings.target_count - current_count)
+                    if database_ready
+                    else limit
+                )
+                existing = (
+                    self.database.get_existing_repository_names()
+                    if database_ready
+                    else set()
+                )
+                report.manifest_status = getattr(self.database, "manifest_status", "not_supported")
+                before_count = current_count
+                enriched_count = 0
+                persisted_count = 0
+                discovery_published = False
+
+                def discovered(audit: AcquisitionRunResult) -> None:
+                    nonlocal discovery_published
+                    if discovery_published:
+                        raise ValueError("Discovery totals were already published for this cycle")
+                    report.discovered += audit.discovered_count
+                    report.skipped_existing += audit.skipped_existing_count
+                    report.duplicates_removed += audit.duplicates_removed
+                    discovery_published = True
+
+                def consume(acquired: AcquisitionRunResult) -> None:
+                    nonlocal enriched_count, persisted_count
+                    enriched_count += len(acquired.repositories)
+                    report.enriched += len(acquired.repositories)
+                    for failure in acquired.failures:
+                        report.failures[failure.repository] = f"{failure.stage}: {failure.error}"
+                        self.checkpoint.record_failure(failure.repository, failure.stage, failure.error)
+                        self.checkpoint.add_pending_persistence([failure.repository])
+                    approved, rejected = self.quality_filter(
+                        acquired.repositories, min_readme_chars=min_readme_chars,
+                    )
+                    report.rejected += len(rejected)
+                    for source, reasons in rejected:
+                        name = _source_name(source)
+                        self.checkpoint.record_rejection(name, reasons)
+                        self.checkpoint.clear_pending_persistence([name])
+                    persisted = self._persist_and_index(
+                        approved, database_ready=database_ready, report=report,
+                    )
+                    persisted_count += len(persisted)
+                    if not approved or not database_ready:
+                        self.checkpoint.save()
+                    if self.streaming and approved and not persisted:
+                        raise RuntimeError("Backend delivery made no progress; remaining identities stay retryable")
+
+                def selected(names: list[str]) -> None:
+                    # Identities only; no README/token staging. Save before workers
+                    # start so interruption retains even not-yet-enriched work.
+                    self.checkpoint.add_pending_persistence(names)
+                    self.checkpoint.save()
+
+                kwargs = dict(limit=cycle_limit, batch_size=batch_size,
+                              workers=workers, existing_repos=existing)
+                try:
+                    if self.streaming:
+                        acquired = self._as_acquisition_result(self.acquire(
+                            **kwargs, on_batch=consume, on_targets=selected, on_discovery=discovered,
+                        ))
+                    else:
+                        acquired = self._as_acquisition_result(self.acquire(**kwargs))
+                        consume(acquired)
+                    if not discovery_published:
+                        # Compatibility acquire callables may not expose the early
+                        # audit callback; successful returns still retain totals.
+                        discovered(acquired)
+                finally:
+                    # Includes cancellation/BaseException; accepted subsets were
+                    # cleared batch-wise, all remaining identities stay retryable.
+                    self.checkpoint.record_run(report.as_dict())
+                    self.checkpoint.save()
+
+                if not enriched_count:
+                    logger.warning("Acquisition made no progress; ending this bounded run.")
+                    break
+                if database_ready:
+                    current_count = self.database.get_repo_count()
+                    if not persisted_count or current_count <= before_count:
+                        logger.warning(
+                            "Corpus persistence made no forward progress; stopping safely."
+                        )
+                        break
+                else:
+                    break
+
+            return report
+        finally:
+            # Resume can fail/cancel before discovery starts. Always replace the
+            # previous invocation's audit with the progress made in this run.
+            self.checkpoint.record_run(report.as_dict())
+            self.checkpoint.save()
 
     def _resume_indexing(self, report: CorpusRunReport) -> None:
         pending = self.checkpoint.pending_index
