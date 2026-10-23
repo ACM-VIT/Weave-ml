@@ -444,3 +444,24 @@ def test_trending_retry_reuses_successes_and_restores_original_rank_order():
     ]
     assert storage.last_enrichment_counts == {"fetched": 1, "reused": 1, "failed": 0, "fallback": 0}
     assert storage._retry_records == {}
+
+
+@pytest.mark.parametrize('invalid', [
+    {'github_id': 'unexpected', 'repo_id': 'invalid', 'content_version': 1},
+    {'github_id': '123', 'repo_id': str(uuid.uuid4()), 'content_version': 1},
+    {'github_id': '124', 'repo_id': 'invalid', 'content_version': 1},
+])
+def test_ambiguous_mapping_suffix_does_not_acknowledge_a_valid_prefix(invalid):
+    class Session:
+        def post(self, *_args, **_kwargs):
+            return _Response({'mappings': [
+                {'github_id': '123', 'repo_id': str(uuid.uuid4()), 'content_version': 1}, invalid,
+            ]})
+    client = BackendIngestionClient(base_url='http://backend.test', internal_secret='test', session=Session())
+    result = client.upsert_repositories_detailed([
+        _source(full_name='owner/one', github_id='123'),
+        _source(full_name='owner/two', github_id='124'),
+    ])
+    assert result.succeeded == [] and result.mappings == {}
+    assert set(result.failed) == {'owner/one', 'owner/two'}
+    assert client.get_repo_count() == 0 and client._accepted_names == set()

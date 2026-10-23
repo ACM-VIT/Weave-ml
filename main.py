@@ -225,6 +225,7 @@ def main(argv: list[str] | None = None) -> int:
         checkpoint=CorpusCheckpoint(settings.checkpoint_path),
         allow_qdrant_without_postgres=False,
         indexing_enabled=False,
+        streaming=True,
     )
     try:
         report = pipeline.run(
