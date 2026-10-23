@@ -95,3 +95,36 @@ def test_actual_scoped_factory_survives_reconnect_and_overdue_idle_probe(
             assert guarded.read() is not None
         finally:
             guarded.close()
+
+
+@pytest.mark.parametrize('state, healthy', [
+    ('READY', True), ('DIRTY', True), ('UNTRUSTED', False), ('UNAVAILABLE', False), ('outage', False),
+])
+def test_readiness_includes_enabled_authority_state_without_rejecting_dirty(monkeypatch, state, healthy):
+    from api import v2
+    monkeypatch.setenv('V2_FEEDBACK_CONSUMER_REQUIRED', 'true')
+    monkeypatch.setattr(v2, 'retriever', lambda: SimpleNamespace(health=lambda: {'qdrant_status': 'healthy'}))
+    monkeypatch.setattr(v2, 'producer', lambda: SimpleNamespace(health=lambda: {
+        'feedback_healthy': True, 'feedback_consumer_active': True,
+    }))
+    def status():
+        if state == 'outage':
+            raise RuntimeError('redis://sensitive-credentials-must-not-leak')
+        return {'state': state, 'writers': 1 if state == 'DIRTY' else 0}
+    monkeypatch.setattr(v2, 'corpus_authority', lambda: SimpleNamespace(status=status))
+    actual_healthy, details = v2._collect_health_diagnostics(threading.Event())
+    assert actual_healthy is healthy
+    info = details['corpus_authority']
+    assert info['enabled'] is True
+    assert info['healthy'] is healthy
+    assert info['reachable'] is (state != 'outage')
+    assert 'sensitive-credentials' not in str(details)
+
+
+def test_disabled_authority_reports_no_reachability_observation(monkeypatch):
+    from api import v2
+    monkeypatch.setattr(v2, 'retriever', lambda: SimpleNamespace(health=lambda: {'qdrant_status': 'healthy'}))
+    monkeypatch.setattr(v2, 'corpus_authority', lambda: None)
+    assert v2._qdrant_health()['corpus_authority'] == {
+        'enabled': False, 'reachable': None, 'healthy': True, 'state': 'DISABLED', 'writers': None,
+    }
