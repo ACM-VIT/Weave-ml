@@ -199,3 +199,29 @@ def test_rollout_cohort_is_stable_request_local_and_can_be_disabled_without_read
         assert lookup_social_ids([candidate(1)], off.for_user(user), set()) == []
     for invalid in [True, -1., 101., float('nan')]:
         with pytest.raises(ValueError): replace(policy, traffic_percent=invalid)
+
+
+def test_shadow_cannot_spend_semantic_low_yield_refill_budget(local_recommendation_corpus):
+    corpus = local_recommendation_corpus
+    corpus.client.set_payload(corpus.repository_collection,
+        payload={'doc_quality': 'invalid'}, points=corpus.repo_ids[:100])
+    retriever = _corpus_retriever(corpus, heavy=True)
+    retriever.max_candidates = 50
+    social = [SocialCandidate(repo_id=repo_id, owner_github_id=str(index + 1),
+                source='followed_owner', source_score=.5, support=1)
+              for index, repo_id in enumerate(corpus.repo_ids[400:500])]
+    retriever.social_policy = SocialPolicy(mode='disabled')
+    baseline = retriever.recommend_batch(corpus.user_id, 10, [], 'low-yield', social_candidates=social)
+    expected_inputs = [row['id'] for row in retriever.ranker.calls[-1][2]]
+    for method in (corpus.client.query_points, corpus.client.scroll, corpus.client.retrieve):
+        method.reset_mock()
+    retriever.social_policy = SocialPolicy(mode='shadow')
+    shadow = retriever.recommend_batch(corpus.user_id, 10, [], 'low-yield', social_candidates=social)
+    assert shadow.items == baseline.items
+    assert [row['id'] for row in retriever.ranker.calls[-1][2]] == expected_inputs
+    assert corpus.client.query_points.call_count == 3
+    candidate_reads = sum(call.kwargs['limit'] for method in (corpus.client.query_points, corpus.client.scroll)
+                          for call in method.call_args_list)
+    social_reads = sum(len(call.kwargs['ids']) for call in corpus.client.retrieve.call_args_list
+                       if call.kwargs.get('with_vectors') is False)
+    assert candidate_reads + social_reads <= 6 * retriever.max_candidates
