@@ -120,6 +120,7 @@ def test_actual_encoder_groups_cross_eight_input_boundary_and_count_padding(vers
     assert result["encoder_padded_tokens"] == sum(max(group) * len(group) for group in lengths)
     assert all(len(group) <= 8 and max(group) * len(group) <= 2048 for group in lengths)
 
+
 def test_measured_wrapper_reuses_counts_without_a_second_tokenizer_pass():
     from scripts.sweep_embedding_budget import MeasuredModel
     class Untokenizable:
@@ -132,6 +133,58 @@ def test_measured_wrapper_reuses_counts_without_a_second_tokenizer_pass():
     assert measured.groups == 2 and measured.padded_tokens == 25
     with pytest.raises(ValueError, match="prepared token-count"):
         measured.encode(["unexpected"])
+
+
+def test_source_identity_includes_cleaner_and_changes_with_its_bytes(monkeypatch, tmp_path):
+    from scripts import sweep_embedding_budget as bench
+    names = ["utils/readme_processor.py", "embedding/readme_embedding.py", "embedding/embeddings.py", "embedding/repository_embedding.py", "embedding/runtime.py", "config.py", "scripts/sweep_embedding_budget.py", "pyproject.toml", "uv.lock"]
+    for name in names:
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("original")
+    monkeypatch.setattr(bench, "ROOT", tmp_path)
+    monkeypatch.setattr(bench, "local_git", lambda *args: "\0".join(names) + "\0", raising=False)
+    original = bench.source_hashes()
+    (tmp_path / "utils/readme_processor.py").write_text("changed cleaner")
+    changed = bench.source_hashes()
+    assert original["utils/readme_processor.py"] != changed["utils/readme_processor.py"]
+    assert len(original) == len(names)
+
+
+def test_missing_promisor_blob_never_invokes_git_transport(tmp_path, monkeypatch):
+    import os
+    if os.name != 'posix':
+        pytest.skip('POSIX executable Git remote-helper fixture')
+    import subprocess
+    from scripts.sweep_embedding_budget import local_git
+    repo = tmp_path / "partial"
+    repo.mkdir()
+    def git(*args, data=None):
+        return subprocess.check_output(["git", *args], cwd=repo, input=data, text=True).strip()
+    git("init", "--quiet")
+    blob = git("hash-object", "-w", "--stdin", data="README content")
+    # A real missing promisor object would normally trigger a remote helper.
+    git("config", "remote.origin.url", "proof::missing")
+    git("config", "remote.origin.promisor", "true")
+    git("config", "extensions.partialClone", "origin")
+    (repo / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+    helper = tmp_path / "git-remote-proof"
+    marker = tmp_path / "transport-invoked"
+    helper.write_text("#!/bin/sh\nprintf attempted > \"$PROOF_MARKER\"\nexit 1\n")
+    helper.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("PROOF_MARKER", str(marker))
+    with pytest.raises(RuntimeError, match="lazy fetching disabled"):
+        local_git(repo, "show", blob)
+    assert not marker.exists()
+    # Positive control: the same missing object does invoke transport without
+    # the guard, so absence above is not an inert fixture false-positive.
+    env = dict(os.environ)
+    env.pop("GIT_NO_LAZY_FETCH", None)
+    subprocess.run(["git", "show", blob], cwd=repo, env=env,
+                   capture_output=True, text=True, timeout=15, check=False)
+    assert marker.read_text() == "attempted"
+
 
 def test_job_reporting_does_not_retokenize_the_prepared_input_stream():
     model = Encoder()
@@ -147,3 +200,40 @@ def test_job_reporting_does_not_retokenize_the_prepared_input_stream():
     # The old reporting wrapper adds a second pass over this complete stream.
     assert len(calls) == result['job_chunks']
     assert len(calls) == len(model.texts)
+
+
+def test_unavailable_rss_is_explicitly_unknown(monkeypatch):
+    from scripts import sweep_embedding_budget as bench
+    monkeypatch.setattr(bench, 'resource', None)
+    assert bench.peak_rss_mib() is None
+
+
+def test_cli_help_remains_available_without_unix_resource_module():
+    import subprocess
+    import sys
+    from pathlib import Path
+    script = '''
+import builtins, runpy, sys
+original = builtins.__import__
+def blocked(name, *args, **kwargs):
+    if name == 'resource':
+        raise ImportError('resource unavailable on this platform')
+    return original(name, *args, **kwargs)
+builtins.__import__ = blocked
+sys.argv = ['sweep_embedding_budget', '--help']
+runpy.run_path('scripts/sweep_embedding_budget.py', run_name='__main__')
+'''
+    result = subprocess.run([sys.executable, '-c', script],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert '--budgets' in result.stdout
+
+
+@pytest.mark.parametrize('platform_name,expected', [('linux', 128/1024), ('darwin', 128/(1024**2))])
+def test_peak_rss_preserves_platform_units(monkeypatch, platform_name, expected):
+    from types import SimpleNamespace
+    from scripts import sweep_embedding_budget as bench
+    fake = SimpleNamespace(RUSAGE_SELF=0, getrusage=lambda who: SimpleNamespace(ru_maxrss=128))
+    monkeypatch.setattr(bench, 'resource', fake)
+    monkeypatch.setattr(bench.sys, 'platform', platform_name)
+    assert bench.peak_rss_mib() == expected

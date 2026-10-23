@@ -15,7 +15,10 @@ import json
 import os
 from pathlib import Path
 import re
-import resource
+try:
+    import resource
+except ImportError:  # RSS is unavailable on platforms without the Unix module.
+    resource = None
 import socket
 import subprocess
 import sys
@@ -67,6 +70,23 @@ def select_prefix(counts: list[int], mandatory: list[int], budget: Budget | None
     return selected
 
 
+def local_git(repo, *args):
+    """Read existing local objects only; missing partial-clone blobs fail closed.
+
+    Git's subprocess transport is outside the Python socket guard. Disallow lazy
+    fetching explicitly instead of interpreting zero Python attempts as proof.
+    Unsupported Git versions reject this option rather than trying a fetch.
+    """
+    try:
+        return subprocess.check_output(
+            ["git", "--no-lazy-fetch", "--no-pager", *args], cwd=repo, text=True,
+            env={**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0"},
+            stderr=subprocess.PIPE, timeout=15,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError("local-only Git read failed; required objects must already exist (lazy fetching disabled)") from exc
+
+
 def fixtures(include_sibling=False):
     words = "Search indexes immutable document vectors with bounded workers and versioned storage. "
     cases = [
@@ -79,8 +99,8 @@ def fixtures(include_sibling=False):
     if include_sibling:
         repos.append(("local_weave_readme", ROOT.parent / "Weave"))
     for name, repo in repos:
-        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
-        text = subprocess.check_output(["git", "show", f"{commit}:README.md"], cwd=repo, text=True)
+        commit = local_git(repo, "rev-parse", "HEAD").strip()
+        text = local_git(repo, "show", f"{commit}:README.md")
         if len(text) > 200000:
             raise ValueError("local fixture exceeds diagnostic input guard")
         result.append({"name": name, "readme": text, "provenance": f"local git object {commit}:README.md"})
@@ -178,8 +198,19 @@ def no_network():
 
 
 def source_hashes():
-    names = ("embedding/readme_embedding.py", "embedding/embeddings.py", "embedding/repository_embedding.py", "embedding/runtime.py", "config.py", "scripts/sweep_embedding_budget.py")
-    return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in names}
+    # Include the cleaner and every transitive project Python dependency. The
+    # broader conservative guard also rejects unrelated source drift mid-run.
+    tracked = local_git(ROOT, "ls-files", "-z").split("\0")
+    names = {name for name in tracked if name.endswith(".py")}
+    names.update(("pyproject.toml", "uv.lock", "scripts/sweep_embedding_budget.py"))
+    return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sorted(names)}
+
+
+def peak_rss_mib():
+    if resource is None:
+        return None
+    divisor = 1024 ** 2 if sys.platform == 'darwin' else 1024
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / divisor
 
 
 def cohort(budget, include_sibling):
@@ -198,8 +229,8 @@ def cohort(budget, include_sibling):
     if attempts or before != source_hashes():
         raise RuntimeError("network attempt or measured source drift")
     return {"source_hashes": before, "model_revision": PIN, "max_seq_length": model.max_seq_length,
-            "network_attempts": len(attempts), "budget": vars(budget) if budget else None,
-            "cohort_peak_rss_mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
+            "network_attempts": len(attempts), "network_guard_scope": "Python sockets; Git lazy fetching explicitly disabled", "budget": vars(budget) if budget else None,
+            "cohort_peak_rss_mib": peak_rss_mib(),
             "fixtures": [{key: value for key, value in case.items() if key != "readme"} for case in cases], "rows": rows}
 
 
