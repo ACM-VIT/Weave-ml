@@ -183,3 +183,20 @@ async def test_cancelled_awaiter_retains_encoder_slot_until_actual_encode_exits(
         raw.close()
         await asyncio.gather(*(task for task in (owner, successor) if task is not None), return_exceptions=True)
         await asyncio.to_thread(wait_for_model, model, waiting=0, active=0)
+
+
+
+def test_http_benchmark_auth_is_isolated_from_custom_header(monkeypatch):
+    import os
+    from types import SimpleNamespace
+    from scripts.benchmark_encoder_fairness import http_search_fixture
+
+    monkeypatch.setenv('INTERNAL_API_HEADER', 'x-developer-custom')
+    # Invalid input reaches request validation only after internal authentication.
+    # Neither the encoder nor a provider should run for this request.
+    model = SimpleNamespace(encode=lambda *a, **k: pytest.fail('Unexpected encode'))
+    with http_search_fixture(model, enabled=True) as client:
+        response = client.post('/api/v2/search/repositories',
+            headers={'x-internal-secret': 'isolated-encoder-fixture'}, json={})
+        assert response.status_code == 422, response.text
+    assert os.environ['INTERNAL_API_HEADER'] == 'x-developer-custom'

@@ -185,6 +185,7 @@ def http_search_fixture(model, *, enabled):
         finally:
             CLASS.reset(token)
     with patch.dict(os.environ, {'INTERNAL_API_SECRET': 'isolated-encoder-fixture',
+                                 'INTERNAL_API_HEADER': 'x-internal-secret',
                                  'APP_ENV': 'development', 'V2_SEARCH_EXECUTOR_WORKERS': '1',
                                  'V2_SEARCH_MAX_OUTSTANDING': '4', 'V2_SEARCH_TIMEOUT_SECONDS': '4'}), \
          patch.object(v2, 'shared_embedding_model', return_value=model), \
