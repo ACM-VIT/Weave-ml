@@ -101,3 +101,24 @@ def test_inline_pairs_are_not_reused_across_requests():
 def test_invalid_transport_mode_is_rejected():
     with pytest.raises(ValueError, match='deferred or inline'):
         QdrantV2Retriever(client=WireQdrant(), candidate_vector_mode='auto-guessed', heavy_ranker_enabled=False)
+
+
+from tests.test_v2_retrieval import local_recommendation_corpus, _corpus_retriever
+
+
+def test_local_qdrant_inline_projection_and_social_hydration(local_recommendation_corpus):
+    from retrieval.social_candidates import SocialCandidate, SocialPolicy
+    corpus = local_recommendation_corpus
+    retriever = _corpus_retriever(corpus, heavy=True)
+    retriever.candidate_vector_mode = 'inline'
+    retriever.social_policy = SocialPolicy(mode='enabled')
+    social_id = corpus.repo_ids[-1]
+    batch = retriever.recommend_batch(corpus.user_id, 10, [], social_candidates=[SocialCandidate(
+        repo_id=social_id, owner_github_id='123', source='followed_owner', source_score=.5, support=1,
+    )])
+    assert batch.ranker_applied
+    assert social_id in {row['id'] for row in retriever.ranker.calls[-1][2]}
+    repository_reads = [call.kwargs for call in corpus.client.retrieve.call_args_list
+                        if call.kwargs.get('collection_name') == retriever.repository_collection]
+    assert any(row.get('with_vectors') is False for row in repository_reads)
+    assert any(row.get('with_vectors') and social_id in row['ids'] for row in repository_reads)
