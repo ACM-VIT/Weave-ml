@@ -76,3 +76,112 @@ def test_conflicting_owner_or_duplicate_source_projection_fails_closed():
 @pytest.mark.parametrize('change', [{'mode':'maybe'}, {'max_lookup':0}, {'max_candidates':101}, {'max_per_owner':True}, {'minimum_collaborative_support':1}])
 def test_invalid_policy_cannot_weaken_bounds(change):
     with pytest.raises(ValueError): SocialPolicy(**change)
+
+# Registered retrieval integration uses the real local Qdrant engine for filters,
+# projections and vector reads; only the heavy model is a deterministic test model.
+from tests.test_v2_retrieval import local_recommendation_corpus, _corpus_retriever
+
+
+def social_for(corpus):
+    return SocialCandidate(repo_id=corpus.repo_ids[-1], owner_github_id='123456',
+                           source='followed_owner', support=1, source_score=.5)
+
+
+def test_independent_social_id_reaches_required_heavy_ranking_and_wire_provenance(local_recommendation_corpus):
+    corpus = local_recommendation_corpus
+    retriever = _corpus_retriever(corpus, heavy=True)
+    retriever.social_policy = SocialPolicy(mode='enabled')
+    social = social_for(corpus)
+    baseline = retriever.recommend_batch(corpus.user_id, 10, [], 'same-generation')
+    baseline_ranked = {row['id'] for row in retriever.ranker.calls[-1][2]}
+    assert social.repo_id not in baseline_ranked
+
+    def rank_all(user_vector, skills, candidates):
+        retriever.ranker.calls.append((user_vector, skills, candidates))
+        return [{'repo_id': row['id'], 'final_score': 1. if row['id'] == social.repo_id else .1} for row in candidates]
+    retriever.ranker.score_batch = rank_all
+    batch = retriever.recommend_batch(corpus.user_id, 10, [], 'same-generation', False, [], [social])
+    assert batch.ranker_applied and batch.served_ranker == 'heavy'
+    assert social.repo_id in {row['id'] for row in retriever.ranker.calls[-1][2]}
+    assert len(retriever.ranker.calls[-1][2]) <= retriever.max_candidates
+    item = next(item for item in batch.items if item.repo_id == social.repo_id)
+    assert item.source == 'followed_owner'
+    assert item.retrieval_scores['followed_owner'] == .5
+    social_reads = [call.kwargs for call in corpus.client.retrieve.call_args_list
+                    if call.kwargs.get('ids') == [social.repo_id]]
+    assert any(row['with_vectors'] is False for row in social_reads)
+    assert all(len(row.kwargs['ids']) <= 100 for row in corpus.client.retrieve.call_args_list
+               if row.kwargs.get('with_vectors') is False)
+
+
+def test_shadow_and_disabled_do_not_change_feed_or_ranking_pool(local_recommendation_corpus):
+    corpus = local_recommendation_corpus
+    retriever = _corpus_retriever(corpus, heavy=True)
+    social = social_for(corpus)
+    retriever.social_policy = SocialPolicy(mode='disabled')
+    disabled = retriever.recommend_batch(corpus.user_id, 10, [], 'same-generation', False, [], [social])
+    before = [row['id'] for row in retriever.ranker.calls[-1][2]]
+    retriever.social_policy = SocialPolicy(mode='shadow')
+    shadow = retriever.recommend_batch(corpus.user_id, 10, [], 'same-generation', False, [], [social])
+    assert disabled.items == shadow.items
+    assert before == [row['id'] for row in retriever.ranker.calls[-1][2]]
+    assert social.repo_id not in before
+    assert retriever._ranking_counter_snapshot()['social_shadow_candidates'] == 1
+    assert retriever._ranking_counter_snapshot()['social_injected_candidates'] == 0
+
+
+def test_excluded_or_ineligible_social_points_never_reach_ranker(local_recommendation_corpus):
+    from config import QDRANT_VECTOR_NAME
+    from embedding.vector_contract import REPOSITORY_SERVING_ELIGIBILITY_FIELD
+    corpus = local_recommendation_corpus
+    retriever = _corpus_retriever(corpus, heavy=True)
+    retriever.social_policy = SocialPolicy(mode='enabled')
+    social = social_for(corpus)
+    retriever.recommend_batch(corpus.user_id, 10, [social.repo_id], 'excluded', False, [], [social])
+    assert social.repo_id not in {row['id'] for row in retriever.ranker.calls[-1][2]}
+    corpus.client.set_payload(corpus.repository_collection,
+        payload={REPOSITORY_SERVING_ELIGIBILITY_FIELD: 'invalid'}, points=[social.repo_id])
+    retriever.recommend_batch(corpus.user_id, 10, [], 'invalid', False, [], [social])
+    assert social.repo_id not in {row['id'] for row in retriever.ranker.calls[-1][2]}
+
+
+def test_social_lookup_failure_does_not_hide_or_weaken_required_heavy_dependencies(local_recommendation_corpus, monkeypatch):
+    from retrieval.v2_retriever import RetrievalDependencyError
+    corpus = local_recommendation_corpus
+    retriever = _corpus_retriever(corpus, heavy=True)
+    retriever.social_policy = SocialPolicy(mode='enabled')
+    social = social_for(corpus)
+    monkeypatch.setattr(retriever, '_fetch_social_candidates', lambda ids: (_ for _ in ()).throw(TimeoutError('test outage')))
+    batch = retriever.recommend_batch(corpus.user_id, 10, [], 'outage', False, [], [social])
+    assert batch.ranker_applied
+    assert social.repo_id not in {item.repo_id for item in batch.items}
+    assert retriever._ranking_counter_snapshot()['social_lookup_failures'] == 1
+    retriever.ranker = None
+    with pytest.raises(RetrievalDependencyError, match='required V2 heavy'):
+        retriever.recommend_batch(corpus.user_id, 10, [], 'missing-model', False, [], [social])
+
+
+def test_registered_http_contract_accepts_backend_evidence_and_returns_source_scores(monkeypatch):
+    from fastapi.testclient import TestClient
+    from api.main import app
+    from retrieval.v2_retriever import RankedRepository, RecommendationBatch
+    from types import SimpleNamespace
+    seen = []
+    row = candidate(1)
+    def recommend(*args):
+        seen.append(args)
+        return RecommendationBatch(items=[RankedRepository(row.repo_id, .9, 'followed_owner', {'followed_owner': .5})],
+            model_version='test-heavy', embedding_version='repo-embedding-v2', ranker_applied=True, served_ranker='heavy')
+    monkeypatch.setenv('INTERNAL_API_SECRET', 'isolated-social-contract')
+    monkeypatch.setattr('api.v2.retriever', lambda: SimpleNamespace(recommend_batch=recommend))
+    body = {'schema_version':2,'generation_id':str(uuid.uuid4()),'user_id':str(uuid.uuid4()),
+            'feed_version':1,'limit':10,'context':{},'social_candidates':[row.model_dump()]}
+    client = TestClient(app)
+    response = client.post('/api/v2/recommendations/generate', headers={'x-internal-secret':'isolated-social-contract'}, json=body)
+    assert response.status_code == 200, response.text
+    assert seen[0][6] == [row]
+    assert response.json()['items'][0]['retrieval_scores'] == {'followed_owner': .5}
+    assert 'owner_github_id' not in response.json()['items'][0]
+    body['social_candidates'].append(row.model_dump())
+    assert client.post('/api/v2/recommendations/generate', headers={'x-internal-secret':'isolated-social-contract'}, json=body).status_code == 422
+    assert len(seen) == 1

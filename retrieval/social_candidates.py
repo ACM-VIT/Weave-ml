@@ -19,7 +19,7 @@ COLLABORATIVE_SOURCES = {'co_like', 'co_save', 'followed_like', 'followed_save',
 
 class SocialCandidate(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True, frozen=True)
-    repo_id: str
+    repo_id: str = Field(json_schema_extra={'format': 'uuid'})
     owner_github_id: Annotated[str, StringConstraints(pattern=r'^[1-9][0-9]{0,18}$')]
     source: SocialSource
     support: Annotated[int, Field(ge=1, le=100000)]
