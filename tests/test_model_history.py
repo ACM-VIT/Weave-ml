@@ -49,5 +49,10 @@ def test_actual_production_stages_compare_same_history_and_parent_refuses_forger
     assert result['qualified'] is False and set(result['results'])=={'single_vector','long_session'}
     assert validate_model_comparison(result,value)==result
     assert all(row['execution']['run']['timing_kind']=='measured' for row in result['results'].values())
+    assert all(row['execution']['configuration']['runtime']['retrieval_executor']['stages']['profile']['calls_total']==len(value.snapshot.profiles)
+               for row in result['results'].values())
+    cumulative=deepcopy(result)
+    cumulative['results']['long_session']['execution']['configuration']['runtime']['retrieval_executor']['stages']['profile']['calls_total']*=2
+    with pytest.raises(ValueError):validate_model_comparison(cumulative,value)
     forged=deepcopy(result);forged['storage'][next(iter(forged['storage']))]['feedback_version']='9'
     with pytest.raises(ValueError):validate_model_comparison(forged,value)

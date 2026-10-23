@@ -160,6 +160,15 @@ def compare_model_history(experiment, artifact_dir):
     snapshots, storage = derive_snapshots(experiment)
     results = {}
     for name, snapshot in snapshots.items():
+        # This module runs only in the owned offline worker. Drain/forget its
+        # idle executor between conditions so observations are per-condition,
+        # not cumulative statistics from the baseline or a previous replay.
+        from retrieval.runtime import retrieval_runtime_cleanup_actions, retrieval_runtime_status
+        status = retrieval_runtime_status()
+        if any(status.get(key, 0) for key in ('outstanding', 'running', 'waiting_submitters')):
+            raise RuntimeError('offline model comparison requires an idle owned retrieval executor')
+        for _, action in retrieval_runtime_cleanup_actions():
+            action()
         exported = execute_snapshot(snapshot, Path(artifact_dir))
         results[name] = {'execution': exported.model_dump(mode='json'),
                          'evaluation': evaluate(snapshot.bundle, exported.run, k=experiment.k)}
@@ -194,6 +203,9 @@ def validate_model_comparison(value, experiment):
         if (execution.snapshot_sha256 != digest(snapshot) or execution.bundle_sha256 != digest(snapshot.bundle)
                 or execution.artifacts != snapshot.artifacts or execution.as_of != snapshot.as_of or execution.seed != snapshot.seed):
             raise ValueError('worker executed a different frozen model input')
+        calls = execution.configuration.get('runtime', {}).get('retrieval_executor', {}).get('stages', {}).get('profile', {}).get('calls_total')
+        if type(calls) is not int or calls != len(snapshot.profiles):
+            raise ValueError('worker model condition includes cumulative or missing profile measurements')
         expected['results'][name] = {'execution': execution.model_dump(mode='json'),
                                       'evaluation': evaluate(snapshot.bundle, execution.run, k=experiment.k)}
     if json.dumps(value,sort_keys=True,allow_nan=False,separators=(',',':')) != json.dumps(expected,sort_keys=True,allow_nan=False,separators=(',',':')):
