@@ -48,8 +48,11 @@ class Measurement:
         self.transport = transport
         self.deadline = time.monotonic() + seconds
         self.calls: list[dict[str, Any]] = []
+        self.stopped = False
 
     def execute(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        if self.stopped:
+            raise RuntimeError("Comparison stopped after rate-limit reserve")
         if len(self.calls) >= MAX_CALLS or time.monotonic() >= self.deadline:
             raise RuntimeError("Comparison budget exhausted")
         record: dict[str, Any] = {"ok": False}
@@ -70,6 +73,7 @@ class Measurement:
             record.update(decoded_json_bytes=size, graphql_errors=bool(response.get("errors")),
                           cost=cost if type(cost) is int and cost >= 0 else None)
             if type(remaining) is int and remaining < 100:
+                self.stopped = True
                 raise RuntimeError("Rate-limit reserve reached")
             if time.monotonic() >= self.deadline:
                 raise RuntimeError("Comparison deadline exceeded")
@@ -99,21 +103,24 @@ def compare_repository(repository: str, measurement: Measurement) -> dict[str, A
     variables = {"owner": owner, "name": name}
     reference_start = len(measurement.calls)
     response = measurement.execute(REF_QUERY, variables)
+    shared_reference_requests = list(measurement.calls[reference_start:])
     data = response.get("data")
     repo = data.get("repository") if isinstance(data, dict) else None
     if response.get("errors") or not isinstance(repo, dict) or repo.get("visibility") != "PUBLIC":
-        return {"repository": repository, "status": "unresolved_or_nonpublic"}
+        return {"repository": repository, "status": "unresolved_or_nonpublic",
+                "shared_reference_requests": shared_reference_requests}
     ref = repo.get("defaultBranchRef")
     target = ref.get("target") if isinstance(ref, dict) else None
     commit = target.get("oid") if isinstance(target, dict) else None
     branch = ref.get("name") if isinstance(ref, dict) else None
     if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit) is None or not isinstance(branch, str) or not branch:
-        return {"repository": repository, "status": "unresolved_commit"}
+        return {"repository": repository, "status": "unresolved_commit",
+                "shared_reference_requests": shared_reference_requests}
 
     client = GitHubGraphQLClient(token="", max_retries=0, sleep_on_rate_limit=False)
     client.execute = measurement.execute
     result: dict[str, Any] = {"repository": repository, "commit": commit,
-                              "shared_reference_requests": list(measurement.calls[reference_start:]),
+                              "shared_reference_requests": shared_reference_requests,
                               "strategies": {}}
     try:
         for strategy in ("aliases", "metadata"):
@@ -124,11 +131,14 @@ def compare_repository(repository: str, measurement: Measurement) -> dict[str, A
                     query = query.rstrip().removesuffix("}") + "\n rateLimit { cost remaining resetAt }\n}"
                     raw = measurement.execute(query, variables)
                     value = client._get_readme_legacy(owner, name, response=raw)
+                    if value and value.default_branch != branch:
+                        result["reference_changed"] = True
+                        raise ValueError("Default branch changed during comparison")
                 else:
                     manifest = client._readme_manifest(owner, name, commit)
                     text = client._readme_blob(owner, name, manifest.blob_oid, manifest.byte_size) if manifest.blob_oid else ""
                     value = FetchedReadme(text, source_path=manifest.source_path,
-                                         default_branch=branch if text else None,
+                                         default_branch=branch,
                                          base_url=build_readme_base_url(owner, name, branch, manifest.source_path, source_commit=commit) if text else None)
                 result["strategies"][strategy] = {"status": "content" if value else "missing", **_artifact(value)}
             except Exception:

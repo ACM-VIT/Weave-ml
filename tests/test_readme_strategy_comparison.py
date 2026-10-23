@@ -62,8 +62,11 @@ def test_real_parsers_preserve_precedence_and_content(files, path):
     transport = Fixture(files)
     measured = Measurement(transport)
     result = compare_repository("Example/project", measured)
-    assert result["content_path_branch_equal"] is True
+    assert result["content_path_branch_equal"] is bool(files)
     assert result["strategies"]["metadata"]["source_path"] == path
+    assert result["strategies"]["metadata"]["default_branch"] == transport.branch
+    if not files:
+        assert result["strategies"]["aliases"]["default_branch"] is None
     assert len(measured.calls) == (4 if files else 3)
     assert all(call["cost"] == 1 for call in measured.calls)
     if files:
@@ -173,3 +176,59 @@ def test_invalid_samples_rejected(tmp_path, repos):
     path.write_text(json.dumps({"repositories": repos}))
     with pytest.raises(ValueError):
         load_sample(path)
+
+
+
+def test_reaching_rate_reserve_prevents_all_later_strategy_requests():
+    fixture = Fixture({"README.md": "content"})
+    def transport(query, variables):
+        response = fixture(query, variables)
+        if len(fixture.queries) == 2:
+            response["data"]["rateLimit"]["remaining"] = 99
+        return response
+    measured = Measurement(transport)
+    result = compare_repository("Example/project", measured)
+    assert len(fixture.queries) == 2
+    assert len(measured.calls) == 2
+    assert result["status"] == "inconclusive"
+    assert result["strategies"]["metadata"]["requests"] == []
+    with pytest.raises(RuntimeError, match="reserve"):
+        measured.execute("query", {})
+    assert len(fixture.queries) == 2
+
+
+@pytest.mark.parametrize("failure", ["graphql_errors", "no_commit", "nonpublic"])
+def test_early_return_retains_shared_reference_measurements(failure):
+    fixture = Fixture()
+    def transport(query, variables):
+        response = fixture(query, variables)
+        if failure == "graphql_errors":
+            response["errors"] = [{"message": "never retain provider details"}]
+        elif failure == "no_commit":
+            response["data"]["repository"]["defaultBranchRef"] = None
+        else:
+            response["data"]["repository"]["visibility"] = "PRIVATE"
+        return response
+    measured = Measurement(transport)
+    result = compare_repository("Example/project", measured)
+    assert result["shared_reference_requests"] == measured.calls
+    assert len(result["shared_reference_requests"]) == 1
+    request = result["shared_reference_requests"][0]
+    assert request["cost"] == 1 and request["decoded_json_bytes"] > 0
+    assert request["elapsed_ms"] >= 0
+    assert request["graphql_errors"] is (failure == "graphql_errors")
+    assert "never retain" not in json.dumps(result)
+
+
+def test_default_branch_change_is_inconclusive_even_with_same_commit_content():
+    fixture = Fixture({"README.md": "unchanged content"})
+    def transport(query, variables):
+        response = fixture(query, variables)
+        if "query GetReadme(" in query:
+            response["data"]["repository"]["defaultBranchRef"]["name"] = "other-branch"
+        return response
+    result = compare_repository("Example/project", Measurement(transport))
+    assert result["reference_changed"] is True
+    assert result["status"] == "inconclusive"
+    assert result["content_path_branch_equal"] is False
+    assert result["strategies"]["metadata"]["status"] == "content"
