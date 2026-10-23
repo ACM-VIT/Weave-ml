@@ -16,13 +16,37 @@ from unittest.mock import patch
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def source_hashes():
+    # Conservatively fingerprint all tracked project Python code, including
+    # setup constructors and their transitive project helpers. The script is
+    # included explicitly while it is still an untracked development tool.
+    names = subprocess.check_output(
+        ['git', 'ls-files', '-z', '--', '*.py', 'pyproject.toml', 'uv.lock'], cwd=ROOT,
+    ).decode().split('\0')
+    paths = {ROOT / name for name in names if name}
+    paths.add(Path(__file__).resolve())
+    return {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(paths)}
+
+
+def require_sources(expected):
+    if source_hashes() != expected:
+        raise RuntimeError('project source changed during measurement; discard this comparison')
+    return expected
+
+
+_IMPORTED_SOURCE_SHA256 = source_hashes()
+
 import numpy as np
 import torch
 
 from inference.feature_spec import EMBEDDING_DIM
 from inference.ranker_service import RankerService
 
-ARTIFACTS = Path(__file__).resolve().parents[1] / "inference"
+ARTIFACTS = ROOT / "inference"
 
 
 def validate_artifacts(directory: Path) -> dict:
@@ -127,10 +151,38 @@ def profile_stages(service, user, skills, candidates, repeats, device):
     return {key: summary(values) for key, values in totals.items()}
 
 
+def compare_timed_compact(samples, reference):
+    """Compare every timed compact output by ID, not a later diagnostic call."""
+    reference_ids = tuple(row['repo_id'] for row in reference)
+    if not samples or not reference_ids or len(set(reference_ids)) != len(reference_ids):
+        raise ValueError('Invalid compact reference/sample identities')
+    expected = {row['repo_id']: float(row['final_score']) for row in reference}
+    right = np.asarray([expected[key] for key in reference_ids], dtype=np.float64)
+    if not np.all(np.isfinite(right)):
+        raise ValueError('Non-finite compact reference')
+    maximum = 0.0
+    order_equal = True
+    for sample in samples:
+        ids = tuple(key for key, _ in sample)
+        if len(ids) != len(reference_ids) or len(set(ids)) != len(ids) or set(ids) != set(reference_ids):
+            raise ValueError('Timed compact output changed candidate identities')
+        actual = dict(sample)
+        left = np.asarray([actual[key] for key in reference_ids], dtype=np.float64)
+        if not np.all(np.isfinite(left)):
+            raise ValueError('Non-finite timed compact output')
+        np.testing.assert_allclose(left, right, rtol=1e-5, atol=1e-6)
+        maximum = max(maximum, float(np.max(np.abs(left-right))))
+        order_equal = order_equal and ids == reference_ids
+    return maximum, order_equal
+
+
 def run_case(device: str, count: int, repeats: int, threads: int, directory: Path = ARTIFACTS) -> dict:
+    sources = require_sources(_IMPORTED_SOURCE_SHA256)
     previous_threads = torch.get_num_threads()
     try:
-        return _run_case(device, count, repeats, threads, directory)
+        result = _run_case(device, count, repeats, threads, directory)
+        require_sources(sources)
+        return {**result, 'source_sha256': dict(sources)}
     finally:
         torch.set_num_threads(previous_threads)
 
@@ -164,9 +216,11 @@ def _run_case(device: str, count: int, repeats: int, threads: int, directory: Pa
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     samples = []
+    timed_outputs = []
     for _ in range(repeats):
         actual, duration = _timed(invoke, device)
         samples.append(duration)
+        timed_outputs.append(tuple((row['repo_id'], float(row['final_score'])) for row in actual))
     stages = profile_stages(service, user, skills, candidates, repeats, device)
     rss_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     cuda_peak = torch.cuda.max_memory_allocated() if device == "cuda" else None
@@ -185,6 +239,8 @@ def _run_case(device: str, count: int, repeats: int, threads: int, directory: Pa
         right = np.array(list(expected["predictions"].values()) + [expected["final_score"]])
         np.testing.assert_allclose(left, right, rtol=1e-5, atol=1e-6)
         max_error = max(max_error, float(np.max(np.abs(left - right))))
+    compact_error, compact_order_equal = compare_timed_compact(timed_outputs, reference)
+    max_error = max(max_error, compact_error)
     times = summary(samples)
     return {"device": device, "candidates": count, "status": "measured",
             "device_name": torch.cuda.get_device_name() if device == "cuda" else platform.processor(),
@@ -195,8 +251,10 @@ def _run_case(device: str, count: int, repeats: int, threads: int, directory: Pa
             "candidates_per_second": count * repeats * 1000 / sum(samples),
             "instrumented_stages": stages, "process_peak_rss_kib": rss_kib,
             "cuda_peak_allocated_bytes": cuda_peak,
+            "cuda_peak_allocated_bytes_scope": "post_warmup_headline_and_instrumented_calls",
+            "timed_compact_max_abs_error": compact_error,
             "cpu_reference_max_abs_error": max_error,
-            "cpu_reference_order_equal": [r["repo_id"] for r in actual] == [r["repo_id"] for r in reference]}
+            "cpu_reference_order_equal": compact_order_equal}
 
 
 def main(argv=None):
@@ -216,6 +274,7 @@ def main(argv=None):
             parser.error("Child device run requires one candidate size")
         print(json.dumps(run_case(args.device, args.counts[0], args.repeats, args.threads, args.artifact_dir)))
         return 0
+    sources = require_sources(_IMPORTED_SOURCE_SHA256)
     results = []
     for device in ("cpu", "cuda"):
         for count in args.counts:
@@ -225,11 +284,12 @@ def main(argv=None):
             start = time.perf_counter()
             child = subprocess.run(command, capture_output=True, text=True, timeout=180, check=True)
             row = json.loads(child.stdout)
+            require_sources(sources)
+            if row.get('source_sha256') != sources:
+                raise RuntimeError('child measured different project sources; discard this matrix')
             row["process_wall_ms"] = (time.perf_counter() - start) * 1000
             results.append(row)
-    sources = {str(path.relative_to(ARTIFACTS.parent)): hashlib.sha256(path.read_bytes()).hexdigest()
-               for path in (Path(__file__).resolve(), ARTIFACTS / "ranker_service.py",
-                            ARTIFACTS / "feature_spec.py", ARTIFACTS / "value_function.py")}
+    require_sources(sources)
     print(json.dumps({"schema": "ranker-device-diagnostic-v1", "python": platform.python_version(),
                       "recorded_at": datetime.now(timezone.utc).isoformat(), "source_sha256": sources,
                       "torch": torch.__version__, "platform": platform.platform(),
