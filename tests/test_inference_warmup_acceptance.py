@@ -270,3 +270,24 @@ def test_explicit_optional_ranker_failure_is_reported_without_claiming_heavy_rea
         assert startup.runtime.ranker is None
         assert startup.app.state.inference_warmup_ready is True
     assert startup.closed.wait(2)
+
+
+def test_profile_fingerprint_includes_onboarding_and_detects_setup_only_changes(tmp_path, monkeypatch):
+    from scripts import profile_inference_warmup as profile
+    names = ['scripts/profile_inference_warmup.py','scripts/user_onboarding.py',
+             'embedding/runtime.py','inference/ranker_service.py','api/main.py',
+             'inference/feature_spec.py','inference/value_function.py',
+             'scripts/benchmark_ranker_devices.py']
+    for name in names:
+        target = tmp_path/name
+        target.parent.mkdir(parents=True,exist_ok=True)
+        target.write_text('original source\n')
+    monkeypatch.setattr(profile,'ROOT',tmp_path)
+    monkeypatch.setattr(profile,'__file__',str(tmp_path/names[0]))
+    monkeypatch.setattr(profile.subprocess,'check_output',lambda *a,**kw:('\0'.join(names)+'\0').encode())
+    before=profile.source_hashes()
+    (tmp_path/'scripts/user_onboarding.py').write_text('changed timed constructor\n')
+    assert 'scripts/user_onboarding.py' in before
+    assert profile.source_hashes()!=before
+    with pytest.raises(RuntimeError,match='source changed'):
+        profile.require_sources(before)

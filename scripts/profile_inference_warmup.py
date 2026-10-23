@@ -24,6 +24,7 @@ def validate_options(candidates,repeats,threads):
 def child_profile(mode,candidates,repeats,threads):
     validate_options(candidates,repeats,threads)
     if mode not in {'load_only_control','warmup'}: raise ValueError('invalid profile mode')
+    sources=source_hashes()
     # Scope is this disposable child. No production environment/config is edited.
     os.environ.update(HF_HUB_OFFLINE='1',TRANSFORMERS_OFFLINE='1',HF_HUB_DISABLE_TELEMETRY='1',
                       EMBEDDING_CPU_THREADS=str(threads),EMBEDDING_MAX_CONCURRENCY='1',CUDA_VISIBLE_DEVICES='')
@@ -119,7 +120,7 @@ def child_profile(mode,candidates,repeats,threads):
             _,duration=timed(encode);encode_samples.append(duration)
             _,duration=timed(score);score_samples.append(duration)
         if network_attempts: raise AssertionError('offline warmup attempted a socket connection')
-        return {'mode':mode,'network_connection_attempts':len(network_attempts),'device':str(ranker.device),'threads':torch.get_num_threads(),
+        result={'mode':mode,'network_connection_attempts':len(network_attempts),'device':str(ranker.device),'threads':torch.get_num_threads(),
             'candidates':candidates,'encoder_device':str(model._model.device),'encoder_model':REPOSITORY_EMBEDDING_MODEL,
             'encoder_revision':EMBEDDING_MODEL_REVISION,'ranker_input_dim':INPUT_DIM,
             'artifact_provenance':provenance,'model_setup_ms':setup_ms,'warmup_ms':warmup_ms,
@@ -132,13 +133,28 @@ def child_profile(mode,candidates,repeats,threads):
             'parity':{'embedding':first_embedding[0].tolist(),
                       'ids':[row['repo_id'] for row in first_scores],
                       'scores':[float(row['final_score']) for row in first_scores]}}
+        require_sources(sources)
+        result['source_sha256']=sources
+        return result
 
 
 def source_hashes():
-    paths=[Path(__file__).resolve(),ROOT/'embedding/runtime.py',ROOT/'inference/ranker_service.py',
-           ROOT/'api/main.py',ROOT/'inference/feature_spec.py',ROOT/'inference/value_function.py',
-           ROOT/'scripts/benchmark_ranker_devices.py']
-    return {str(path.relative_to(ROOT)):hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+    # Conservatively fingerprint all tracked project Python code, including
+    # setup constructors and their transitive project helpers. The script is
+    # included explicitly while it is still an untracked development tool.
+    names = subprocess.check_output(
+        ['git', 'ls-files', '-z', '--', '*.py', 'pyproject.toml', 'uv.lock'], cwd=ROOT,
+    ).decode().split('\0')
+    paths = {ROOT / name for name in names if name}
+    paths.add(Path(__file__).resolve())
+    return {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(paths)}
+
+
+def require_sources(expected):
+    if source_hashes() != expected:
+        raise RuntimeError('project source changed during measurement; discard this comparison')
+    return expected
 
 
 def main(argv=None):
@@ -161,6 +177,8 @@ def main(argv=None):
             '--candidates',str(args.candidates),'--repeats',str(args.repeats),'--threads',str(args.threads)],
             cwd=ROOT,check=True,capture_output=True,text=True,timeout=180)
         row=json.loads(result.stdout)
+        require_sources(sources)
+        if row.get('source_sha256')!=sources: raise RuntimeError('child measured different project sources; discard this comparison')
         row['process_wall_ms']=(time.perf_counter()-began)*1000
         rows.append(row)
     import numpy as np
