@@ -662,10 +662,12 @@
       },
       "RepositoryFeaturePatch": {
         "additionalProperties": false,
+        "description": "Mutable observations plus optional, validated derived-score echoes.\n\n``pushed_days_ago`` is the producer's age at its observation anchor. The\nrefresh service never advances it from wall-clock time or infers it from\n``pushed_at``. Ranking scores are server-owned; callers may include them\nfor compatibility, but the refresh service requires exact agreement with\nthe effective score. It recomputes a score only when one of that score's\nsource observations changes.",
         "properties": {
           "activity_score": {
             "anyOf": [
               {
+                "description": "Optional echo of the server-derived activity score.",
                 "maximum": 1.0,
                 "minimum": 0.0,
                 "type": "number"
@@ -679,6 +681,7 @@
           "code_health": {
             "anyOf": [
               {
+                "description": "Optional echo of the server-derived code health score.",
                 "maximum": 1.0,
                 "minimum": 0.0,
                 "type": "number"
@@ -821,6 +824,7 @@
           "pushed_days_ago": {
             "anyOf": [
               {
+                "description": "Repository push age at the producer's observation anchor.",
                 "maximum": 100000.0,
                 "minimum": 0.0,
                 "type": "integer"
@@ -847,6 +851,7 @@
           "trend_velocity": {
             "anyOf": [
               {
+                "description": "Optional echo of the server-derived trend velocity.",
                 "maximum": 1.0,
                 "minimum": 0.0,
                 "type": "number"

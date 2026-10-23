@@ -262,7 +262,11 @@ async def service_http_error(request: Request, exc: StarletteHTTPException):
             else exc.status_code in {408, 425, 429, 502, 503, 504}
         ),
         headers=dict(exc.headers or {}),
-        details=explicit_details if isinstance(explicit_details, dict) else None,
+        details=(
+            explicit_details
+            if isinstance(explicit_details, (dict, list))
+            else None
+        ),
     )
 
 
