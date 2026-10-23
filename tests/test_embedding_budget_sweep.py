@@ -52,6 +52,24 @@ def test_uncapped_control_matches_existing_full_pipeline(version):
     assert measured["retained_readme_chunks"] == actual.readme_chunks
 
 
+@pytest.mark.parametrize("version", ["repo-embedding-v2", TOKEN_SECTION_EMBEDDING_VERSION])
+def test_supplied_repository_uses_exact_metadata_and_matches_full_pipeline(version):
+    repo = {"repo_id": "00000000-0000-4000-8000-000000000058", "full_name": "canonical/real-input",
+        "description": "Exact supplied metadata with Unicode café", "readme": case()["readme"],
+        "topics": ["storage", "vectors"], "languages": ["Rust"], "content_version": 7}
+    fixture = {"name": repo["repo_id"], "readme": repo["readme"], "repository": repo}
+    model = Encoder()
+    measured = encode_job(fixture, version=version, model=model, budget=None)
+    pipeline = RepositoryEmbeddingPipeline(config=RepositoryEmbeddingConfig(version=version),
+        embedder=SentenceTransformerEmbedder(model=Encoder()), card_summarizer=Summary())
+    actual = pipeline.embed_repository(repo)
+    assert np.allclose(measured["final_vector"], actual.final_embedding, atol=1e-7)
+    assert measured["name"] == repo["repo_id"]
+    assert any("Exact supplied metadata" in text for text in model.texts)
+    assert all(len(label) == 64 for label in measured["heading_label_presence"])
+    assert repo["description"] not in str(measured)
+
+
 def test_total_budget_reserves_mandatory_towers_and_stops_at_prefix_boundary():
     assert select_prefix([64, 64, 10], [20, 10], Budget(4, 158)) == 2
     # It cannot skip a large earlier chunk to choose a smaller later one.
@@ -92,7 +110,7 @@ def test_network_guard_fails_closed_and_restores_socket():
     assert socket.create_connection is original
 
 
-@pytest.mark.parametrize("field", ["source_hashes", "fixtures", "model_revision"])
+@pytest.mark.parametrize("field", ["source_hashes", "fixtures", "model_revision", "input_fixture_sha256", "query_vector_sha256"])
 def test_changing_inputs_cannot_produce_a_budget_comparison(field):
     from copy import deepcopy
     group = {"source_hashes": {"encoder": "original"}, "fixtures": [{"name": "readme", "sha256": "a"}], "model_revision": "pinned", "max_seq_length": 256}
@@ -137,7 +155,7 @@ def test_measured_wrapper_reuses_counts_without_a_second_tokenizer_pass():
 
 def test_source_identity_includes_cleaner_and_changes_with_its_bytes(monkeypatch, tmp_path):
     from scripts import sweep_embedding_budget as bench
-    names = ["utils/readme_processor.py", "embedding/readme_embedding.py", "embedding/embeddings.py", "embedding/repository_embedding.py", "embedding/runtime.py", "config.py", "scripts/sweep_embedding_budget.py", "pyproject.toml", "uv.lock"]
+    names = ["utils/readme_processor.py", "embedding/readme_embedding.py", "embedding/embeddings.py", "embedding/repository_embedding.py", "embedding/runtime.py", "config.py", "scripts/sweep_embedding_budget.py", "evaluation/embedding_budget.py", "pyproject.toml", "uv.lock"]
     for name in names:
         target = tmp_path / name
         target.parent.mkdir(parents=True, exist_ok=True)
