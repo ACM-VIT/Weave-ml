@@ -94,6 +94,38 @@ def test_default_policy_keeps_prepared_observations_inert(monkeypatch):
     assert not any(getattr(item, 'key', '').startswith('lifecycle_') for item in (retriever._eligible_filter().must_not or []))
 
 
+@pytest.mark.parametrize('flag', ['archived', 'disabled'])
+@pytest.mark.parametrize('exclude_seen', [False, True])
+def test_search_lifecycle_exclusions_apply_before_limit(monkeypatch, flag, exclude_seen):
+    from api.search import search_repositories
+    from tests.test_repository_search import request
+    monkeypatch.setenv('V2_REPOSITORY_LIFECYCLE_POLICY', 'verified-status-v1')
+    client = QdrantClient(':memory:')
+    collection = 'lifecycle-search'
+    client.create_collection(collection, vectors_config={QDRANT_VECTOR_NAME: models.VectorParams(
+        size=REPOSITORY_EMBEDDING_DIM, distance=models.Distance.COSINE)})
+    excluded, seen, active = [str(uuid.uuid4()) for _ in range(3)]
+    query = [1.] + [0.] * (REPOSITORY_EMBEDDING_DIM - 1)
+    rows = []
+    for repo_id, similarity, lifecycle in [
+        (excluded, 1., observation(**{flag: True})),
+        (seen, .9, None), (active, .8, observation()),
+    ]:
+        vector = [similarity, (1 - similarity ** 2) ** .5] + [0.] * (REPOSITORY_EMBEDDING_DIM - 2)
+        rows.append(models.PointStruct(id=repo_id, vector={QDRANT_VECTOR_NAME: vector},
+            payload=_repository_payload(repo_id, primary_language='Python', topics=['vision'],
+                                        **merge_lifecycle({}, lifecycle))))
+    try:
+        client.upsert(collection, rows)
+        retriever = QdrantV2Retriever(client=client, repository_collection=collection, heavy_ranker_enabled=False)
+        result = search_repositories(request(limit=1, exclude_repo_ids=[seen] if exclude_seen else [],
+            filters={'languages': ['Python'], 'topics': ['vision']}), retriever,
+            SimpleNamespace(embed_text=lambda _: query))
+        assert [item['repo_id'] for item in result['items']] == [active if exclude_seen else seen]
+    finally:
+        client.close()
+
+
 def test_refresh_cas_persists_status_without_reembedding_and_rejects_conflict():
     client, store, original = _indexed_feature_refresh_fixture()
     original_vector = original.vector
@@ -155,6 +187,46 @@ def test_delayed_archive_refresh_survives_newer_stats_version_without_rewinding_
     assert stored.payload['lifecycle_archived'] is True
     assert stored.payload['feature_version'] == 20 and stored.payload['star_count'] == 99
     client.close()
+
+
+@pytest.mark.parametrize('winning_version', [10, 20])
+@pytest.mark.parametrize('lifecycle', [observation(archived=True, day=2),
+                                     observation(disabled=True, day=2), observation(day=2)])
+def test_refresh_cas_race_retries_lifecycle_without_rewinding_stats(winning_version, lifecycle):
+    from api.v2 import V2ServiceHTTPException
+    client, store, original = _indexed_feature_refresh_fixture()
+    # Also exercise restoration of an already archived repository.
+    initial = merge_lifecycle({}, observation(archived=True)) if not (
+        lifecycle['archived'] or lifecycle['disabled']) else {}
+    client.set_payload(store.collection_name, {'feature_version': 5, **initial}, [original.id])
+    winning_features = {'feature_version': winning_version, 'feature_job_id': str(uuid.uuid4()), 'star_count': 99}
+    request = RepositoryRefreshJob(schema_version=2, job_id=uuid.uuid4(), repo_id=original.id,
+        feature_version=10, features={'star_count': 1, 'lifecycle': lifecycle})
+    actual_cas = store.compare_and_set_features
+    def publish_stats_before_cas(**kwargs):
+        client.set_payload(store.collection_name, winning_features, [original.id])
+        # The real Qdrant CAS rejects the stale feature snapshot and reads back
+        # the stats winner; it has not persisted this request's lifecycle.
+        return actual_cas(**kwargs)
+    try:
+        with patch('api.v2.repository_store', return_value=store), patch('api.v2._repository_points', side_effect=lambda _:
+            client.retrieve(store.collection_name, [original.id], with_payload=True, with_vectors=True)):
+            with patch.object(store, 'compare_and_set_features', side_effect=publish_stats_before_cas):
+                with pytest.raises(V2ServiceHTTPException) as conflict:
+                    _refresh_repository_job_locked(request, OwnedLock())
+            assert conflict.value.status_code == 503
+            assert conflict.value.retryable is True
+            assert conflict.value.headers['Retry-After'] == '2'
+            result = _refresh_repository_job_locked(request, OwnedLock())
+        assert result['status'] == 'current'
+        assert result['feature_version'] == winning_version
+        stored = client.retrieve(store.collection_name, [original.id], with_payload=True, with_vectors=True)[0]
+        for field, value in {**winning_features, **merge_lifecycle(initial, lifecycle)}.items():
+            assert stored.payload[field] == value
+        assert stored.payload['content_version'] == original.payload['content_version']
+        assert stored.vector == original.vector
+    finally:
+        client.close()
 
 
 def test_independent_lifecycle_cas_fences_stale_content_and_feature_writers():

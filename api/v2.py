@@ -1122,6 +1122,20 @@ def _refresh_repository_job_locked(
         },
     )
     lock.assert_owned()
+    # A stats writer can advance the feature revision after our initial read,
+    # fencing out this independent status observation too. Do not acknowledge
+    # or permanently reject the job until its lifecycle has been persisted.
+    actual_payload = dict(stored.payload or {}) if stored is not None else {}
+    if lifecycle is not None and any(
+        actual_payload.get(field) != value for field, value in lifecycle_features.items()
+    ):
+        raise V2ServiceHTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Repository lifecycle state changed during the write; retry the request.",
+            error_code="CONCURRENT_REPOSITORY_WRITE",
+            retryable=True,
+            headers={"Retry-After": "2"},
+        )
     final_status, final_version = _repository_cas_outcome(
         stored,
         version_field="feature_version",
