@@ -195,6 +195,8 @@ def test_actual_api_factories_and_server_write_settling_after_lost_ack(owned_aut
         raw_upsert=store.client.upsert
         outcomes=[]
         def delayed_server_write(**kwargs):
+            # Simulate delayed client dispatch after an injected error. The
+            # separate HTTP-proxy test covers a real server-accepted lost reply.
             nonlocal thread
             def later():
                 try:

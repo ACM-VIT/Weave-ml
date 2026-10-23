@@ -16,12 +16,17 @@ from inference.scoring_provenance import (
 def identifier(n): return str(uuid.UUID(int=n))
 
 
-def frame(n):
+def raw_input(n):
     values = [float(i)/100 for i in range(778)]
     values[400] = n/100
-    return ScoredFrame(identifier(1),identifier(2),RepositorySnapshot(repo_id=identifier(100+n),
+    return struct.pack('<778f',*values)
+
+
+def frame(n, ctx=None):
+    ctx = context() if ctx is None else ctx
+    return ScoredFrame(ctx.user_id,ctx.generation_id,RepositorySnapshot(repo_id=identifier(100+n),
         content_version='1',feature_version='0',content_hash='a'*64,source_hash='b'*64,embedding_version_index=0),
-        struct.pack('<778f',*values))
+        raw_input(n),ctx)
 
 
 def context():
@@ -29,7 +34,7 @@ def context():
         profile_version='2',feedback_version='3',feedback_state_revision='4',
         embedding_model='all-MiniLM-L6-v2',embedding_revision='c'*40,user_embedding_version=None,
         repository_embedding_versions=('repo-embedding-v2',),
-        user_vector_sha256=hashlib.sha256(frame(1).input_bytes[:1536]).hexdigest(),
+        user_vector_sha256=hashlib.sha256(raw_input(1)[:1536]).hexdigest(),
         model_version='heavy-ranker-v2',model_sha256='d'*64,scaler_sha256='e'*64,manifest_sha256='f'*64,
         feature_spec_version='v2',feature_order_sha256=hashlib.sha256(json.dumps(FEATURE_ORDER,separators=(',',':')).encode()).hexdigest(),
         code_commit='a'*40)
@@ -106,7 +111,7 @@ def test_exact_wire_budget_holds_for_every_allowed_output_size_including_max_ver
         'feed_version':str(2**63-1),'profile_version':str(2**63-1),'feedback_version':str(2**63-1),'feedback_state_revision':str(2**63-1),
         'user_embedding_version':character*128,'scored_at':'2026-10-23T00:00:00.'+'1'*19+'Z',
         'repository_embedding_versions':tuple(character*127+str(i) for i in range(8))})
-    frames=tuple(replace(frame(i),snapshot=frame(i).snapshot.model_copy(update={
+    frames=tuple(replace(frame(i,ctx),snapshot=frame(i,ctx).snapshot.model_copy(update={
         'content_version':str(2**63-1),'feature_version':str(2**63-1),'embedding_version_index':i%8})) for i in range(150))
     sizes=[]
     for count in range(151):
@@ -286,3 +291,51 @@ def test_copied_context_cannot_mutate_another_threads_capture_but_snapshots_rema
         decoded=pool.submit(decode_owned_packet,packet,ctx,owner_user_id=ctx.user_id,
             generation_id=ctx.generation_id,repo_id=snapshots[0].snapshot.repo_id).result(timeout=5)
         assert decoded==snapshots[0].input_bytes
+
+
+@pytest.mark.parametrize('field,value', [
+    ('profile_version','9'), ('feedback_version','8'), ('feedback_state_revision','7'),
+    ('model_sha256','0'*64), ('scaler_sha256','1'*64), ('code_commit','b'*40),
+])
+def test_saved_frame_cannot_be_rebound_to_another_valid_scoring_context(field,value):
+    ctx=context();item=frame(0,ctx)
+    changed=ScoringContext.model_validate({**ctx.model_dump(),field:value})
+    with pytest.raises(ValueError,match='context'):
+        packet_for_frame(item,changed)
+    with pytest.raises(ValueError,match='context'):
+        seal_scoring_response(response(1),changed,(item,))
+    assert decode_owned_packet(packet_for_frame(item,ctx),ctx,owner_user_id=ctx.user_id,
+        generation_id=ctx.generation_id,repo_id=item.snapshot.repo_id)==item.input_bytes
+
+
+def test_actual_captured_frame_keeps_capture_time_context(actual_capture_ranker):
+    import numpy as np
+    from inference.scoring_provenance import capture_scored_inputs
+    ranker=actual_capture_ranker;user=np.zeros(384,dtype=np.float32)
+    ctx=actual_context(ranker,user=user)
+    with capture_scored_inputs(ctx) as capture:
+        ranker.score_batch_compact(user,[],actual_candidates(ranker,1))
+        item=capture.frames[0]
+        assert item.context is ctx
+    changed=ScoringContext.model_validate({**ctx.model_dump(),'profile_version':'9'})
+    with pytest.raises(ValueError,match='context'):
+        packet_for_frame(item,changed)
+    assert packet_for_frame(item,ctx).snapshot.repo_id==item.snapshot.repo_id
+
+
+def test_copied_context_on_owner_thread_cannot_record_after_scope_exit(actual_capture_ranker):
+    import numpy as np
+    from contextvars import copy_context
+    from inference.scoring_provenance import capture_scored_inputs
+    ranker=actual_capture_ranker;user=np.zeros(384,dtype=np.float32)
+    ctx=actual_context(ranker,user=user)
+    with capture_scored_inputs(ctx) as capture:
+        copied=copy_context()
+        ranker.score_batch_compact(user,[],actual_candidates(ranker,1))
+        saved=capture.frames
+    assert capture.frames==()
+    with pytest.raises(ValueError,match='closed'):
+        copied.run(ranker.score_batch_compact,user,[],actual_candidates(ranker,1))
+    assert capture.frames==()
+    assert packet_for_frame(saved[0],ctx).snapshot.repo_id==saved[0].snapshot.repo_id
+    assert len(ranker.score_batch_compact(user,[],actual_candidates(ranker,1)))==1
