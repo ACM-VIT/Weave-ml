@@ -51,6 +51,49 @@ DATA_KEYS = (
 )
 
 
+
+
+def training_array_sha256(arrays):
+    """Hash the exact validated arrays used, independent of NPZ compression."""
+    checksum = hashlib.sha256()
+    for key in DATA_KEYS:
+        value = np.ascontiguousarray(arrays[key])
+        if value.dtype.hasobject:
+            raise ValueError("training source cannot contain object arrays")
+        header = json.dumps({"name": key, "dtype": value.dtype.str,
+                             "shape": list(value.shape)}, sort_keys=True,
+                            separators=(",", ":")).encode()
+        checksum.update(len(header).to_bytes(8, "big"))
+        checksum.update(header)
+        checksum.update(value.nbytes.to_bytes(8, "big"))
+        checksum.update(value.tobytes(order="C"))
+    return checksum.hexdigest()
+
+
+def training_source_identity():
+    """Local-only exact code identity; no remote fallback or symbolic revision."""
+    import os
+    import subprocess
+    environment = {**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0",
+                   "GIT_OPTIONAL_LOCKS": "0"}
+    def git(*arguments):
+        return subprocess.check_output(["git", "--no-lazy-fetch", "--no-pager", *arguments],
+            cwd=REPO_ROOT, env=environment, timeout=5)
+    try:
+        commit = git("rev-parse", "HEAD").decode().strip()
+        if len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
+            raise ValueError("training requires an exact Git commit")
+        names = git("ls-files", "-z", "--", "*.py", "pyproject.toml", "uv.lock").decode().split("\0")
+        hashes = {name: hashlib.sha256((REPO_ROOT / name).read_bytes()).hexdigest()
+                  for name in sorted(names) if name}
+        if not hashes:
+            raise ValueError("training source inventory is empty")
+        return {"code_commit": commit, "source_tree_dirty": bool(git("status", "--porcelain", "--untracked-files=normal")),
+                "source_sha256": hashes}
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("training provenance requires compatible local-only Git and readable source") from exc
+
+
 def load_training_data(data_path: str | Path) -> dict[str, np.ndarray]:
     """Load and validate the arrays required by the ranker trainer."""
     with np.load(data_path) as data:
@@ -269,6 +312,8 @@ def train(
         raise ValueError("code_version must be a non-empty string")
 
     arrays = load_training_data(data_path)
+    dataset_sha256 = training_array_sha256(arrays)
+    source_identity = training_source_identity()
     split_index = chronological_split_index(len(arrays["dense_features"]))
     scaled_dense, scaler_mean, scaler_scale = standardize_dense_features(
         arrays["dense_features"], fit_rows=split_index,
@@ -332,6 +377,11 @@ def train(
             f"val_loss={final_val_loss:.6f}"
         )
 
+    calibration = calibration_metrics(model, val_loader, device)
+    if training_source_identity() != source_identity:
+        raise ValueError("training source changed before artifact export")
+    if training_array_sha256(arrays) != dataset_sha256:
+        raise ValueError("training input arrays changed during training")
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     model_path = destination / "heavy_ranker.pt"
@@ -347,13 +397,15 @@ def train(
         + "\n",
         encoding="utf-8",
     )
-    calibration = calibration_metrics(model, val_loader, device)
     manifest = {
         "model_file": model_path.name,
         "scaler_file": scaler_path.name,
         "model_version": model_version,
         "embedding_version": REPOSITORY_EMBEDDING_VERSION,
         "embedding_model": REPOSITORY_EMBEDDING_MODEL,
+        "embedding_identity": {"model": REPOSITORY_EMBEDDING_MODEL, "revision": EMBEDDING_MODEL_REVISION,
+            "dimension": EMBEDDING_DIM, "pooling": "mean", "normalized": True,
+            "query_prompt": "", "document_prompt": "", "recipe": REPOSITORY_EMBEDDING_VERSION},
         "embedding_model_revision": EMBEDDING_MODEL_REVISION,
         "compatible_embedding_versions": [REPOSITORY_EMBEDDING_VERSION],
         "feature_spec_version": FEATURE_SPEC_VERSION,
@@ -365,11 +417,17 @@ def train(
         "scaler_sha256": _sha256(scaler_path),
         "value_function_version": "v2",
         "code_version": code_version.strip(),
+        **source_identity,
         "value_weights": VALUE_WEIGHTS,
         "training_data": {
             "identity": training_data_identity,
             "type": training_data_type,
+            "content_sha256": dataset_sha256,
+            "content_hash_scope": "validated ordered DATA_KEYS; dtype/shape and contiguous array bytes",
         },
+        "training_split_sha256": hashlib.sha256(json.dumps({"dataset_sha256": dataset_sha256,
+            "split": "input_order_80_20", "training_range": [0, split_index],
+            "validation_range": [split_index, len(X)]}, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
         "preprocessing_fit": {
             "split": "input_order_80_20",
             "training_rows": split_index,
