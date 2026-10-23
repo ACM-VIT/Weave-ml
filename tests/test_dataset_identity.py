@@ -44,10 +44,10 @@ def test_explicit_cross_encoder_policy_keeps_per_run_identity_and_metrics():
     assert 'assembly.judged_ndcg_at_k: below minimum' in assess(changed,baseline,policy)['failures']
     with pytest.raises(ValueError,match='identity digest'):
         assess({**changed,'embedding_sha256':'f'*64},baseline,policy)
-    assert bundle.dataset.sha256==old.report.evaluation_dataset_sha256
+    assert digest(bundle.dataset)==old.report.evaluation_dataset_sha256 # immutable historical v1 raw dump
 
 
-@pytest.mark.parametrize('part',['readme','context','judgments','split','exclusions'])
+@pytest.mark.parametrize('part',['readme','context','judgments','split','exclusions','intent','disliked'])
 def test_every_raw_source_label_split_and_exclusion_change_is_bound(part):
     old,policy=fixture_report();raw=read('bundle.json')
     if part=='readme':raw['dataset']['repositories'][0]['readme']='different frozen source'
@@ -55,6 +55,11 @@ def test_every_raw_source_label_split_and_exclusion_change_is_bound(part):
     elif part=='judgments':
         raw['dataset']['judgments'][0]['grade']=3
         raw['judgments']=deepcopy(raw['dataset']['judgments'])
+    elif part=='intent':
+        raw['dataset']['profiles'][0]['intent']='different declared intent';raw['profiles'][0]['intent']='different declared intent'
+    elif part=='disliked':
+        changed=[raw['repositories'][-1]['repo_id']]
+        raw['dataset']['profiles'][0]['disliked']=changed;raw['profiles'][0]['disliked']=changed
     elif part=='split':raw['dataset']['split'][raw['profiles'][0]['profile_id']]='other'
     else:
         raw['dataset']['profiles'][0]['seen']=[];raw['profiles'][0]['seen']=[]
@@ -160,3 +165,60 @@ def test_cross_encoder_cli_requires_actual_manifest_contract(tmp_path,field,monk
     assert expected in payload['assessment']['failures']
     if field=='file_drift':assert swapped==[True]
     assert payload['qualification_manifest'] is None
+
+
+@pytest.mark.parametrize('field',['source_hash','readme_chunks','fallback_content_hash'])
+def test_common_dataset_identity_excludes_encoder_derived_run_metadata(field):
+    from evaluation.dataset_identity import SourceDataset
+    raw=read('bundle.json')['dataset']
+    if field=='fallback_content_hash':
+        raw['repositories'][0]['ranking_material']['content_hash']=raw['repositories'][0]['ranking_material']['source_hash']
+        raw['repositories'][0]['content_hash_origin']='encoder_fallback'
+        raw['repositories'][0]['readme_sha256']=__import__('hashlib').sha256(b'').hexdigest()
+    before=SourceDataset.model_validate(raw)
+    changed=deepcopy(raw);material=changed['repositories'][0]['ranking_material']
+    if field=='source_hash':material['source_hash']='e'*64
+    elif field=='readme_chunks':material['readme_chunks']+=1
+    else:material.update(source_hash='e'*64,content_hash='e'*64)
+    assert SourceDataset.model_validate(changed).sha256==before.sha256
+
+
+def test_snapshot_accepts_different_run_fingerprint_without_changing_raw_sources():
+    raw=read('snapshot.json');before=FrozenSnapshot.model_validate(raw)
+    raw['repositories'][0]['payload']['source_hash']='e'*64
+    raw['repositories'][0]['payload']['readme_chunks']+=1
+    after=FrozenSnapshot.model_validate(raw)
+    assert after.bundle.dataset.sha256==before.bundle.dataset.sha256
+
+
+def test_backend_hash_is_preserved_and_ambiguous_fallback_requires_explicit_raw_identity():
+    from evaluation.dataset_identity import SourceDataset
+    raw=read('bundle.json')['dataset'];source=raw['repositories'][0]
+    source['content_hash_origin']='backend';source['ranking_material']['content_hash']=source['ranking_material']['source_hash']
+    before=SourceDataset.model_validate(raw)
+    changed=deepcopy(raw);changed['repositories'][0]['ranking_material']['content_hash']='f'*64
+    assert SourceDataset.model_validate(changed).sha256!=before.sha256
+    source.pop('content_hash_origin')
+    with pytest.raises(ValueError,match='explicit raw README'):SourceDataset.model_validate(raw)
+    source['content_hash_origin']='encoder_fallback';source['readme_sha256']='a'*64
+    before=SourceDataset.model_validate(raw)
+    changed=deepcopy(raw);changed['repositories'][0]['readme_sha256']='b'*64
+    assert SourceDataset.model_validate(changed).sha256!=before.sha256
+
+
+def test_common_projection_keeps_raw_binding_across_encoder_and_recipe_variants():
+    from evaluation.dataset_identity import common_ranking_material
+    payload=read('snapshot.json')['repositories'][0]['payload']
+    changed=deepcopy(payload)
+    changed.update(embedding_model='other-controlled-384-encoder',embedding_version='different-recipe',
+        embedding_model_revision='f'*40,source_hash='e'*64,readme_chunks=99)
+    assert common_ranking_material(changed,content_hash_origin='backend')==common_ranking_material(payload,content_hash_origin='backend')
+    changed['content_hash']='f'*64
+    assert common_ranking_material(changed,content_hash_origin='backend')!=common_ranking_material(payload,content_hash_origin='backend')
+
+
+def test_present_raw_readme_bytes_must_match_any_declared_hash():
+    from evaluation.dataset_identity import SourceDataset
+    raw=read('bundle.json')['dataset'];source=raw['repositories'][0]
+    source.update(readme='actual frozen bytes',readme_sha256='a'*64)
+    with pytest.raises(ValueError,match='bytes and declared hash differ'):SourceDataset.model_validate(raw)

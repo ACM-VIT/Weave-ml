@@ -113,11 +113,12 @@ class FrozenSnapshot(StrictModel):
                 raise ValueError('bundle metrics metadata and frozen payload disagree')
         if self.bundle.dataset is not None:
             sources={row.repo_id:row for row in self.bundle.dataset.repositories}
-            model_keys={'embedding_dim','embedding_model','embedding_model_revision','embedding_version',
-                        'model_version','serving_eligibility_version','indexed_at'}
+            from evaluation.dataset_identity import common_ranking_material
             for row in self.repositories:
-                material={key:value for key,value in row.payload.items() if key not in model_keys}
-                if sources[row.repo_id].ranking_material != material:
+                source=sources[row.repo_id]
+                material=common_ranking_material(row.payload,content_hash_origin=source.content_hash_origin)
+                expected=common_ranking_material(source.ranking_material,content_hash_origin=source.content_hash_origin)
+                if expected != material:
                     raise ValueError('raw dataset and actual ranking material differ')
             profiles={row.profile_id:row for row in self.bundle.dataset.profiles}
             for row in self.profiles:

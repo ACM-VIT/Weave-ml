@@ -20,6 +20,7 @@
     "2": "Useful partial solution or alternative with a documented mismatch to at least one central task constraint.",
     "3": "Direct documented fit to the declared task or one explicitly requested component of it."
   },
+  "dataset_identity_scheme": "raw-source-profile-label-split-v2; excludes encoder fingerprints/chunk plans; genuine backend content hash and explicit retained README hash remain bound",
   "encoding": {
     "model": {
       "dimension": 384,
