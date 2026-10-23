@@ -302,3 +302,65 @@ def test_shadow_child_expiry_is_isolated_but_parent_cancellation_is_authoritativ
             assert parent.remaining() > 29
     assert len(children) == 1
     assert parent.cancelled.is_set() is parent_cancelled
+
+
+@pytest.mark.parametrize('defect', ['same_family', 'duplicate_vector'])
+@pytest.mark.parametrize(('social_count', 'pool_cap'), [(0, 150), (20, 150), (100, 150), (50, 50)])
+def test_enabled_pool_preserves_compatible_discovery_breadth_and_personalization(
+    diversity_corpus, defect, social_count, pool_cap,
+):
+    from config import QDRANT_VECTOR_NAME
+    from qdrant_client import models
+    from retrieval.config import DISCOVERY_LIMIT
+    from retrieval.social_candidates import SocialCandidate, SocialPolicy
+    corpus = diversity_corpus
+    independent = set(corpus.repo_ids[300:450])
+    corpus.client.set_payload(corpus.repository_collection,
+        payload={'star_count': 10000, 'trend_velocity': 10000., 'activity_score': 1.},
+        points=sorted(independent))
+    first, second, third = corpus.repo_ids[300:303]
+    if defect == 'same_family':
+        corpus.client.set_payload(corpus.repository_collection,
+            payload={'is_fork': True, 'fork_parent_github_id': '900000',
+                     'fork_family_github_id': '900000'}, points=[first, second])
+    else:
+        point = corpus.client.retrieve(corpus.repository_collection, ids=[first],
+                                      with_payload=True, with_vectors=True)[0]
+        other = corpus.client.retrieve(corpus.repository_collection, ids=[second],
+                                      with_payload=True, with_vectors=True)[0]
+        corpus.client.upsert(corpus.repository_collection, points=[models.PointStruct(
+            id=second, vector=point.vector, payload=other.payload)])
+    retriever = _corpus_retriever(corpus, heavy=True)
+    retriever.max_candidates = pool_cap
+    retriever.diversity_mode = 'enabled'
+    retriever.diversity_traffic_percent = 100
+    retriever.diversity_policy = DiversityPolicy(minimum_exploration=2)
+    retriever.social_policy = SocialPolicy(mode='enabled', max_candidates=100, max_per_source=100)
+    social_ids = corpus.repo_ids[450:450 + social_count]
+    social = [SocialCandidate(repo_id=repo_id, owner_github_id=str(index // 2 + 1),
+              source='followed_owner', support=1, source_score=1.)
+              for index, repo_id in enumerate(corpus.repo_ids) if repo_id in social_ids]
+    batch = retriever.recommend_batch(corpus.user_id, 30, [], 'compatible-breadth', False, [], social)
+    pool = {row['id'] for row in retriever.ranker.calls[-1][2]}
+    assert len(pool) == pool_cap
+    assert len(pool & independent) == DISCOVERY_LIMIT
+    assert {first, second, third} <= pool
+    admitted_social = min(social_count, pool_cap - DISCOVERY_LIMIT - 1)
+    assert len(set(social_ids) & pool) == admitted_social
+    # Tiny full-social custom pools explicitly prioritize enabled discovery and
+    # the semantic floor; no claim that every social reservation can always fit.
+    # Abundant independent rows cannot displace every personalized ANN row.
+    assert len(pool & set(corpus.repo_ids[:150])) == pool_cap - DISCOVERY_LIMIT - admitted_social
+    assert len(batch.items) == 30 and batch.ranker_applied
+    assert len({row.repo_id for row in batch.items} & independent) >= 2
+
+
+def test_enabled_quota_cannot_silently_eliminate_present_personalized_candidates(diversity_corpus):
+    from retrieval.v2_retriever import RetrievalDependencyError
+    retriever = _corpus_retriever(diversity_corpus, heavy=True)
+    retriever.max_candidates = 50
+    retriever.diversity_mode = 'enabled'
+    retriever.diversity_traffic_percent = 100
+    retriever.diversity_policy = DiversityPolicy(minimum_exploration=50)
+    with pytest.raises(RetrievalDependencyError, match='personalized candidate floor'):
+        retriever.recommend_batch(diversity_corpus.user_id, 50, [], 'incompatible-quota')

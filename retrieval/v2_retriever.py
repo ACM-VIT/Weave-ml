@@ -50,7 +50,7 @@ from inference.feature_spec import FEATURE_ORDER
 from inference.ranker_service import RankerService
 from inference.runtime import RecommendationDeadlineExceeded, recommendation_timeout_seconds
 from retrieval.candidate_vectors import InlineCandidateSnapshots
-from retrieval.config import TOTAL_CANDIDATE_POOL
+from retrieval.config import DISCOVERY_LIMIT, TOTAL_CANDIDATE_POOL
 from retrieval.discovery_cache import DiscoveryRevision, PoolLease, SharedDiscoveryCache
 from retrieval.metrics import record_candidate_read
 from retrieval.runtime import RetrievalWork, validate_retrieval_runtime
@@ -1910,11 +1910,28 @@ class QdrantV2Retriever:
         # to reach heavy ranking rather than disappearing behind the ANN prefix.
         reserved_pool = set(reserved_social)
         if diversity_selected and self.diversity_mode == 'enabled':
-            # Independent candidates must reach fresh hydration/heavy ranking
-            # before the selector can satisfy its required exploration count.
-            required = max(0, min(limit, self.diversity_policy.minimum_exploration, self.max_candidates))
-            independent = [item.repo_id for item in ordered_candidates if item.source != 'semantic'][:required]
-            reserved_pool = set(independent)
+            # Reserve bounded discovery breadth, not exactly the minimum:
+            # those first few choices can conflict by family or cosine once
+            # fresh vectors arrive. Reuse the existing 20 discovery allowance.
+            # No extra vector reads or larger ranker pool are authorized here.
+            required = max(0, min(limit, self.diversity_policy.minimum_exploration))
+            semantic = next((item for item in ordered_candidates if item.source == 'semantic'), None)
+            capacity = self.max_candidates - int(semantic is not None)
+            if required > capacity:
+                raise RetrievalDependencyError(
+                    'Configured diversity exploration quota is incompatible with the personalized candidate floor'
+                )
+            independent = [item for item in ordered_candidates if item.source != 'semantic']
+            # Already reserved social IDs cannot consume the discovery breadth;
+            # overlapping identities are counted once by the reservation set.
+            independent = ([item for item in independent if item.repo_id not in reserved_social]
+                           + [item for item in independent if item.repo_id in reserved_social])
+            breadth = min(max(DISCOVERY_LIMIT, required), capacity)
+            reserved_pool = {semantic.repo_id} if semantic is not None else set()
+            reserved_pool.update(item.repo_id for item in independent[:breadth])
+            # Preserve existing social reservations wherever the common cap
+            # permits. Enabled diversity gives discovery breadth and a present
+            # personalized candidate precedence in tiny/full-social pools.
             for item in ordered_candidates:
                 if item.repo_id in reserved_social and len(reserved_pool) < self.max_candidates:
                     reserved_pool.add(item.repo_id)
