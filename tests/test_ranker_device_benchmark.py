@@ -141,7 +141,7 @@ assert benchmark._peak_process_rss_bytes() is None
 benchmark.main(['--help'])
 """
     result = subprocess.run([sys.executable, '-c', code], capture_output=True,
-                            text=True, timeout=30)
+                            text=True, timeout=30, cwd=ARTIFACTS.parent)
     assert result.returncode == 0, result.stderr
     assert '--counts' in result.stdout
 
