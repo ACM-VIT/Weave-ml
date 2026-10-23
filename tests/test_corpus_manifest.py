@@ -223,7 +223,7 @@ def test_newly_accepted_names_are_excluded_even_when_downloaded_inventory_is_ful
     assert "owner/new" in db.get_existing_repository_names()
 
 
-def test_dripping_manifest_body_cannot_outlive_total_scan_deadline():
+def test_dripping_manifest_body_cannot_outlive_total_scan_deadline(monkeypatch):
     import asyncio
     import time
 
@@ -246,6 +246,7 @@ def test_dripping_manifest_body_cannot_outlive_total_scan_deadline():
     db, _ = client([])
     db.manifest_transport = httpx.MockTransport(handler)
     started = time.monotonic()
-    with pytest.raises(TimeoutError):
+    monkeypatch.delattr(asyncio, "timeout", raising=False)
+    with pytest.raises(asyncio.TimeoutError):
         manifest._read_page(db, None, 0.1)
     assert time.monotonic() - started < 0.4 and closed == [True]

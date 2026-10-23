@@ -138,25 +138,27 @@ def load_manifest(client: Any) -> dict[str, dict[str, Any]]:
 
 def _read_page(client: Any, cursor: str | None, remaining: float):
     async def read():
-        async with asyncio.timeout(remaining):
-            async with (
-                httpx.AsyncClient(
-                    transport=client.manifest_transport,
-                    timeout=min(client.timeout, 5, remaining),
-                ) as session,
-                session.stream(
-                    "GET",
-                    f"{client.base_url}/api/internal/v2/ingestion/repositories/manifest",
-                    params={"limit": 250, **({"cursor": cursor} if cursor else {})},
-                    headers={"x-internal-secret": client.internal_secret},
-                ) as response,
-            ):
-                response.raise_for_status()
-                body = bytearray()
-                async for chunk in response.aiter_bytes(16384):
-                    body.extend(chunk)
-                    if len(body) > MAX_PAGE_BYTES:
-                        raise ValueError("manifest response exceeded its byte budget")
-                return json.loads(body)
+        async with (
+            httpx.AsyncClient(
+                transport=client.manifest_transport,
+                timeout=min(client.timeout, 5, remaining),
+            ) as session,
+            session.stream(
+                "GET",
+                f"{client.base_url}/api/internal/v2/ingestion/repositories/manifest",
+                params={"limit": 250, **({"cursor": cursor} if cursor else {})},
+                headers={"x-internal-secret": client.internal_secret},
+            ) as response,
+        ):
+            response.raise_for_status()
+            body = bytearray()
+            async for chunk in response.aiter_bytes(16384):
+                body.extend(chunk)
+                if len(body) > MAX_PAGE_BYTES:
+                    raise ValueError("manifest response exceeded its byte budget")
+            return json.loads(body)
 
-    return asyncio.run(read())
+    async def bounded_read():
+        return await asyncio.wait_for(read(), timeout=remaining)
+
+    return asyncio.run(bounded_read())
