@@ -128,3 +128,71 @@ def test_disabled_authority_reports_no_reachability_observation(monkeypatch):
     assert v2._qdrant_health()['corpus_authority'] == {
         'enabled': False, 'reachable': None, 'healthy': True, 'state': 'DISABLED', 'writers': None,
     }
+
+
+@pytest.mark.integration
+def test_real_qdrant_accepted_write_with_lost_http_reply_stays_dirty(
+    owned_authority_services, monkeypatch,
+):
+    import socket
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import httpx
+    from qdrant_client import QdrantClient
+    from qdrant_client.http.exceptions import ResponseHandlingException
+    from config import QDRANT_COLLECTION_NAME, QDRANT_VECTOR_NAME
+    from embedding.qdrant_store import QdrantRepositoryStore
+    from tests.test_v2_qdrant_fencing import _repository_result, REPO_ID
+
+    redis_url, qdrant_url = owned_authority_services
+    configure(monkeypatch, redis_url, qdrant_url)
+    authority = authority_from_environment(collection=QDRANT_COLLECTION_NAME,
+        vector=QDRANT_VECTOR_NAME, endpoint=qdrant_url)
+    accepted = threading.Event()
+    statuses, errors = [], []
+
+    class LoseAcceptedReply(BaseHTTPRequestHandler):
+        def do_PUT(self):
+            try:
+                body = self.rfile.read(int(self.headers['Content-Length']))
+                with httpx.Client(timeout=5, trust_env=False) as forward:
+                    response = forward.put(qdrant_url + self.path, content=body,
+                        headers={'content-type': 'application/json'})
+                    response.raise_for_status()
+                    statuses.append(response.json()['result']['status'])
+                accepted.set()  # The real server replied before the client loses its response.
+            except Exception as exc:
+                errors.append(type(exc).__name__)
+            finally:
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), LoseAcceptedReply)
+    server.daemon_threads = False  # server_close joins every owned forwarding handler.
+    worker = threading.Thread(target=lambda: server.serve_forever(poll_interval=.05))
+    worker.start()
+    direct = QdrantClient(url=qdrant_url, timeout=5, check_compatibility=False)
+    faulted = QdrantClient(url=f'http://127.0.0.1:{server.server_port}', timeout=10, check_compatibility=False)
+    try:
+        authority.bootstrap(proof())
+        store = QdrantRepositoryStore(client=direct, corpus_authority=authority)
+        store.ensure_collection()
+        store.upsert([_repository_result(1, str(uuid4()))])
+        store.client = faulted  # Transparent owned fault proxy, same corpus and authority.
+        with pytest.raises(ResponseHandlingException):
+            store.upsert([_repository_result(2, str(uuid4()))])
+        assert accepted.is_set() and statuses == ['completed'] and not errors
+        current = direct.retrieve(store.collection_name, ids=[REPO_ID], with_payload=True)[0]
+        assert current.payload['content_version'] == 2
+        assert authority.status() == {'state': 'DIRTY', 'writers': 1}
+        assert authority.read() is None
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(5)
+        assert not worker.is_alive()
+        faulted.close()
+        direct.close()
+        authority.close()
