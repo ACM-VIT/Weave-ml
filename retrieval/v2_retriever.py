@@ -47,6 +47,7 @@ from inference.feed_assembly import FeedAssemblySystem
 from inference.feature_spec import FEATURE_ORDER
 from inference.ranker_service import RankerService
 from inference.runtime import RecommendationDeadlineExceeded, recommendation_timeout_seconds
+from retrieval.candidate_vectors import InlineCandidateSnapshots
 from retrieval.config import TOTAL_CANDIDATE_POOL
 from retrieval.discovery_cache import DiscoveryRevision, PoolLease, SharedDiscoveryCache
 from retrieval.metrics import record_candidate_read
@@ -222,6 +223,7 @@ class QdrantV2Retriever:
         discovery_revision_provider: Callable[[], DiscoveryRevision | None] | None = None,
         discovery_cache: SharedDiscoveryCache | None = None,
         social_policy: SocialPolicy | None = None,
+        candidate_vector_mode: str | None = None,
     ) -> None:
         validate_retrieval_runtime()
         self.qdrant_timeout_seconds = self._float_env(
@@ -242,6 +244,12 @@ class QdrantV2Retriever:
         self._discovery_cache_scope = uuid.uuid4().hex
         self._discovery_cache = discovery_cache or SharedDiscoveryCache()
         self.max_candidates = max(50, min(max_candidates, 2_000))
+        self.candidate_vector_mode = (
+            candidate_vector_mode if candidate_vector_mode is not None
+            else os.getenv("V2_CANDIDATE_VECTOR_MODE", "deferred")
+        ).strip().casefold()
+        if self.candidate_vector_mode not in {"deferred", "inline"}:
+            raise ValueError("V2_CANDIDATE_VECTOR_MODE must be deferred or inline")
         self.social_policy = social_policy or SocialPolicy(
             mode=os.getenv("V2_SOCIAL_CANDIDATE_MODE", "disabled").strip().casefold(),
             traffic_percent=self._float_env("V2_SOCIAL_CANDIDATE_TRAFFIC_PERCENT", default=100., minimum=0., maximum=100.),
@@ -1636,22 +1644,44 @@ class QdrantV2Retriever:
         social_ids = lookup_social_ids(social_rows, social_policy, excluded)
         social_ids = social_ids[:budget.reserve(len(social_ids))] if social_ids else []
         social_points: dict[str, _EligibleRepositoryPoint] = {}
+        # Inline is an explicit high-RTT alternative only for required-heavy.
+        # It never uses the shared discovery pool or a previous request's pair.
+        inline_vectors = bool(
+            self.candidate_vector_mode == "inline" and self.heavy_ranker_required
+            and heavy_selected and self.ranker is not None
+        )
+        snapshots = InlineCandidateSnapshots(
+            core_fields=_REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS,
+            extra_fields=_HEAVY_RANKER_PAYLOAD_FIELDS,
+            max_entries=max(1, min(20_000, budget.remaining)),
+        ) if inline_vectors else None
+        if snapshots is not None:
+            eligibility_cache = snapshots
         discovery_plan = _DiscoveryPlan(budget=budget)
         try:
             with RetrievalWork() as work:
                 profile_future = work.submit("profile", self._fetch_user_profile, user_id)
                 social_future = (work.submit("social", self._fetch_social_candidates, social_ids)
                                  if social_ids else None)
+                # Validate the required profile before any vector-bearing
+                # repository RPC. Deferred mode retains its parallel overlap.
+                if inline_vectors:
+                    user_vector, user_profile = self._profile_from_points(
+                        user_id, work.result(profile_future),
+                    )
+                    if user_vector is None:
+                        raise RetrievalDependencyError(
+                            "the required V2 heavy ranker needs a compatible user vector"
+                        )
                 self._prepare_discovery(
                     work, discovery_plan, max(limit * 8, 200),
-                    # Payload-first retrieval avoids transferring overlapping or
-                    # ultimately dropped repository vectors on every channel.
-                    include_vectors=False,
+                    include_vectors=inline_vectors,
                     exclude_repo_ids=excluded,
                 )
-                user_vector, user_profile = self._profile_from_points(
-                    user_id, work.result(profile_future),
-                )
+                if not inline_vectors:
+                    user_vector, user_profile = self._profile_from_points(
+                        user_id, work.result(profile_future),
+                    )
                 if self.heavy_ranker_required and not heavy_selected:
                     raise RetrievalDependencyError(
                         "the required V2 heavy ranker was not selected"
@@ -1672,7 +1702,7 @@ class QdrantV2Retriever:
                     try:
                         semantic = self._semantic(
                             user_vector, max(limit * 5, 100), eligibility_cache,
-                            include_vectors=False, exclude_repo_ids=excluded,
+                            include_vectors=inline_vectors, exclude_repo_ids=excluded,
                             minimum_candidates=limit, budget=budget,
                             work=work,
                         )
@@ -1720,7 +1750,7 @@ class QdrantV2Retriever:
                                 social_points.pop(point_id, None)
                                 continue
                             seen_social.add(point_id)
-                            point = self._eligible_repository_point(record, require_vector=False)
+                            point = self._eligible_repository_point(record, snapshots, require_vector=False)
                             if point is not None and point.repo_id not in excluded:
                                 social_points[point.repo_id] = point
                         record_candidate_read("social", records, len(social_points))
@@ -1729,7 +1759,7 @@ class QdrantV2Retriever:
                 try:
                     discovery_points = self._complete_discovery(
                         work, discovery_plan, max(limit * 8, 200), eligibility_cache,
-                        include_vectors=False, exclude_repo_ids=excluded,
+                        include_vectors=inline_vectors, exclude_repo_ids=excluded,
                         minimum_candidates=limit, existing_repo_ids=set(candidates),
                     )
                 except RetrievalDependencyError:
@@ -1807,6 +1837,16 @@ class QdrantV2Retriever:
                     )
                 reserved_social.add(row.repo_id)
 
+        if snapshots is not None:
+            if snapshots.overflowed:
+                raise RetrievalDependencyError("inline candidate snapshot bound exceeded")
+            # A later conflicting or invalid observation invalidates every
+            # contribution from that canonical ID, regardless of channel order.
+            for repo_id in snapshots.conflicts:
+                candidates.pop(repo_id, None)
+                metadata.pop(repo_id, None)
+                vectors.pop(repo_id, None)
+                reserved_social.discard(repo_id)
         check_deadline()
         ordered_candidates = sorted(candidates.values(), key=lambda item: (-item.score, item.repo_id))
         # Preserve the overall pool bound while allowing genuinely new social IDs
@@ -1820,7 +1860,14 @@ class QdrantV2Retriever:
         heavy_ranked: list[RankedRepository] | None = None
         fallback_code: str | None = None
         fallback_reason: str | None = None
-        if include_candidate_vectors:
+        if include_candidate_vectors and not (
+            snapshots is not None and all(
+                snapshots.has_pair(item.repo_id) and vectors.get(item.repo_id) is not None
+                for item in hybrid_ranked
+            )
+        ):
+            # Metadata-only social IDs and any missing pair retain the full
+            # fresh hydration path rather than borrowing a vector by identity.
             try:
                 hybrid_ranked, vectors = self._hydrate_retained_candidates(
                     hybrid_ranked, metadata,
