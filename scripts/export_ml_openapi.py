@@ -25,9 +25,16 @@ def build_schema() -> dict:
     schema['info']['x-online-product-database-access'] = False
     schema['components']['securitySchemes'] = {
         'InternalSecret': {'type': 'apiKey', 'in': 'header', 'name': 'x-internal-secret'},
+        'ScoringCaptureCapability': {'type': 'apiKey', 'in': 'header',
+            'name': 'x-scoring-capture-capability',
+            'description': 'Required in addition to InternalSecret only for explicitly negotiated scoring_capture requests.'},
     }
     for path in PRODUCT_PATHS:
         schema['paths'][path]['post']['security'] = [{'InternalSecret': []}]
+    schema['paths']['/api/v2/recommendations/generate']['post']['x-scoring-capture-security'] = {
+        'required_when': 'scoring_capture is provided',
+        'security': [{'InternalSecret': [], 'ScoringCaptureCapability': []}],
+    }
     return schema
 
 

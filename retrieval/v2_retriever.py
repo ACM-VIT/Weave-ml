@@ -47,6 +47,7 @@ from embedding.vector_contract import (
 from inference.feed_assembly import FeedAssemblySystem, DiversityUnavailableError
 from inference.diversity import DiversityPolicy
 from inference.feature_spec import FEATURE_ORDER
+from inference.scoring_runtime import CaptureOptions, CapturedScoring, scoring_context_for, score_with_capture
 from inference.ranker_service import RankerService
 from inference.runtime import RecommendationDeadlineExceeded, recommendation_timeout_seconds
 from retrieval.candidate_vectors import InlineCandidateSnapshots
@@ -174,6 +175,7 @@ class RecommendationBatch:
     heavy_ranker_selected: bool = False
     fallback_code: str | None = None
     retrieval_mode: str = "personalized"
+    captured_scoring: CapturedScoring | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -709,6 +711,16 @@ class QdrantV2Retriever:
             ids=[user_point_id(user_id)],
             with_vectors=True,
             with_payload=_USER_RETRIEVAL_PAYLOAD_FIELDS,
+            **qdrant_timeout(self.qdrant_timeout_seconds),
+        )
+
+    def _fetch_user_profile_for_capture(self, user_id: str) -> list[Any]:
+        return self.client.retrieve(
+            collection_name=self.user_collection,
+            ids=[user_point_id(user_id)],
+            with_vectors=True,
+            with_payload=[*_USER_RETRIEVAL_PAYLOAD_FIELDS, "profile_version", "last_feedback_version",
+                          "feedback_state_revision", "embedding_version"],
             **qdrant_timeout(self.qdrant_timeout_seconds),
         )
 
@@ -1678,6 +1690,7 @@ class QdrantV2Retriever:
         cold_start: bool = False,
         social_repo_ids: list[str] | None = None,
         social_candidates: list[SocialCandidate] | None = None,
+        scoring_capture: CaptureOptions | None = None,
     ) -> RecommendationBatch:
         check_deadline()
         excluded = {str(uuid.UUID(item)) for item in exclude_repo_ids}
@@ -1715,7 +1728,8 @@ class QdrantV2Retriever:
         discovery_plan = _DiscoveryPlan(budget=budget)
         try:
             with RetrievalWork() as work:
-                profile_future = work.submit("profile", self._fetch_user_profile, user_id)
+                profile_future = work.submit("profile", self._fetch_user_profile if scoring_capture is None
+                                             else self._fetch_user_profile_for_capture, user_id)
                 social_future = (work.submit("social", self._fetch_social_candidates, social_ids)
                                  if social_policy.injects and social_ids else None)
                 # Validate the required profile before any vector-bearing
@@ -1978,14 +1992,29 @@ class QdrantV2Retriever:
                 )
                 fallback_code = "CANDIDATE_VECTORS_UNAVAILABLE"
                 fallback_reason = _FALLBACK_MESSAGES[fallback_code]
+        captured_scoring = None
         if heavy_selected and fallback_code is None:
-            heavy_ranked, fallback_code, fallback_reason = self._heavy_rank(
-                user_vector=user_vector,
-                user_profile=user_profile,
-                ranked=hybrid_ranked,
-                metadata=metadata,
-                vectors=vectors,
-            )
+            if scoring_capture is None:
+                heavy_ranked, fallback_code, fallback_reason = self._heavy_rank(
+                    user_vector=user_vector, user_profile=user_profile,
+                    ranked=hybrid_ranked, metadata=metadata, vectors=vectors,
+                )
+            elif hybrid_ranked:
+                context = scoring_context_for(ranker=self.ranker, user_id=user_id,
+                    generation_id=generation_seed, user_vector=user_vector, profile=user_profile,
+                    candidates=hybrid_ranked, metadata=metadata, options=scoring_capture)
+                result, captured_scoring = score_with_capture(context, lambda: self._heavy_rank(
+                    user_vector=user_vector, user_profile=user_profile,
+                    ranked=hybrid_ranked, metadata=metadata, vectors=vectors,
+                ))
+                heavy_ranked, fallback_code, fallback_reason = result
+            else:
+                # Keep the existing no-eligible heavy failure; no synthetic
+                # empty scoring result is created for capture requests.
+                heavy_ranked, fallback_code, fallback_reason = self._heavy_rank(
+                    user_vector=user_vector, user_profile=user_profile,
+                    ranked=hybrid_ranked, metadata=metadata, vectors=vectors,
+                )
         if self.heavy_ranker_required and heavy_ranked is None:
             self._record_ranking_result(
                 heavy_selected=heavy_selected,
@@ -1997,6 +2026,8 @@ class QdrantV2Retriever:
                 "the required V2 heavy ranker could not serve this request: "
                 f"{fallback_reason or 'unknown ranker failure'}"
             )
+        if scoring_capture is not None and captured_scoring is None and (heavy_ranked or hybrid_ranked or fallback_code):
+            raise RetrievalDependencyError("Requested scoring capture requires actual compatible heavy scoring")
         ranker_applied = heavy_ranked is not None
         ranked = heavy_ranked if heavy_ranked is not None else hybrid_ranked
         ranked = self._apply_social_boost(
@@ -2111,6 +2142,7 @@ class QdrantV2Retriever:
             heavy_ranker_selected=heavy_selected,
             fallback_code=fallback_code,
             retrieval_mode=retrieval_mode,
+            captured_scoring=captured_scoring,
         )
 
     def recommend(
