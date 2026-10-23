@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -11,10 +12,12 @@ import uuid
 
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
 from api.contracts import RepositoryJob, RepositoryRefreshJob
+from api import main as api_main
 from api.v2 import _embed_repository_job_locked, _refresh_repository_job_locked, _repository_embedding_payload
 from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
 from embedding.qdrant_store import QdrantRepositoryStore
@@ -641,12 +644,26 @@ def _indexed_feature_refresh_fixture():
     return client, store, point
 
 
+def test_trend_velocity_clamps_decline_and_preserves_positive_scale() -> None:
+    assert trend_velocity(
+        {"delta_3d": -30, "delta_7d": 0, "delta_30d": 0}
+    ) == 0.0
+    assert trend_velocity(
+        {"delta_3d": 30, "delta_7d": 7, "delta_30d": 30}
+    ) == 0.4511
+
+
 @pytest.mark.parametrize(
     ("feature_patch", "affected_scores"),
     [
         ({"fork_count": 8, "open_issues_count": 2}, {"code_health"}),
         ({"pushed_days_ago": 0}, {"code_health", "activity_score"}),
         ({"delta_3d": 30}, {"trend_velocity"}),
+        (
+            {"delta_3d": -30, "delta_7d": 0, "delta_30d": 0},
+            {"trend_velocity"},
+        ),
+        ({"mentionable_users_count": 4}, set()),
         ({"star_count": 42}, set()),
         (
             {
@@ -656,7 +673,15 @@ def _indexed_feature_refresh_fixture():
             set(),
         ),
     ],
-    ids=["counts", "recency", "delta", "unrelated-count", "timestamps"],
+    ids=[
+        "counts",
+        "recency",
+        "positive-delta",
+        "negative-delta",
+        "unchanged-dependency",
+        "unrelated-count",
+        "timestamps",
+    ],
 )
 def test_feature_refresh_derives_only_dependent_scores_without_reembedding(
     feature_patch, affected_scores,
@@ -791,6 +816,43 @@ def test_feature_refresh_rejects_inconsistent_caller_derived_scores() -> None:
         client.close()
 
 
+@pytest.mark.parametrize("echo_kind", ["recomputed", "preserved"])
+def test_feature_refresh_accepts_matching_derived_score_echo(echo_kind) -> None:
+    client, store, expected = _indexed_feature_refresh_fixture()
+    if echo_kind == "recomputed":
+        feature_patch = {"pushed_days_ago": 0, "activity_score": 0.6325}
+        expected_activity = 0.6325
+    else:
+        expected_activity = expected.payload["activity_score"]
+        feature_patch = {
+            "star_count": 42,
+            "activity_score": expected_activity,
+        }
+    request = RepositoryRefreshJob(
+        schema_version=2,
+        job_id=uuid.uuid4(),
+        repo_id=REPO_ID,
+        feature_version=1,
+        features=feature_patch,
+    )
+
+    try:
+        with patch("api.v2._repository_points", return_value=[expected]), patch(
+            "api.v2.repository_store", return_value=store
+        ):
+            response = _refresh_repository_job_locked(request, OwnedLock())
+        stored = client.retrieve(
+            store.collection_name,
+            [REPO_ID],
+            with_payload=True,
+        )[0]
+
+        assert response["status"] == "applied"
+        assert stored.payload["activity_score"] == expected_activity
+    finally:
+        client.close()
+
+
 def test_unrelated_refresh_validates_echo_against_preserved_score() -> None:
     client, store, expected = _indexed_feature_refresh_fixture()
     request = RepositoryRefreshJob(
@@ -811,6 +873,56 @@ def test_unrelated_refresh_validates_echo_against_preserved_score() -> None:
         assert exc_info.value.detail.endswith(
             f"expected activity_score={expected.payload['activity_score']}."
         )
+    finally:
+        client.close()
+
+
+def test_refresh_http_error_for_score_echo_matches_validation_contract(
+    monkeypatch,
+) -> None:
+    client, store, expected = _indexed_feature_refresh_fixture()
+    monkeypatch.setenv("INTERNAL_API_SECRET", "test-internal-secret")
+    request_id = "refresh-score-contract"
+
+    try:
+        with patch("api.v2._repository_points", return_value=[expected]), patch(
+            "api.v2.repository_store", return_value=store
+        ), patch(
+            "api.v2._repository_job_lock",
+            return_value=nullcontext(OwnedLock()),
+        ):
+            response = TestClient(api_main.app).post(
+                "/api/v2/repositories/refresh",
+                headers={
+                    "x-internal-secret": "test-internal-secret",
+                    "x-request-id": request_id,
+                },
+                json={
+                    "schema_version": 2,
+                    "job_id": str(uuid.uuid4()),
+                    "repo_id": REPO_ID,
+                    "feature_version": 1,
+                    "features": {
+                        "pushed_days_ago": 0,
+                        "activity_score": 0.1234,
+                    },
+                },
+            )
+
+        assert response.status_code == 422
+        assert response.headers["x-request-id"] == request_id
+        body = response.json()
+        assert body["code"] == "REQUEST_VALIDATION_FAILED"
+        assert body["retryable"] is False
+        assert body["request_id"] == request_id
+        assert body["detail"] == body["message"]
+        assert body["details"] == [
+            {
+                "path": "body.features.activity_score",
+                "message": "Value must match the effective server-owned score 0.6325.",
+                "type": "value_error.derived_feature_mismatch",
+            }
+        ]
     finally:
         client.close()
 

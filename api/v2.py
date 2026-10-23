@@ -267,7 +267,7 @@ class V2ServiceHTTPException(HTTPException):
         error_code: str,
         retryable: bool,
         headers: dict[str, str] | None = None,
-        details: dict[str, Any] | None = None,
+        details: dict[str, Any] | list[dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(status_code=status_code, detail=detail, headers=headers)
         self.error_code = error_code
@@ -983,10 +983,16 @@ def _refresh_repository_job_locked(
         **dict(expected_point.payload or {}),
         **observed_features,
     }
+    stored_observation = dict(expected_point.payload or {})
+    changed_observed_features = {
+        field
+        for field, value in observed_features.items()
+        if stored_observation.get(field) != value
+    }
     affected_derived_features = {
         field
         for field, dependencies in _REPOSITORY_FEATURE_DEPENDENCIES.items()
-        if dependencies.intersection(observed_features)
+        if dependencies.intersection(changed_observed_features)
     }
     derived_features: dict[str, float] = {}
     if "code_health" in affected_derived_features:
@@ -1021,12 +1027,26 @@ def _refresh_repository_job_locked(
         expected = ", ".join(
             f"{field}={expected_derived_features[field]}" for field in inconsistent
         )
-        raise HTTPException(
+        detail = (
+            "Repository derived features are inconsistent with the resulting "
+            f"observation; expected {expected}."
+        )
+        raise V2ServiceHTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=(
-                "Repository derived features are inconsistent with the resulting "
-                f"observation; expected {expected}."
-            ),
+            detail=detail,
+            error_code="REQUEST_VALIDATION_FAILED",
+            retryable=False,
+            details=[
+                {
+                    "path": f"body.features.{field}",
+                    "message": (
+                        "Value must match the effective server-owned score "
+                        f"{expected_derived_features[field]}."
+                    ),
+                    "type": "value_error.derived_feature_mismatch",
+                }
+                for field in inconsistent
+            ],
         )
     features = {**observed_features, **derived_features}
     updated = {

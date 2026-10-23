@@ -183,12 +183,20 @@ def activity_score(repo: dict) -> float:
 
 
 def trend_velocity(repo: dict) -> float:
-    """Quantifies current social popularity traction across multi-stage window intervals."""
+    """Quantify positive popularity traction across multiple windows.
+
+    Signed deltas describe both growth and decline, while the published
+    ranking feature is a unit score. A non-positive weighted growth rate is
+    therefore represented as zero; positive observations retain the existing
+    logarithmic scale and acceleration boost.
+    """
     r3  = repo.get("delta_3d",  0) / 3.0
     r7  = repo.get("delta_7d",  0) / 7.0
     r30 = repo.get("delta_30d", 0) / 30.0
     
     blend = 0.50 * r3 + 0.30 * r7 + 0.20 * r30
+    if blend <= 0:
+        return 0.0
     vel   = min(math.log1p(blend) / math.log1p(500), 1.0)
     
     # Acceleration boost flag for sudden exponential breakouts
