@@ -15,6 +15,8 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import PlainTextResponse
 from api.contracts import (
+    RecommendationResponse, FeedbackResponse, RepositoryIndexResponse,
+    RepositoryRefreshResponse, OnboardingResponse,
     FeedbackBatch,
     OnboardingJob,
     RecommendationRequest,
@@ -23,6 +25,7 @@ from api.contracts import (
     RepositoryRefreshJob,
     RepositorySearchRequest,
     RepositorySearchResponse,
+    RequestValidationResponse,
 )
 from api.runtime import (
     ServiceCapacityError,
@@ -100,7 +103,9 @@ from utils.runtime_lifecycle import (
     RuntimeRetiringError, resume_runtime_admission, stop_runtime_admission,
 )
 
-router = APIRouter(prefix="/api/v2", tags=["v2"])
+router = APIRouter(prefix="/api/v2", tags=["v2"], responses={
+    422: {"model": RequestValidationResponse, "description": "Request validation failed"},
+})
 logger = logging.getLogger("pipeline.api.v2")
 
 
@@ -1036,7 +1041,7 @@ def _onboard_user_job(request: OnboardingJob) -> dict[str, Any]:
 
 
 @router.post(
-    "/recommendations/generate", dependencies=[Depends(require_internal_secret)]
+    "/recommendations/generate", response_model=RecommendationResponse, dependencies=[Depends(require_internal_secret)]
 )
 async def generate_recommendations(
     request: RecommendationRequest,
@@ -1110,6 +1115,7 @@ async def generate_recommendations(
 
 @router.post(
     "/feedback/batch",
+    response_model=FeedbackResponse,
     status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(require_internal_secret)],
 )
@@ -1161,7 +1167,7 @@ async def submit_feedback(request: FeedbackBatch, http_request: Request):
     return {"accepted": accepted, "duplicates": duplicates, "durable": True}
 
 
-@router.post("/repositories/embed", dependencies=[Depends(require_internal_secret)])
+@router.post("/repositories/embed", response_model=RepositoryIndexResponse, dependencies=[Depends(require_internal_secret)])
 async def embed_repository(request: RepositoryJob, http_request: Request):
     try:
         deadline = time.monotonic() + embedding_timeout_seconds()
@@ -1188,7 +1194,7 @@ async def embed_repository(request: RepositoryJob, http_request: Request):
         ) from exc
 
 
-@router.post("/repositories/refresh", dependencies=[Depends(require_internal_secret)])
+@router.post("/repositories/refresh", response_model=RepositoryRefreshResponse, dependencies=[Depends(require_internal_secret)])
 async def refresh_repository(request: RepositoryRefreshJob, http_request: Request):
     try:
         return await run_service_job("refresh", _refresh_repository_job, request)
@@ -1210,7 +1216,7 @@ async def refresh_repository(request: RepositoryRefreshJob, http_request: Reques
         ) from exc
 
 
-@router.post("/users/onboard", dependencies=[Depends(require_internal_secret)])
+@router.post("/users/onboard", response_model=OnboardingResponse, dependencies=[Depends(require_internal_secret)])
 async def onboard_user(request: OnboardingJob, http_request: Request):
     try:
         return await run_onboarding_job(_onboard_user_job, request)

@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timedelta
 from functools import lru_cache
 import os
-from typing import Annotated, Literal
+from typing import Annotated, Literal, get_args
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -20,6 +20,7 @@ from pydantic import (
 )
 
 from feedback.v2_settings import V2FeedbackSettings
+from summarization.contracts import CardSummaryArtifact
 
 
 ShortText = Annotated[
@@ -47,6 +48,25 @@ UnitScore = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class RequestValidationDetail(StrictModel):
+    path: str
+    message: str
+    type: str
+
+
+class RequestValidationResponse(StrictModel):
+    """Safe validation envelope emitted by the integrated application handler."""
+
+    detail: str
+    code: Literal["REQUEST_VALIDATION_FAILED"]
+    message: str
+    retryable: Literal[False]
+    # Compatibility response IDs also accept bounded legacy backend IDs.
+    # Trace correlation separately requires UUIDs and never adopts these IDs.
+    request_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+    details: list[RequestValidationDetail]
 
 
 def _utc(value: datetime, *, field_name: str) -> datetime:
@@ -123,9 +143,17 @@ class FeedbackEvent(StrictModel):
     user_id: uuid.UUID
     repo_id: uuid.UUID
     feedback_version: int = Field(ge=1)
-    event_type: EventType
+    event_type: EventType = Field(json_schema_extra={
+        "enum": [event for event in get_args(EventType) if event != "impression"],
+    })
     dwell_ms: int | None = None
     occurred_at: datetime
+
+    @field_validator("feedback_version", mode="before", json_schema_input_type=Annotated[int, Field(ge=1)] | Annotated[str, StringConstraints(pattern=r"^[1-9][0-9]*$")])
+    @classmethod
+    def feedback_version_wire(cls, value):
+        # Node sends decimal strings to avoid losing 64-bit version precision.
+        return value
 
     @field_validator("occurred_at")
     @classmethod
@@ -385,3 +413,74 @@ class RepositorySearchResponse(StrictModel):
     search_id: uuid.UUID
     embedding_version: ShortText
     items: list[RepositorySearchHit] = Field(max_length=100)
+
+
+# Response schemas are the wire contract used by the generated backend client.
+# Keep derived summary artifacts separate from canonical README source.
+class RecommendationItem(StrictModel):
+    repo_id: uuid.UUID
+    score: float = Field(allow_inf_nan=False)
+    source: ShortText
+
+
+class RecommendationContextStatus(StrictModel):
+    cold_start_applied: bool
+    locale: Literal["reserved_unused", "not_provided"]
+
+
+class RecommendationResponse(StrictModel):
+    schema_version: Literal[2]
+    generation_id: uuid.UUID
+    user_id: uuid.UUID
+    feed_version: int = Field(ge=1)
+    model_version: str = Field(min_length=1, max_length=512)
+    # Retrieval supports eight compatible 128-character identities plus the
+    # mixed-version prefix and seven separating commas.
+    embedding_version: str = Field(min_length=1, max_length=len("compatible-mixed:") + 8 * 128 + 7)
+    embedding_versions: list[str]
+    served_ranker: Literal["heavy", "hybrid"]
+    heavy_ranker_selected: bool
+    ranker_applied: bool
+    fallback_code: str | None
+    fallback_reason: str | None
+    retrieval_mode: str
+    context_status: RecommendationContextStatus
+    items: list[RecommendationItem] = Field(max_length=150)
+
+    @field_validator("items")
+    @classmethod
+    def unique_items(cls, value: list[RecommendationItem]) -> list[RecommendationItem]:
+        if len({item.repo_id for item in value}) != len(value):
+            raise ValueError("recommendation IDs must be unique")
+        return value
+
+
+class FeedbackResponse(StrictModel):
+    accepted: int = Field(ge=0, le=100)
+    duplicates: int = Field(ge=0, le=100)
+    durable: Literal[True]
+
+
+class RepositoryIndexResponse(StrictModel):
+    schema_version: Literal[2]
+    accepted: Literal[True]
+    status: Literal["applied", "duplicate", "current"]
+    job_id: uuid.UUID
+    repo_id: uuid.UUID
+    content_version: int = Field(ge=1)
+    embedding_version: str = Field(min_length=1, max_length=512)
+    card_summary: CardSummaryArtifact
+
+
+class RepositoryRefreshResponse(StrictModel):
+    accepted: Literal[True]
+    status: Literal["applied", "duplicate", "current"]
+    repo_id: uuid.UUID
+    feature_version: int = Field(ge=1)
+
+
+class OnboardingResponse(StrictModel):
+    accepted: Literal[True]
+    status: Literal["applied", "duplicate", "current"]
+    user_id: uuid.UUID
+    profile_version: int = Field(ge=1)
