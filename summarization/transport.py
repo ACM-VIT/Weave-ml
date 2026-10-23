@@ -28,10 +28,16 @@ class BoundedSummarySession:
                         raise requests.RequestException(
                             "summary response exceeded its byte budget"
                         )
+                # aiter_bytes has already removed compression/framing. Keep
+                # status/retry metadata without decoding or framing this body twice.
+                response_headers = {
+                    key: value
+                    for key, value in response.headers.items()
+                    if key.lower()
+                    not in {"content-encoding", "content-length", "transfer-encoding"}
+                }
                 return httpx.Response(
-                    response.status_code,
-                    headers=response.headers,
-                    content=bytes(body),
+                    response.status_code, headers=response_headers, content=bytes(body)
                 )
 
         async def bounded_request():

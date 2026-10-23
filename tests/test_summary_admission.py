@@ -356,3 +356,40 @@ def test_slow_stream_is_actually_closed_before_probe_lease_can_expire(monkeypatc
     with pytest.raises(requests.RequestException, match="deadline"):
         transport.post("https://summary.invalid", json={}, headers={}, timeout=0.1)
     assert time.monotonic() - started < 0.4 and closed == [True]
+
+
+def test_compressed_success_is_not_decoded_twice_or_classified_as_outage():
+    import gzip
+    import json
+
+    import httpx
+
+    from summarization.transport import BoundedSummarySession
+
+    expected = '{"summary":"A concise summary.","highlights":[]}'
+    encoded = gzip.compress(
+        json.dumps({"choices": [{"message": {"content": expected}}]}).encode()
+    )
+
+    async def handler(_):
+        return httpx.Response(
+            200,
+            stream=httpx.ByteStream(encoded),
+            headers={
+                "Content-Encoding": "gzip",
+                "Content-Length": str(len(encoded)),
+                "X-Fixture": "preserved",
+            },
+        )
+
+    config = settings(api_url="https://summary.invalid")
+    policy = LocalSummaryAdmission(config)
+    provider = OpenRouterSummaryProvider(
+        config,
+        session=BoundedSummarySession(transport=httpx.MockTransport(handler)),
+        limiter=NoWait(),
+        admission=policy,
+        sleeper=lambda _: None,
+    )
+    assert provider.generate("A tool for reviewing changes.") == expected
+    assert policy.metrics["available"] == 1 and policy.metrics["failed"] == 0
