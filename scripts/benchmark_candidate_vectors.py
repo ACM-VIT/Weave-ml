@@ -47,11 +47,11 @@ class FixtureRanker:
 class WireQdrant:
     """Serialize/decode complete fixture responses and inject per-call RTT."""
 
-    def __init__(self, *, overlap='high', inline=False, rtt_ms=0, points=20, change=None):
-        self.overlap, self.inline, self.rtt = overlap, inline, rtt_ms / 1000
+    def __init__(self, *, overlap='high', rtt_ms=0, points=20, change=None):
+        self.overlap, self.rtt = overlap, rtt_ms / 1000
         self.points, self.change = points, change
         self.user_id = str(UUID(int=10000))
-        self.records, self.snapshots = [], {}
+        self.records = []
         self.changed_id = None
         self.lock = threading.Lock()
         raw = [(index + 1) / 1000 for index in range(REPOSITORY_EMBEDDING_DIM)]
@@ -91,9 +91,6 @@ class WireQdrant:
                 'decode_cpu_seconds': decode_cpu,
                 'ids': [row['id'] for row in decoded],
                 'vector_ids': [row['id'] for row in decoded if row.get('vector') and stage != 'profile']})
-            for point in result:
-                if stage != 'profile' and point.vector is not None:
-                    self.snapshots[point.id] = point
         return result
 
     @staticmethod
@@ -126,9 +123,6 @@ class WireQdrant:
                 'embedding_model': REPOSITORY_EMBEDDING_MODEL,
                 'embedding_model_revision': EMBEDDING_MODEL_REVISION, 'last_feedback_version': 0}
             return self.exchange('profile', [{'id': self.user_id, 'vector': USER_VECTOR, 'payload': payload}])
-        if self.inline:
-            # Static control only: do not pretend a local snapshot is a fresh RPC.
-            return [self.snapshots[repo_id] for repo_id in kwargs['ids'] if repo_id in self.snapshots]
         rows = [self.repo(int(UUID(repo_id)) - 1) for repo_id in kwargs['ids']]
         if self.change and rows:
             bad = rows[0]
@@ -159,7 +153,7 @@ def isolated_io():
 
 
 def run_case(*, overlap, inline=False, rtt_ms=0, max_candidates=150, heavy=True, change=None):
-    client = WireQdrant(overlap=overlap, inline=False, rtt_ms=rtt_ms, change=change)
+    client = WireQdrant(overlap=overlap, rtt_ms=rtt_ms, change=change)
     ranker = FixtureRanker()
     with isolated_io():
         engine = QdrantV2Retriever(candidate_vector_mode="inline" if inline else "deferred", client=client, ranker=ranker if heavy else None, max_candidates=max_candidates,
