@@ -456,9 +456,20 @@ class RecommendationResponse(StrictModel):
 
 
 class FeedbackResponse(StrictModel):
-    accepted: int = Field(ge=0, le=100)
-    duplicates: int = Field(ge=0, le=100)
+    accepted: int = Field(ge=0, le=100, strict=True)
+    duplicates: int = Field(ge=0, le=100, strict=True)
     durable: Literal[True]
+    acknowledged_event_ids: list[uuid.UUID] = Field(
+        min_length=1, max_length=100, json_schema_extra={"uniqueItems": True},
+    )
+
+    @model_validator(mode="after")
+    def complete_acknowledgement(self):
+        if len(set(self.acknowledged_event_ids)) != len(self.acknowledged_event_ids):
+            raise ValueError("acknowledged event IDs must be unique")
+        if self.accepted + self.duplicates != len(self.acknowledged_event_ids):
+            raise ValueError("accepted plus duplicates must match acknowledged event IDs")
+        return self
 
 
 class RepositoryIndexResponse(StrictModel):
