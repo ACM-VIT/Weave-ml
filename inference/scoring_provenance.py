@@ -192,7 +192,8 @@ def seal_scoring_response(response: dict, context: ScoringContext, frames: tuple
     if not isinstance(items, list) or not 0 <= len(items) <= MAX_ITEMS or len(frames) > MAX_ITEMS:
         raise ValueError('Scored response exceeds allowed output bounds')
     if (response.get('user_id') != context.user_id or response.get('generation_id') != context.generation_id
-            or type(response.get('feed_version')) is not int or response.get('feed_version') != int(context.feed_version)):
+            or type(response.get('feed_version')) not in {int, str}
+            or str(response.get('feed_version')) != context.feed_version):
         raise ValueError('Response ownership/version does not match scored context')
     if any(frame.user_id != context.user_id or frame.generation_id != context.generation_id for frame in frames):
         raise ValueError('Scored frame pool ownership mismatch')

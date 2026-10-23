@@ -105,6 +105,18 @@ def test_selected_inputs_are_bound_to_actual_scored_ids_and_base_score_api_is_un
         seal_scoring_response(original,ctx,(frame(0),replace(frame(1),user_id=identifier(999))))
 
 
+@pytest.mark.parametrize('version', ['9007199254740993', '9223372036854775807'])
+def test_sealed_response_preserves_exact_decimal_feed_revision(version):
+    ctx = context().model_copy(update={'feed_version': version})
+    original = response(1)
+    original['feed_version'] = version
+    wire = seal_scoring_response(original, ctx, (frame(0, ctx),))
+    assert json.loads(wire)['feed_version'] == version
+    original['feed_version'] = float(int(version))
+    with pytest.raises(ValueError, match='ownership/version'):
+        seal_scoring_response(original, ctx, (frame(0, ctx),))
+
+
 @pytest.mark.parametrize('character', ['🚀', '\x00'])
 @pytest.mark.parametrize('opaque_hash', [False, True])
 def test_exact_wire_budget_holds_for_every_allowed_output_size_including_max_versions_and_escaping(character, opaque_hash):
