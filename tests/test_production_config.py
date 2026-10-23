@@ -145,6 +145,19 @@ def test_valid_production_environment_passes() -> None:
     assert validate_production_config(valid_production_env()) == []
 
 
+def test_ranker_device_preflight_does_not_require_target_hardware() -> None:
+    environment = valid_production_env()
+    environment["V2_HEAVY_RANKER_DEVICE"] = "cuda"
+    assert validate_production_config(environment) == []
+
+
+@pytest.mark.parametrize("device", ["", "cdua"])
+def test_ranker_device_preflight_rejects_invalid_explicit_configuration(device) -> None:
+    environment = valid_production_env()
+    environment["V2_HEAVY_RANKER_DEVICE"] = device
+    assert "V2_HEAVY_RANKER_DEVICE" in issue_names(environment)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

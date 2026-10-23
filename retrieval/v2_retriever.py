@@ -359,6 +359,9 @@ class QdrantV2Retriever:
                 "V2_HEAVY_RANKER_ENABLED", default=True
             )
         self.heavy_ranker_enabled = heavy_ranker_enabled
+        self.ranker_device = os.getenv("V2_HEAVY_RANKER_DEVICE", "auto").strip().casefold()
+        if self.ranker_device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("V2_HEAVY_RANKER_DEVICE must be auto, cpu or cuda")
         if heavy_ranker_traffic_percent is None:
             heavy_ranker_traffic_percent = (
                 self._float_env(
@@ -527,6 +530,7 @@ class QdrantV2Retriever:
             expected_embedding_model=self.embedding_model,
             expected_embedding_model_revision=self.embedding_model_revision,
             require_production_manifest=not self.allow_unqualified_ranker,
+            device=self.ranker_device,
         )
 
     @staticmethod

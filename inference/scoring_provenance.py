@@ -106,7 +106,7 @@ class RepositorySnapshot(Strict):
     repo_id: str
     content_version: DecimalVersion
     feature_version: DecimalVersion
-    content_hash: Digest
+    content_hash: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=128)]
     source_hash: Digest
     embedding_version_index: Annotated[int, Field(ge=0, le=7)]
     _id = field_validator('repo_id')(_canonical)
