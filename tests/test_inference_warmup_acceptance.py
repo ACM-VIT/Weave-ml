@@ -206,6 +206,31 @@ def test_warmup_timeout_keeps_resources_until_real_worker_exit_and_never_becomes
         startup.encoder.entered,startup.encoder.release=entered,release
     else:
         startup.runtime.ranker.model=ControlledForward(entered=entered,release=release)
+    from api import main as api_main
+    import time as real_time
+    # Freeze API stage-boundary checks until the selected real stage entered.
+    # Replacing only this module's clock preserves asyncio/native real timing.
+    ticks=[0.]
+    delayed_for=[]
+    class DelayedStartupExecutor(ThreadPoolExecutor):
+        def submit(self,fn,*args,**kwargs):
+            def delayed():
+                began=real_time.monotonic()
+                real_time.sleep(.2)  # Deliberately exceed the former .1s race.
+                delayed_for.append(real_time.monotonic()-began)
+                return fn(*args,**kwargs)
+            return super().submit(delayed)
+    monkeypatch.setattr(api_main,'ThreadPoolExecutor',DelayedStartupExecutor)
+    monkeypatch.setattr(api_main,'time',SimpleNamespace(
+        monotonic=lambda:ticks[0],perf_counter=real_time.perf_counter))
+    original_wait_for=asyncio.wait_for
+    async def after_entry(awaitable,timeout):
+        if timeout==.1:
+            assert await asyncio.to_thread(entered.wait,2), 'warmup stage never entered'
+            assert delayed_for and delayed_for[0]>.1
+            ticks[0]=.2
+        return await original_wait_for(awaitable,timeout=timeout)
+    monkeypatch.setattr(asyncio,'wait_for',after_entry)
     monkeypatch.setenv('INFERENCE_WARMUP_TIMEOUT_SECONDS','0.1')
     try:
         with pytest.raises(RuntimeError,match='startup deadline'):
@@ -291,3 +316,14 @@ def test_profile_fingerprint_includes_onboarding_and_detects_setup_only_changes(
     assert profile.source_hashes()!=before
     with pytest.raises(RuntimeError,match='source changed'):
         profile.require_sources(before)
+
+
+def test_profile_rejects_artifact_drift_even_with_identical_sources_and_scores(monkeypatch):
+    import json
+    from scripts import profile_inference_warmup as profile
+    monkeypatch.setattr(profile,'source_hashes',lambda:{'fixture.py':'same'})
+    rows=iter([{'source_sha256':{'fixture.py':'same'},'artifact_provenance':{'model_sha256':value},
+                'parity':{'ids':['same'],'embedding':[1.],'scores':[.5]}} for value in ('a'*64,'b'*64)])
+    monkeypatch.setattr(profile.subprocess,'run',lambda *a,**kw:SimpleNamespace(stdout=json.dumps(next(rows))))
+    with pytest.raises(RuntimeError,match='different ranker artifacts'):
+        profile.main(['--candidates','1','--repeats','2'])

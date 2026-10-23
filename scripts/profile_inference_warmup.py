@@ -181,6 +181,9 @@ def main(argv=None):
         if row.get('source_sha256')!=sources: raise RuntimeError('child measured different project sources; discard this comparison')
         row['process_wall_ms']=(time.perf_counter()-began)*1000
         rows.append(row)
+    if (not rows[0].get('artifact_provenance') or
+            rows[0]['artifact_provenance'] != rows[1].get('artifact_provenance')):
+        raise RuntimeError('child measured different ranker artifacts; discard this comparison')
     import numpy as np
     left,right=[row.pop('parity') for row in rows]
     if left['ids']!=right['ids']: raise AssertionError('warmup changed ranked identities')
