@@ -138,3 +138,94 @@ def test_parent_rejects_source_dirty_state_mismatch(actual_comparison):
         validate_comparison_result(value,experiment)
 
 
+@pytest.mark.parametrize('failure',['timeout_after_write','cleanup','invalid_report','invalid_json'])
+def test_cli_preserves_previous_report_until_worker_exit_cleanup_and_validation(actual_comparison,tmp_path,monkeypatch,failure):
+    import json,subprocess,tempfile
+    from types import SimpleNamespace
+    from scripts import compare_recommendation_variants as cli
+    experiment, comparison=actual_comparison
+    input_path=tmp_path/'experiment.json';input_path.write_text(experiment.model_dump_json())
+    output=tmp_path/'existing.json';output.write_bytes(b'previous complete report\n')
+    private_paths=[]
+    def worker(command,**kwargs):
+        private=Path(command[command.index('--output')+1]);private_paths.append(private)
+        assert private!=output and not private.exists()
+        assert command[command.index('--expected-input-sha')+1]==digest(experiment)
+        value=copy.deepcopy(comparison)
+        if failure=='invalid_report':value['delta_from_baseline']['baseline']['assembly']['catalogue_coverage']=1.
+        private.write_text('{invalid' if failure=='invalid_json' else json.dumps(value))
+        if failure=='timeout_after_write':raise subprocess.TimeoutExpired(command,kwargs['timeout'])
+        return SimpleNamespace(returncode=0,stdout='synthetic worker completed',stderr='')
+    monkeypatch.setattr(cli.subprocess,'run',worker)
+    # Capability checking uses a separate subprocess call; the actual worker
+    # boundary above is the fault under test, not the machine's Git version.
+    monkeypatch.setattr(cli,'require_offline_git',lambda:None)
+    if failure=='cleanup':
+        original=tempfile.TemporaryDirectory
+        class FailingCleanup(original):
+            def cleanup(self):
+                super().cleanup()
+                raise OSError('fixture private cleanup failure')
+        monkeypatch.setattr(cli.tempfile,'TemporaryDirectory',FailingCleanup)
+    assert cli.main(['--experiment',str(input_path),'--output',str(output)])==2
+    assert output.read_bytes()==b'previous complete report\n'
+    assert private_paths and all(not path.exists() for path in private_paths)
+
+
+def test_cli_success_publishes_only_after_private_cleanup(actual_comparison,tmp_path,monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from scripts import compare_recommendation_variants as cli
+    experiment,comparison=actual_comparison
+    source=tmp_path/'input.json';source.write_text(experiment.model_dump_json())
+    output=tmp_path/'result.json';private_paths=[]
+    def worker(command,**kwargs):
+        private=Path(command[command.index('--output')+1]);private_paths.append(private)
+        private.write_text(json.dumps(comparison));return SimpleNamespace(returncode=0,stdout='',stderr='')
+    original=cli.atomic_json
+    def publish(path,value):
+        assert private_paths and all(not p.exists() for p in private_paths)
+        assert not output.exists()
+        original(path,value)
+    monkeypatch.setattr(cli,'require_offline_git',lambda:None)
+    monkeypatch.setattr(cli.subprocess,'run',worker)
+    monkeypatch.setattr(cli,'atomic_json',publish)
+    assert cli.main(['--experiment',str(source),'--output',str(output)])==0
+    assert json.loads(output.read_text())==comparison
+    assert output.stat().st_mode&0o777==0o600
+
+
+def test_cli_rejects_changed_worker_input_before_any_stage(tmp_path,monkeypatch):
+    from scripts import compare_recommendation_variants as cli
+    source=tmp_path/'input.json';source.write_text(VariantExperiment.model_validate(diagnostic_experiment()).model_dump_json())
+    monkeypatch.setattr(cli,'compare_experiment',lambda *a,**kw:pytest.fail('must reject changed input first'))
+    output=tmp_path/'result.json'
+    assert cli.main(['--experiment',str(source),'--output',str(output),'--worker','--expected-input-sha','0'*64])==2
+    assert not output.exists()
+
+
+def test_comparison_owns_nested_inputs_during_real_stages(monkeypatch):
+    import evaluation.variant_comparison as module
+    require_local_only_git()
+    experiment=VariantExperiment.model_validate(diagnostic_experiment())
+    expected=digest(experiment);original=copy.deepcopy(experiment.model_dump(mode='json'))
+    execute=module.execute_snapshot;calls=[]
+    def stage(snapshot,*args,**kwargs):
+        calls.append(kwargs['treatment'].name)
+        if len(calls)==1:
+            # Mutate caller-owned later conditions/profile inputs, then restore
+            # before the final export (ABA). Only the owned copy may be used.
+            experiment.snapshot.seed='caller-changed-seed'
+            experiment.snapshot.profiles[1].payload['skills']=['caller-changed-skill']
+            experiment.treatments[2].social['max_per_owner']=1
+        result=execute(snapshot,*args,**kwargs)
+        if len(calls)==4:
+            restored=VariantExperiment.model_validate(original)
+            experiment.snapshot=restored.snapshot;experiment.treatments=restored.treatments
+        return result
+    monkeypatch.setattr(module,'execute_snapshot',stage)
+    comparison=module.compare_experiment(experiment,ROOT/'inference')
+    assert digest(experiment)==expected and comparison['experiment_sha256']==expected
+    assert calls==['baseline','diversity','social','combined']
+    assert all(row['execution']['seed']==original['snapshot']['seed'] for row in comparison['results'].values())
+    module.validate_comparison_result(comparison,VariantExperiment.model_validate(original))
