@@ -693,6 +693,28 @@ the onboarding vector or heavy result is unavailable; it never silently serves
 the hybrid ranker. Roll back the complete release instead of enabling hybrid
 traffic; do not retrain or relabel synthetic data as production data.
 
+### Training preprocessing and artifact compatibility
+
+`train_ranker.py` selects its 80/20 input-row split before fitting dense-feature
+statistics. Supply chronologically ordered input when a temporal holdout is
+required; the trainer does not infer timestamps or reorder rows. Only training
+rows determine population mean/scale. Constant columns use scale one. Missing
+nonfinite dense values use fixed per-feature defaults before fitting and before
+transformation; meaningful zero values remain zero observations.
+
+Training and serving share `inference/preprocessing.py`: float32 standardization
+and clipping to [-8, 8] in `FEATURE_ORDER`. New scaler exports record
+`dense-standardize-clip-v1`, feature order, clipping and missing-value defaults.
+The manifest records this version and the training/validation row counts. Unknown
+versions, reordered features or incompatible transform metadata fail loading.
+Historical mean/scale-only scalers retain their existing float32 serving behavior.
+
+This corrects future training/export code. It does not refit or replace the
+checked-in scaler/model, remove historical training leakage, or qualify a model
+for promotion. A future candidate must pass the independent gates above. Exercise
+the isolated export and real-serving parity fixtures with
+`python -m pytest tests/test_ranker_preprocessing.py tests/test_ranker_service.py -q`.
+
 ## Rollout sequence
 
 1. **Staging:** exercise authenticated backend -> API -> Redis -> consumer ->
