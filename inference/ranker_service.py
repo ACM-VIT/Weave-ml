@@ -1,4 +1,5 @@
 import json
+import io
 import hashlib
 import logging
 import math
@@ -23,6 +24,7 @@ from inference.feature_spec import (
     RANKER_MODEL_VERSION,
 )
 from inference.value_function import VALUE_WEIGHTS
+from inference.scoring_provenance import capture_ranker_input
 from config import REPOSITORY_EMBEDDING_VERSION
 from utils.deadline import check_deadline
 
@@ -179,6 +181,7 @@ class RankerService:
             "model manifest is unavailable",
         )
         self.manifest: dict = {}
+        self.loaded_artifact_sha256: dict[str, str] = {}
         
         # Total input dim = User_emb(384) + Repo_emb(384) + DenseFeatures(10)
         self.input_dim = INPUT_DIM
@@ -189,8 +192,9 @@ class RankerService:
                 "model_manifest.json",
             )
         if os.path.exists(manifest_path):
-            with open(manifest_path, "r", encoding="utf-8") as manifest_file:
-                manifest = json.load(manifest_file)
+            manifest_bytes = Path(manifest_path).read_bytes()
+            manifest = json.loads(manifest_bytes)
+            self.loaded_artifact_sha256['manifest_sha256'] = hashlib.sha256(manifest_bytes).hexdigest()
             if not isinstance(manifest, dict):
                 raise ValueError("Model manifest must be a JSON object")
             self.manifest = manifest
@@ -290,7 +294,9 @@ class RankerService:
         self.model = MMoEHeavyRanker(self.input_dim).to(self.device)
         self._model_loaded = False
         if os.path.exists(model_path):
-            self.model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=True))
+            model_bytes = Path(model_path).read_bytes()
+            self.model.load_state_dict(torch.load(io.BytesIO(model_bytes), map_location=self.device, weights_only=True))
+            self.loaded_artifact_sha256['model_sha256'] = hashlib.sha256(model_bytes).hexdigest()
             self._model_loaded = True
             logger.info("Heavy Ranker model loaded successfully from %s", model_path)
         else:
@@ -299,8 +305,9 @@ class RankerService:
             
         # Load Scaler safely from JSON
         if os.path.exists(scaler_path):
-            with open(scaler_path, 'r') as f:
-                scaler_params = json.load(f)
+            scaler_bytes = Path(scaler_path).read_bytes()
+            scaler_params = json.loads(scaler_bytes)
+            self.loaded_artifact_sha256['scaler_sha256'] = hashlib.sha256(scaler_bytes).hexdigest()
             self.scaler_mean = np.array(scaler_params['mean'], dtype=np.float32)
             self.scaler_scale = np.array(scaler_params['scale'], dtype=np.float32)
             if len(self.scaler_mean) != FEATURE_COUNT:
@@ -577,6 +584,9 @@ class RankerService:
         X[:, 2 * self.emb_dim:] = dense_features
         if not np.all(np.isfinite(X)):
             raise ValueError("Heavy ranker input contains non-finite values")
+        # Internal request scope only: no HTTP/config switch activates capture.
+        # X is the actual private float32 buffer after scaling and clipping.
+        capture_ranker_input(self, candidate_repos, X)
         return torch.from_numpy(X).to(self.device)
 
     def _score_batch(self, user_embedding, user_skills, candidate_repos, *, diagnostics=False):
