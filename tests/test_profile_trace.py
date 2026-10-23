@@ -106,10 +106,25 @@ def test_frozen_regular_file_and_exact_large_versions(tmp_path):
     with pytest.raises(ValueError):load_trace(huge)
 
 
-@pytest.mark.parametrize('raw',['{"schema_version":1,"schema_version":2}', '{"value":NaN}', '[]'])
-def test_duplicate_nonfinite_or_incorrect_json_root_rejected(tmp_path,raw):
+@pytest.mark.parametrize('fault',['duplicate_root','duplicate_nested','nan','wrong_root'])
+def test_duplicate_nonfinite_or_incorrect_json_root_rejected(tmp_path,fault):
+    raw=json.dumps(trace(record()))
+    if fault=='duplicate_root':raw=raw.replace('"schema_version": 1','"schema_version": 1, "schema_version": 1')
+    elif fault=='duplicate_nested':raw=raw.replace('"at_ms": 0','"at_ms": 0, "at_ms": 0')
+    elif fault=='nan':raw=raw.replace('"fetch_duration_ms": 5','"fetch_duration_ms": NaN')
+    else:raw='[]'
     path=tmp_path/'invalid';path.write_text(raw)
     with pytest.raises(ValueError):load_trace(path)
+
+
+@pytest.mark.parametrize('compatible',[None,False])
+def test_known_newer_ineligible_revision_still_blocks_later_older_reuse(compatible):
+    report=analyze_trace(trace(record(at_ms=0,feedback_version='1'),
+        record(at_ms=1,feedback_version='2',compatible=compatible),
+        record(at_ms=2,feedback_version='1')),max_age_ms=[100])
+    assert report['clock_and_order']['chronological_revision_regressions_excluded_from_time_experiments']==1
+    assert report['clock_and_order']['temporally_eligible_reads']==1
+    assert report['max_age_experiments'][0]['compatible_repeat_opportunities']==0
 
 
 def test_actual_file_cli_reports_only_aggregates_without_services(tmp_path):

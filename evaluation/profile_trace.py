@@ -140,6 +140,13 @@ def analyze_trace(trace, *, max_age_ms=()):
             coverage[counter] += row.get(field) is None
         coverage["missing_revision"] += _version(row) is None
         coverage["incompatible_reads"] += row.get("compatible") is False
+        if (row.get("subject_key") is not None and row.get("embedding_contract_key") is not None
+                and _version(row) is not None and row.get("process_key") is not None and row.get("clock_key") is not None and row.get("at_ms") is not None):
+            domain = row["process_key"], row["clock_key"]
+            previous = last_input_clock.get(domain)
+            out_of_order += previous is not None and row["at_ms"] < previous
+            last_input_clock[domain] = max(previous if previous is not None else row["at_ms"], row["at_ms"])
+            ordered.append((domain, row["at_ms"], index, row))
         if not _eligible(row):
             continue
         coverage["eligible_versioned_compatible_reads"] += 1
@@ -153,12 +160,6 @@ def analyze_trace(trace, *, max_age_ms=()):
             local_duplicates += local_key in local_keys
             local_keys.add(local_key)
             process_subjects.setdefault(row["subject_key"], set()).add(process)
-        if process is not None and row.get("clock_key") is not None and row.get("at_ms") is not None:
-            domain = process, row["clock_key"]
-            previous = last_input_clock.get(domain)
-            out_of_order += previous is not None and row["at_ms"] < previous
-            last_input_clock[domain] = max(previous if previous is not None else row["at_ms"], row["at_ms"])
-            ordered.append((domain, row["at_ms"], index, row))
     ordered.sort(key=lambda item: (item[0], item[1], item[2]))
     last_revision, last_request, temporal = {}, {}, []
     regressions, gaps = 0, []
@@ -170,6 +171,8 @@ def analyze_trace(trace, *, max_age_ms=()):
             regressions += 1
             continue
         last_revision[subject] = revision
+        if not _eligible(row):
+            continue
         if subject in last_request:
             gaps.append(timestamp-last_request[subject])
         last_request[subject] = timestamp
