@@ -90,8 +90,10 @@ def fixtures(include_sibling=False):
 
 
 class MeasuredModel:
-    def __init__(self, model):
+    def __init__(self, model, token_counts):
         self.model = model
+        self.token_counts = tuple(token_counts)
+        self.position = 0
         self.tokenizer = model.tokenizer
         self.max_seq_length = model.max_seq_length
         self.groups = 0
@@ -99,7 +101,12 @@ class MeasuredModel:
 
     def encode(self, texts, **kwargs):
         self.groups += 1
-        counts = [min(self.max_seq_length, len(self.tokenizer(text, add_special_tokens=True, truncation=False)["input_ids"])) for text in texts]
+        # Reuse the planning counts in the same ordered stream. Retokenizing
+        # here would charge larger cohorts extra diagnostic work in the timer.
+        counts = self.token_counts[self.position:self.position + len(texts)]
+        if len(counts) != len(texts):
+            raise ValueError("encoder group exceeds the prepared token-count stream")
+        self.position += len(texts)
         self.padded_tokens += max(counts) * len(counts)
         return self.model.encode(texts, **kwargs)
 
@@ -120,7 +127,7 @@ def encode_job(case, *, version, model, budget):
     counts = [min(count, model.max_seq_length) for count in raw]
     required = [min(model.max_seq_length, len(model.tokenizer(text, add_special_tokens=True, truncation=False)["input_ids"])) for text in mandatory]
     keep = select_prefix(counts, required, budget)
-    measured = MeasuredModel(model)
+    measured = MeasuredModel(model, counts[:keep] + required)
     vectors = SentenceTransformerEmbedder(model=measured).embed_texts(texts[:keep] + mandatory)
     readme_vector = aggregate_vectors(vectors[:keep], weights=[chunk.weight for chunk in chunks[:keep]] if modern else None)
     final = combine_repo_tower(readme_embedding=readme_vector, metadata_embedding=vectors[-2], topic_embedding=vectors[-1], weights=config.tower_weights)

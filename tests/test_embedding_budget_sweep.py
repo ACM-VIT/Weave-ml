@@ -19,9 +19,11 @@ class Encoder:
     def __init__(self):
         self.tokenizer = wordpiece_tokenizer()
         self.texts = []
+        self.calls = []
 
     def encode(self, texts, **kwargs):
         self.texts.extend(texts)
+        self.calls.append(list(texts))
         result = []
         for text in texts:
             seed = hashlib.sha256(text.encode()).digest()
@@ -102,3 +104,46 @@ def test_changing_inputs_cannot_produce_a_budget_comparison(field):
     with pytest.raises(RuntimeError, match="identity changed"):
         verify_cohorts([group, changed])
     verify_cohorts([group, deepcopy(group)])
+
+
+@pytest.mark.parametrize("version", ["repo-embedding-v2", TOKEN_SECTION_EMBEDDING_VERSION])
+def test_actual_encoder_groups_cross_eight_input_boundary_and_count_padding(version):
+    model = Encoder()
+    long_case = {"name": "group-boundary", "readme": "# Overview\n" + "vector search storage " * 1600}
+    result = encode_job(long_case, version=version, model=model, budget=Budget(12, 65536))
+    assert len(model.texts) == 12
+    assert [len(group) for group in model.calls] == [8, 4]
+    assert result["encoder_groups"] == len(model.calls) == 2
+    lengths = [[min(model.max_seq_length, len(model.tokenizer(text, add_special_tokens=True,
+               truncation=False)["input_ids"])) for text in group] for group in model.calls]
+    assert len(set(length for group in lengths for length in group)) > 1
+    assert result["encoder_padded_tokens"] == sum(max(group) * len(group) for group in lengths)
+    assert all(len(group) <= 8 and max(group) * len(group) <= 2048 for group in lengths)
+
+def test_measured_wrapper_reuses_counts_without_a_second_tokenizer_pass():
+    from scripts.sweep_embedding_budget import MeasuredModel
+    class Untokenizable:
+        max_seq_length = 64
+        def tokenizer(self, *args, **kwargs): raise AssertionError("duplicate tokenizer pass")
+        def encode(self, texts, **kwargs): return np.zeros((len(texts), 384))
+    measured = MeasuredModel(Untokenizable(), [7, 11, 3])
+    measured.encode(["first", "second"])
+    measured.encode(["third"])
+    assert measured.groups == 2 and measured.padded_tokens == 25
+    with pytest.raises(ValueError, match="prepared token-count"):
+        measured.encode(["unexpected"])
+
+def test_job_reporting_does_not_retokenize_the_prepared_input_stream():
+    model = Encoder()
+    original = model.tokenizer
+    calls = []
+    def counted(text, **kwargs):
+        calls.append(text)
+        return original(text, **kwargs)
+    model.tokenizer = counted
+    result = encode_job(case(), version='repo-embedding-v2', model=model, budget=None)
+    # The fake encoder performs no tokenization; the real legacy chunker and
+    # planner need exactly one count per model input, including both towers.
+    # The old reporting wrapper adds a second pass over this complete stream.
+    assert len(calls) == result['job_chunks']
+    assert len(calls) == len(model.texts)
