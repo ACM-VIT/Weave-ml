@@ -22,6 +22,8 @@ def test_actual_trained_cpu_serving_and_stages():
     assert result["artifact"]["qualification_method"] == "manual_override"
     assert result["automatic_qualification_errors"]  # Remain honest about synthetic training.
     assert result["cuda_peak_allocated_bytes"] is None
+    assert result["cuda_peak_allocated_bytes_scope"] == "post_warmup_headline_and_instrumented_calls"
+    assert result["timed_compact_max_abs_error"] == 0
     assert result["process_peak_rss_kib"] > 0
     assert set(result["instrumented_stages"]) == {"host_input", "input_placement", "forward", "output_cpu", "remaining"}
     assert all(value["samples"] == 2 and value["p50_ms"] >= 0 for value in result["instrumented_stages"].values())
@@ -75,3 +77,43 @@ def test_fixture_dimensions_seed_and_normalization():
         np.testing.assert_array_equal(first["embedding"], second["embedding"])
         assert first["embedding"].shape == (384,)
         assert np.isclose(np.linalg.norm(first["embedding"]), 1)
+
+
+@pytest.mark.parametrize('only_call', [None, 5])
+def test_timed_compact_score_regression_with_unchanged_order_is_rejected(monkeypatch, only_call):
+    from inference.ranker_service import RankerService
+    original = RankerService.score_batch_compact
+    calls = 0
+    def changed(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        rows = original(self, *args, **kwargs)
+        if only_call is None or calls == only_call:
+            return [{**row, 'final_score': row['final_score']+.01} for row in rows]
+        return rows
+    monkeypatch.setattr(RankerService, 'score_batch_compact', changed)
+    # First call + three warmups precede timed call5; later timed output is clean.
+    with pytest.raises(AssertionError):
+        run_case('cpu', 3, 2, 1)
+
+
+def test_source_change_during_case_is_rejected(monkeypatch):
+    from scripts import benchmark_ranker_devices as benchmark
+    state = {'inference/ranker_service.py': 'before'}
+    monkeypatch.setattr(benchmark, '_IMPORTED_SOURCE_SHA256', dict(state))
+    monkeypatch.setattr(benchmark, 'source_hashes', lambda: dict(state))
+    def changed(*args):
+        state['inference/ranker_service.py'] = 'after'
+        return {'status': 'measured'}
+    monkeypatch.setattr(benchmark, '_run_case', changed)
+    with pytest.raises(RuntimeError, match='source changed'):
+        benchmark.run_case('cpu', 1, 1, 1)
+
+
+def test_timed_comparison_uses_identity_and_all_iterations():
+    from scripts.benchmark_ranker_devices import compare_timed_compact
+    reference = [{'repo_id':'a','final_score':.2},{'repo_id':'b','final_score':.1}]
+    error, order = compare_timed_compact([(('b',.1),('a',.2))], reference)
+    assert error == 0 and order is False
+    with pytest.raises(AssertionError):
+        compare_timed_compact([(('a',.21),('b',.11)), (('a',.2),('b',.1))], reference)
