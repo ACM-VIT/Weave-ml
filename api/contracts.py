@@ -122,11 +122,44 @@ class ScoringCaptureRequest(StrictModel):
         return value
 
 
+def _bounded_decimal_pattern(maximum: int) -> str:
+    """Canonical positive decimal <= maximum, using portable digit ranges."""
+    digits = str(maximum)
+    alternatives = [rf"[1-9][0-9]{{0,{len(digits)-2}}}"] if len(digits) > 1 else []
+    for index, digit in enumerate(digits):
+        lower, upper = (1 if index == 0 else 0), int(digit) - 1
+        if lower <= upper:
+            choice = str(lower) if lower == upper else f"[{lower}-{upper}]"
+            remaining = len(digits) - index - 1
+            alternatives.append(digits[:index] + choice + (rf"[0-9]{{{remaining}}}" if remaining else ""))
+    alternatives.append(digits)
+    return "^(?:" + "|".join(alternatives) + ")$"
+
+
+_CAPTURE_FEED_VERSION_PATTERN = _bounded_decimal_pattern(2**63 - 1)
+
+
+def _recommendation_request_schema(schema: dict) -> None:
+    # The common properties still enforce the complete capture object schema.
+    # Branches express negotiation without changing the public Python model.
+    schema["oneOf"] = [
+        {"required": ["feed_version"], "properties": {
+            "feed_version": {"type": "integer", "minimum": 1, "maximum": 2**53-1},
+            "scoring_capture": {"type": "null"}}},
+        {"required": ["feed_version", "scoring_capture"], "properties": {
+            "feed_version": {"type": "string", "minLength": 1, "maxLength": 19,
+                "pattern": _CAPTURE_FEED_VERSION_PATTERN,
+                "not": {"pattern": "[^0-9]"}},
+            "scoring_capture": {"type": "object"}}},
+    ]
+
+
 class RecommendationRequest(StrictModel):
+    model_config = ConfigDict(json_schema_extra=_recommendation_request_schema)
     schema_version: Literal[2]
     generation_id: uuid.UUID
     user_id: uuid.UUID
-    feed_version: Annotated[int, Field(strict=True, ge=1, le=2**53-1)] | Annotated[str, StringConstraints(strict=True, pattern=r"^[1-9][0-9]{0,18}$")]
+    feed_version: Annotated[int, Field(strict=True, ge=1, le=2**53-1)] | Annotated[str, StringConstraints(strict=True, max_length=19, pattern=_CAPTURE_FEED_VERSION_PATTERN)]
     scoring_capture: ScoringCaptureRequest | None = None
     limit: int = Field(ge=1, le=100)
 
