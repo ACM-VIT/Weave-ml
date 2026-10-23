@@ -11,13 +11,13 @@ import time
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 from api.contracts import (
-    RecommendationResponse, FeedbackResponse, RepositoryIndexResponse,
+    RecommendationResponse, RecommendationWireResponse, FeedbackResponse, RepositoryIndexResponse,
     RepositoryRefreshResponse, OnboardingResponse,
     FeedbackBatch,
     OnboardingJob,
@@ -39,6 +39,7 @@ from api.runtime import (
     service_runtime_drain_actions,
     validate_service_runtime,
 )
+from api.scoring_capture import CaptureWorkerError, CapturedRequest, authorized_capture_options, execute_captured_request
 from api.request_budget import run_read_only_request
 from api.health import HealthDiagnostics, HealthSettings
 from api.metrics import record_health_dependency, record_recommendation, render_prometheus
@@ -964,6 +965,11 @@ def _apply_lifecycle_observation(expected_point, observation, lock):
         )
         lock.assert_owned()
         actual = dict(stored.payload or {}) if stored is not None else {}
+        # A filtered CAS can be a no-op and still return a newer content point.
+        # Never adopt that winner as the old request's summary-repair snapshot.
+        if any(actual.get(field) != stored_payload.get(field)
+               for field in ("content_version", "content_job_id", "content_hash")):
+            raise HTTPException(status_code=503, detail="Repository content changed during lifecycle update; retry the request.")
         if any(actual.get(field) != value for field, value in lifecycle_features.items()):
             raise HTTPException(status_code=503, detail="Repository lifecycle state changed; retry the request.")
         return stored
@@ -1217,13 +1223,29 @@ def _onboard_user_job(request: OnboardingJob) -> dict[str, Any]:
         ) from exc
 
 
+def _captured_recommendation_job(request: CapturedRequest):
+    return execute_captured_request(retriever(), request)
+
+
 @router.post(
-    "/recommendations/generate", response_model=RecommendationResponse, dependencies=[Depends(require_internal_secret)]
+    "/recommendations/generate", response_model=RecommendationWireResponse, dependencies=[Depends(require_internal_secret)],
+    openapi_extra={"parameters": [{
+        "in": "header", "name": "x-scoring-capture-capability", "required": False,
+        "schema": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$"},
+        "description": "Additional scoped capability required when scoring_capture is provided. Ordinary requests require only the internal service credential.",
+    }]},
 )
 async def generate_recommendations(
     request: RecommendationRequest,
     http_request: Request,
 ):
+    capture_job = None
+    if request.scoring_capture is not None:
+        options = authorized_capture_options(http_request, request.feed_version)
+        capture_job = CapturedRequest(str(request.user_id), str(request.generation_id), request.feed_version,
+            request.limit, tuple(str(item) for item in request.exclude_repo_ids),
+            tuple(str(item) for item in request.social_repo_ids), tuple(request.social_candidates),
+            request.context.cold_start, request.context.locale, options)
     arguments = (
         str(request.user_id), request.limit,
         [str(item) for item in request.exclude_repo_ids], str(request.generation_id),
@@ -1234,10 +1256,11 @@ async def generate_recommendations(
     try:
         batch = await run_read_only_request(
             http_request, recommendation_timeout_seconds(),
-            lambda: run_recommendation_job(
+            (lambda: run_recommendation_job(partial(_captured_recommendation_job, capture_job)))
+            if capture_job is not None else (lambda: run_recommendation_job(
                 retriever().recommend_batch,
                 *arguments,
-            ),
+            )),
         )
     except HTTPException:
         raise
@@ -1253,12 +1276,22 @@ async def generate_recommendations(
             detail="Recommendation generation exceeded its bounded deadline.",
             headers={"Retry-After": "1"},
         ) from exc
+    except CaptureWorkerError:
+        raise V2ServiceHTTPException(status_code=503, error_code="SCORING_CAPTURE_UNAVAILABLE", retryable=True,
+            detail="Requested scoring capture is unavailable; retry after the provider is ready.",
+            headers={"Retry-After": "2"}) from None
     except Exception as exc:
         raise _operation_error(
             "recommendations",
             exc,
             request_id=str(http_request.state.request_id),
         ) from exc
+    if capture_job is not None:
+        if batch.failure_code is not None or batch.wire is None:
+            raise V2ServiceHTTPException(status_code=503, error_code="SCORING_CAPTURE_UNAVAILABLE", retryable=True,
+                detail="Requested scoring capture is unavailable; retry after the provider is ready.",
+                headers={"Retry-After": "2"})
+        return Response(content=batch.wire, media_type="application/json", headers={"Cache-Control": "no-store"})
     items = batch.items
     invalid_scores = any(not math.isfinite(item.score) for item in items)
     if len({item.repo_id for item in items}) != len(items) or invalid_scores:

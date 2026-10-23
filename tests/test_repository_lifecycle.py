@@ -310,3 +310,47 @@ def test_future_lifecycle_source_rejected_before_embedding_work(monkeypatch):
 def test_bootstrap_can_validate_indexes_without_a_retriever_instance():
     from config import QDRANT_PAYLOAD_INDEX_SCHEMA
     QdrantV2Retriever._validate_repository_payload_indexes(SimpleNamespace(payload_schema=QDRANT_PAYLOAD_INDEX_SCHEMA))
+
+
+def test_lifecycle_cas_new_content_readback_cannot_repair_old_request_summary():
+    """An expired holder publishes while our lifecycle CAS loses its snapshot."""
+    from fastapi import HTTPException
+    from api.contracts import RepositoryJob
+    from api.v2 import _embed_repository_job_locked
+    from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
+    from summarization.contracts import card_summary_payload
+    from tests.test_v2_summary_contract import _job, _artifact, FakeEmbedder
+    client, store, point = _indexed_feature_refresh_fixture()
+    client.set_payload(store.collection_name, {'content_version': 7}, [point.id])
+    point.payload['content_version'] = 7
+    body = _job().model_dump(mode='json')
+    body['repository']['content_hash'] = point.payload['content_hash']
+    body['repository']['lifecycle'] = observation(archived=True)
+    request = RepositoryJob.model_validate(body)
+    winning_artifact = _artifact()
+    winning_payload = {
+        'content_version': 8, 'content_job_id': str(uuid.uuid4()), 'content_hash': 'new-content-hash',
+        **card_summary_payload(winning_artifact),
+        **merge_lifecycle({}, body['repository']['lifecycle']),
+    }
+    actual_lifecycle_cas = store.compare_and_set_lifecycle
+    def publish_expired_holder_before_cas(**kwargs):
+        client.set_payload(store.collection_name, winning_payload, [point.id])
+        # Real Qdrant rejects our original snapshot, then readback returns the
+        # winner whose lifecycle is already equal to the intended observation.
+        return actual_lifecycle_cas(**kwargs)
+    pipeline = RepositoryEmbeddingPipeline(embedder=FakeEmbedder())
+    with patch('api.v2.repository_store', return_value=store), patch('api.v2._repository_points', return_value=[point]), patch(
+        'api.v2.repository_embedding_pipeline', return_value=pipeline), patch.object(
+        store, 'compare_and_set_lifecycle', side_effect=publish_expired_holder_before_cas), patch.object(
+        store, 'compare_and_set_card_summary', wraps=store.compare_and_set_card_summary) as summary_cas, patch.object(
+        pipeline, 'summarize_repository', wraps=pipeline.summarize_repository) as summarize:
+        with pytest.raises(HTTPException) as conflict:
+            _embed_repository_job_locked(request, OwnedLock())
+        summarize.assert_not_called()
+        summary_cas.assert_not_called()
+        assert conflict.value.status_code == 503
+    stored = client.retrieve(store.collection_name, [point.id], with_payload=True)[0]
+    for field, value in winning_payload.items():
+        assert stored.payload[field] == value
+    client.close()

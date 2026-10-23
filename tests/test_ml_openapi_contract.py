@@ -16,7 +16,19 @@ def test_all_product_success_responses_have_explicit_wire_models():
     schema = app.openapi()
     for path, status in PRODUCT_OPERATIONS.items():
         response = schema['paths'][path]['post']['responses'][str(status)]
-        assert response['content']['application/json']['schema'].get('$ref'), path
+        wire = response['content']['application/json']['schema']
+        if path == '/api/v2/recommendations/generate':
+            references = [choice['$ref'] for choice in wire['anyOf']]
+            assert len(references) == 3
+            assert set(references) == {
+                '#/components/schemas/RecommendationResponse',
+                '#/components/schemas/CapturedRecommendationResponse',
+                '#/components/schemas/UnscoredEmptyRecommendationResponse',
+            }
+            for reference in references:
+                assert schema['components']['schemas'][reference.rsplit('/', 1)[-1]]['additionalProperties'] is False
+        else:
+            assert wire.get('$ref'), path
 
 
 def test_feedback_schema_preserves_exact_decimal_versions():
