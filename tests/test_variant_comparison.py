@@ -241,3 +241,13 @@ def test_cli_rejects_fifo_before_worker_deadline(tmp_path):
         capture_output=True,text=True,timeout=5)
     assert result.returncode==2 and 'Traceback' not in result.stderr
     assert not output.exists()
+
+
+def test_comparison_discloses_retained_sources_and_cumulative_executor_scope(actual_comparison):
+    _, comparison = actual_comparison
+    assert 'discovery merging retains the first channel' in comparison['source_presence_scope']
+    assert 'drops other discovery memberships' in comparison['source_presence_scope']
+    assert 'not per-condition treatment cost' in comparison['retrieval_executor_scope']
+    totals = [row['execution']['configuration']['runtime']['retrieval_executor']['stages']['profile']['calls_total']
+              for row in comparison['results'].values()]
+    assert all(after > before for before, after in zip(totals, totals[1:]))

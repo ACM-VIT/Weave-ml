@@ -74,7 +74,8 @@ def _comparison_from_exports(experiment, exports):
         'label_provenance':experiment.snapshot.bundle.provenance.model_dump(mode='json'),
         'scope':'offline local exact-search actual components; no real quality, backend privacy/window or production qualification proof',
         'variant_order':[row.name for row in experiment.treatments],'results':results,'delta_from_baseline':deltas,
-        'source_presence_scope':'overlapping evidence channels; sums may exceed1; not causal attribution',
+        'source_presence_scope':'retained overlapping evidence channels only; discovery merging retains the first channel per repository and drops other discovery memberships; social memberships retain overlap; sums may exceed1; not causal attribution',
+        'retrieval_executor_scope':'process-wide cumulative counters and peak across sequential conditions; not per-condition treatment cost',
         'exposure_scope':'supplied frozen exclusions only; seven-day backend implementation and214 acceptance remain separate'}
 
 
