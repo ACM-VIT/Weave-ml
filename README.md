@@ -30,7 +30,8 @@ columns, and incompatible types raise `SchemaCompatibilityError` and roll back;
 apply schema changes through the database owner's migration process before running
 these tools. Required legacy columns and accepted types are declared in
 `database/schema_readiness.py`. Extra columns are allowed, wider text columns and
-`bigint` counters are compatible. Canonical V2 acquisition uses backend ingestion
+`bigint` counters are compatible. Unbounded `varchar` also satisfies required
+`text`, and explicit timestamp precision from 0 through 6 is accepted. Canonical V2 acquisition uses backend ingestion
 instead; online feedback writes durable ML events without mutating product counters.
 The backend owns product counter transactions, including duplicate and rollback
 handling. ML initialization never creates extensions, tables, columns, or indexes.

@@ -43,6 +43,10 @@ def _compatible(actual: str, required: str) -> bool:
             return True
         actual_width = re.fullmatch(r"character varying\((\d+)\)", actual)
         return actual_width is not None and int(actual_width[1]) >= int(width[1])
+    if required == "text":
+        return actual in {"text", "character varying"}
+    if required == "timestamp without time zone":
+        return re.fullmatch(r"timestamp(?:\([0-6]\))? without time zone", actual) is not None
     if required == "integer":
         return actual in {"integer", "bigint"}
     return actual == required
