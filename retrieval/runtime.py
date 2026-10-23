@@ -20,7 +20,7 @@ from utils.runtime_lifecycle import check_runtime_admission, runtime_admission
 
 
 T = TypeVar("T")
-_STAGES = ("profile", "semantic", "trend", "activity", "popularity", "freshness", "vectors", "search")
+_STAGES = ("profile", "semantic", "trend", "activity", "popularity", "freshness", "vectors", "search", "social")
 _pool_lock = threading.Lock()
 _pool: _RetrievalIO | None = None
 
