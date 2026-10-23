@@ -1653,7 +1653,9 @@ class QdrantV2Retriever:
         snapshots = InlineCandidateSnapshots(
             core_fields=_REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS,
             extra_fields=_HEAVY_RANKER_PAYLOAD_FIELDS,
-            max_entries=max(1, min(20_000, budget.remaining)),
+            # Social reads were already reserved but are observed by the same
+            # request-local proof. Include them without increasing the RPC cap.
+            max_entries=max(1, min(20_000, budget.remaining + len(social_ids))),
         ) if inline_vectors else None
         if snapshots is not None:
             eligibility_cache = snapshots

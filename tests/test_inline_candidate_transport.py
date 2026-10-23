@@ -122,3 +122,35 @@ def test_local_qdrant_inline_projection_and_social_hydration(local_recommendatio
                         if call.kwargs.get('collection_name') == retriever.repository_collection]
     assert any(row.get('with_vectors') is False for row in repository_reads)
     assert any(row.get('with_vectors') and social_id in row['ids'] for row in repository_reads)
+
+
+def test_full_read_budget_includes_disjoint_social_and_rejected_semantic_ids():
+    from uuid import UUID
+    from retrieval.social_candidates import SocialCandidate, SocialPolicy
+
+    class Refill(WireQdrant):
+        semantic_reads = 0
+        def query_points(self, **kwargs):
+            result = super().query_points(**kwargs)
+            self.semantic_reads += 1
+            if self.semantic_reads == 1:
+                for point in result.points:
+                    point.vector['repo_embedding'] = [1.]  # Forces bounded refill.
+            return result
+
+    client = Refill(overlap='low', points=100)
+    social = [SocialCandidate(repo_id=str(UUID(int=1001+i)), owner_github_id=str(1001+i),
+              source='followed_owner', source_score=.5, support=1) for i in range(100)]
+    with isolated_io():
+        retriever = engine(client, max_candidates=50,
+                           social_policy=SocialPolicy(mode='enabled', max_lookup=100))
+        batch = retriever.recommend_batch(client.user_id, 10, [], social_candidates=social)
+    assert batch.ranker_applied
+    # 100 social + 100 discovery + 100 semantic observations exhaust the existing
+    # max_candidates*6 budget. Hydration is its separate bounded retained read.
+    initial = [row for row in client.records if row['stage'] not in {'profile', 'vectors'}]
+    social_read, retained_read = [row for row in client.records if row['stage'] == 'vectors']
+    observed = [repo_id for row in initial + [social_read] for repo_id in row['ids']]
+    assert len(observed) == len(set(observed)) == 300
+    assert client.semantic_reads == 2
+    assert len(retained_read['ids']) <= 50
