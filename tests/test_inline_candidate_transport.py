@@ -154,3 +154,49 @@ def test_full_read_budget_includes_disjoint_social_and_rejected_semantic_ids():
     assert len(observed) == len(set(observed)) == 300
     assert client.semantic_reads == 2
     assert len(retained_read['ids']) <= 50
+
+
+def test_shadow_metadata_conflict_cannot_remove_a_valid_inline_pair():
+    from uuid import UUID
+    from retrieval.social_candidates import SocialCandidate, SocialPolicy
+
+    class OlderSocial(WireQdrant):
+        def retrieve(self, **kwargs):
+            if kwargs['ids'] != [self.user_id] and kwargs.get('with_vectors') is False:
+                rows = [self.repo(int(UUID(repo_id)) - 1) for repo_id in kwargs['ids']]
+                for row in rows:
+                    row['payload']['content_version'] += 1
+                return self.exchange('social', [self.project(row, kwargs) for row in rows])
+            return super().retrieve(**kwargs)
+
+    client = OlderSocial()
+    social = SocialCandidate(repo_id=str(UUID(int=1)), owner_github_id='1', source='followed_owner', source_score=.5, support=1)
+    with isolated_io():
+        retriever = engine(client)
+        retriever.social_policy = SocialPolicy(mode='disabled')
+        baseline = retriever.recommend_batch(client.user_id, 10, [], 'same', social_candidates=[social])
+        inputs = list(retriever.ranker.candidates)
+        retriever.social_policy = SocialPolicy(mode='shadow')
+        shadow = retriever.recommend_batch(client.user_id, 10, [], 'same', social_candidates=[social])
+        assert shadow.items == baseline.items
+        assert retriever.ranker.candidates == inputs
+
+
+def test_missing_profile_has_equal_failure_counters_in_both_transports():
+    class Missing(WireQdrant):
+        def retrieve(self, **kwargs):
+            if kwargs['ids'] == [self.user_id]:
+                return self.exchange('profile', [])
+            return super().retrieve(**kwargs)
+
+    for mode in ('deferred', 'inline'):
+        client = Missing()
+        with isolated_io():
+            retriever = QdrantV2Retriever(client=client, ranker=FixtureRanker(),
+                candidate_vector_mode=mode, heavy_ranker_enabled=True, heavy_ranker_required=True,
+                minimum_eligible_repositories=0)
+            with pytest.raises(RetrievalDependencyError):
+                retriever.recommend_batch(client.user_id, 10, [])
+            counts = retriever._ranking_counter_snapshot()
+        assert counts['requests_total'] == counts['heavy_selected'] == counts['fallback_user_vector_unavailable'] == 1
+        assert counts['heavy_served'] == counts['hybrid_served'] == 0

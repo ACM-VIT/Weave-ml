@@ -385,7 +385,21 @@ def _enqueue_feedback(events: list[dict[str, Any]]) -> tuple[int, int]:
 
 
 def _qdrant_health() -> dict[str, Any]:
-    return retriever().health()
+    result = dict(retriever().health())
+    authority = corpus_authority()
+    if authority is None:
+        state = {"enabled": False, "reachable": None, "healthy": True, "state": "DISABLED", "writers": None}
+    else:
+        try:
+            status = authority.status()
+            state = {"enabled": True, "reachable": True,
+                     "healthy": status["state"] in {"READY", "DIRTY"}, **status}
+        except Exception:
+            # Never expose connection URLs, credentials or arbitrary errors.
+            state = {"enabled": True, "reachable": False, "healthy": False,
+                     "state": "UNAVAILABLE", "writers": None}
+    result["corpus_authority"] = state
+    return result
 
 
 def _feedback_health() -> dict[str, Any]:
@@ -1292,6 +1306,8 @@ def _collect_health_diagnostics(stop: threading.Event) -> tuple[bool, dict[str, 
         try:
             result = check()
             details.update(result)
+            if dependency == "qdrant" and not result.get("corpus_authority", {}).get("healthy", True):
+                raise RuntimeError("enabled corpus authority is unavailable for writes")
             if dependency == "redis":
                 consumer_required = os.getenv(
                     "V2_FEEDBACK_CONSUMER_REQUIRED", "true"

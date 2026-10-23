@@ -205,3 +205,162 @@ def test_diversity_does_not_add_repository_vector_reads_to_hybrid_and_rejects_en
     monkeypatch.setenv('V2_DIVERSITY_MODE','enabled')
     with pytest.raises(ValueError,match='strict-heavy'):
         _corpus_retriever(corpus,heavy=False)
+
+
+@pytest.mark.parametrize('mode', ['disabled', 'shadow', 'enabled'])
+def test_full_semantic_pool_retains_independent_exploration_only_when_enabled(diversity_corpus, mode):
+    corpus = diversity_corpus
+    independent = set(corpus.repo_ids[300:450])
+    corpus.client.set_payload(corpus.repository_collection,
+        payload={'star_count': 10000, 'trend_velocity': 10000., 'activity_score': 1.},
+        points=sorted(independent))
+    retriever = _corpus_retriever(corpus, heavy=True)
+    retriever.diversity_mode = mode
+    retriever.diversity_traffic_percent = 100
+    retriever.diversity_policy = DiversityPolicy(minimum_exploration=2)
+    batch = retriever.recommend_batch(corpus.user_id, 30, [], 'full-pool')
+    ranked_ids = {row['id'] for row in retriever.ranker.calls[-1][2]}
+    assert len(ranked_ids) == 150
+    if mode == 'enabled':
+        assert len(ranked_ids & independent) >= 2
+        assert len({row.repo_id for row in batch.items} & independent) >= 2
+        assert batch.ranker_applied
+    else:
+        assert not ranked_ids.intersection(independent)
+
+
+def test_shadow_skips_optional_selector_near_parent_deadline(diversity_corpus, monkeypatch):
+    from utils.deadline import RequestDeadline, check_deadline, deadline_scope
+    corpus = diversity_corpus
+    retriever = _corpus_retriever(corpus, heavy=True)
+    baseline = retriever.recommend_batch(corpus.user_id, 10, [], 'near-deadline')
+    retriever.diversity_mode = 'shadow'
+    retriever.diversity_traffic_percent = 100
+    retriever.diversity_policy = DiversityPolicy(minimum_exploration=0)
+    clock = [0.]
+    deadline = RequestDeadline(30, clock=lambda: clock[0])
+    original_score = retriever.ranker.score_batch
+    def finish_near_deadline(*args):
+        result = original_score(*args)
+        clock[0] = deadline.expires_at - .001
+        return result
+    monkeypatch.setattr(retriever.ranker, 'score_batch', finish_near_deadline)
+    original_shape = retriever.assembler.shape_batch
+    shadow_calls = []
+    def slow_optional(*args, **kwargs):
+        if kwargs.get('diversity_policy') is not None:
+            shadow_calls.append(True)
+            clock[0] += .002
+            check_deadline()
+        return original_shape(*args, **kwargs)
+    monkeypatch.setattr(retriever.assembler, 'shape_batch', slow_optional)
+    with deadline_scope(deadline):
+        result = retriever.recommend_batch(corpus.user_id, 10, [], 'near-deadline')
+    assert result.items == baseline.items
+    assert not shadow_calls
+    assert not deadline.cancelled.is_set()
+
+
+@pytest.mark.parametrize('parent_cancelled', [False, True])
+def test_shadow_child_expiry_is_isolated_but_parent_cancellation_is_authoritative(
+    diversity_corpus, monkeypatch, parent_cancelled,
+):
+    from utils.deadline import (
+        CooperativeDeadlineExceeded, RequestDeadline, check_deadline,
+        current_deadline, deadline_scope,
+    )
+    corpus = diversity_corpus
+    retriever = _corpus_retriever(corpus, heavy=True)
+    baseline = retriever.recommend_batch(corpus.user_id, 10, [], 'child-budget')
+    retriever.diversity_mode = 'shadow'
+    retriever.diversity_traffic_percent = 100
+    retriever.diversity_policy = DiversityPolicy(minimum_exploration=0)
+    clock = [0.]
+    parent = RequestDeadline(30, clock=lambda: clock[0])
+    original = retriever.assembler.shape_batch
+    children = []
+    def expire_optional(*args, **kwargs):
+        if kwargs.get('diversity_policy') is not None:
+            child = current_deadline()
+            assert child is not parent
+            assert child.expires_at < parent.expires_at - .05
+            children.append(child)
+            if parent_cancelled:
+                parent.cancel('cancelled')
+            else:
+                clock[0] = child.expires_at + .001
+            check_deadline()
+        return original(*args, **kwargs)
+    monkeypatch.setattr(retriever.assembler, 'shape_batch', expire_optional)
+    with deadline_scope(parent):
+        if parent_cancelled:
+            with pytest.raises(CooperativeDeadlineExceeded):
+                retriever.recommend_batch(corpus.user_id, 10, [], 'child-budget')
+        else:
+            result = retriever.recommend_batch(corpus.user_id, 10, [], 'child-budget')
+            assert result.items == baseline.items
+            assert parent.remaining() > 29
+    assert len(children) == 1
+    assert parent.cancelled.is_set() is parent_cancelled
+
+
+@pytest.mark.parametrize('defect', ['same_family', 'duplicate_vector'])
+@pytest.mark.parametrize(('social_count', 'pool_cap'), [(0, 150), (20, 150), (100, 150), (50, 50)])
+def test_enabled_pool_preserves_compatible_discovery_breadth_and_personalization(
+    diversity_corpus, defect, social_count, pool_cap,
+):
+    from config import QDRANT_VECTOR_NAME
+    from qdrant_client import models
+    from retrieval.config import DISCOVERY_LIMIT
+    from retrieval.social_candidates import SocialCandidate, SocialPolicy
+    corpus = diversity_corpus
+    independent = set(corpus.repo_ids[300:450])
+    corpus.client.set_payload(corpus.repository_collection,
+        payload={'star_count': 10000, 'trend_velocity': 10000., 'activity_score': 1.},
+        points=sorted(independent))
+    first, second, third = corpus.repo_ids[300:303]
+    if defect == 'same_family':
+        corpus.client.set_payload(corpus.repository_collection,
+            payload={'is_fork': True, 'fork_parent_github_id': '900000',
+                     'fork_family_github_id': '900000'}, points=[first, second])
+    else:
+        point = corpus.client.retrieve(corpus.repository_collection, ids=[first],
+                                      with_payload=True, with_vectors=True)[0]
+        other = corpus.client.retrieve(corpus.repository_collection, ids=[second],
+                                      with_payload=True, with_vectors=True)[0]
+        corpus.client.upsert(corpus.repository_collection, points=[models.PointStruct(
+            id=second, vector=point.vector, payload=other.payload)])
+    retriever = _corpus_retriever(corpus, heavy=True)
+    retriever.max_candidates = pool_cap
+    retriever.diversity_mode = 'enabled'
+    retriever.diversity_traffic_percent = 100
+    retriever.diversity_policy = DiversityPolicy(minimum_exploration=2)
+    retriever.social_policy = SocialPolicy(mode='enabled', max_candidates=100, max_per_source=100)
+    social_ids = corpus.repo_ids[450:450 + social_count]
+    social = [SocialCandidate(repo_id=repo_id, owner_github_id=str(index // 2 + 1),
+              source='followed_owner', support=1, source_score=1.)
+              for index, repo_id in enumerate(corpus.repo_ids) if repo_id in social_ids]
+    batch = retriever.recommend_batch(corpus.user_id, 30, [], 'compatible-breadth', False, [], social)
+    pool = {row['id'] for row in retriever.ranker.calls[-1][2]}
+    assert len(pool) == pool_cap
+    assert len(pool & independent) == DISCOVERY_LIMIT
+    assert {first, second, third} <= pool
+    admitted_social = min(social_count, pool_cap - DISCOVERY_LIMIT - 1)
+    assert len(set(social_ids) & pool) == admitted_social
+    # Tiny full-social custom pools explicitly prioritize enabled discovery and
+    # the semantic floor; no claim that every social reservation can always fit.
+    # Abundant independent rows cannot displace every personalized ANN row.
+    assert len(pool & set(corpus.repo_ids[:150])) == pool_cap - DISCOVERY_LIMIT - admitted_social
+    assert len(batch.items) == 30 and batch.ranker_applied
+    assert len({row.repo_id for row in batch.items} & independent) >= 2
+
+
+def test_enabled_quota_cannot_silently_eliminate_present_personalized_candidates(diversity_corpus):
+    from retrieval.v2_retriever import RetrievalDependencyError
+    retriever = _corpus_retriever(diversity_corpus, heavy=True)
+    retriever.max_candidates = 50
+    retriever.diversity_mode = 'enabled'
+    retriever.diversity_traffic_percent = 100
+    retriever.diversity_policy = DiversityPolicy(minimum_exploration=50)
+    with pytest.raises(RetrievalDependencyError, match='personalized candidate floor'):
+        retriever.recommend_batch(diversity_corpus.user_id, 50, [], 'incompatible-quota')
