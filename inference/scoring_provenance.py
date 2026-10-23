@@ -16,6 +16,7 @@ import hashlib
 import json
 import math
 import struct
+from threading import current_thread
 from typing import Annotated, Literal
 import uuid
 
@@ -236,6 +237,7 @@ class ScoredInputCapture:
     """
     def __init__(self, context: ScoringContext):
         self.context = context
+        self._execution_thread = current_thread()
         self._frames: list[ScoredFrame] = []
         self._ids: set[str] = set()
 
@@ -244,6 +246,8 @@ class ScoredInputCapture:
         return tuple(self._frames)
 
     def record(self, ranker, candidates, matrix):
+        if current_thread() is not self._execution_thread:
+            raise ValueError('Scored capture mutation must stay in its owning execution thread')
         if (ranker.model_version != self.context.model_version
                 or ranker.embedding_model != self.context.embedding_model
                 or ranker.embedding_model_revision != self.context.embedding_revision

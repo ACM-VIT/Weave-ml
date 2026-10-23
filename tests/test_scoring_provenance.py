@@ -262,3 +262,27 @@ def test_capture_is_atomic_bounded_and_never_coerces_other_input_types(actual_ca
         candidates=actual_candidates(ranker,2);del candidates[1]['source_hash']
         with pytest.raises(KeyError):capture.record(ranker,candidates,np.zeros((2,778),dtype=np.float32))
         assert capture.frames==()
+
+
+def test_copied_context_cannot_mutate_another_threads_capture_but_snapshots_remain_readable(actual_capture_ranker):
+    import numpy as np
+    from concurrent.futures import ThreadPoolExecutor
+    from contextvars import copy_context
+    from inference.scoring_provenance import capture_scored_inputs
+    ranker=actual_capture_ranker;user=np.zeros(384,dtype=np.float32);ctx=actual_context(ranker,user=user)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with capture_scored_inputs(ctx) as capture:
+            copied=copy_context()
+            mutation=pool.submit(copied.run,ranker.score_batch_compact,user,[],actual_candidates(ranker,1))
+            with pytest.raises(ValueError,match='execution thread'):
+                mutation.result(timeout=5)
+            assert capture.frames==(), 'Copied-context mutation must leave the owner collector untouched.'
+            ranker.score_batch_compact(user,[],actual_candidates(ranker,1))
+            snapshots=capture.frames
+            packet=packet_for_frame(snapshots[0],ctx)
+        assert capture.frames==()
+        # Finalized tuples and their immutable bytes remain valid after scope
+        # exit and can be checked by another thread with explicit owner selectors.
+        decoded=pool.submit(decode_owned_packet,packet,ctx,owner_user_id=ctx.user_id,
+            generation_id=ctx.generation_id,repo_id=snapshots[0].snapshot.repo_id).result(timeout=5)
+        assert decoded==snapshots[0].input_bytes

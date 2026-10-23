@@ -26,7 +26,10 @@ IDs, mismatched owner inputs/artifacts and invalid/nonfinite dimensions fail the
 opt-in operation; historical inputs are never reconstructed from current Qdrant.
 The scope permits at most150 unique rows and clears its retained references on
 exit, including exceptions. Clearing references is not secure memory erasure.
-Nested scopes are rejected; concurrent contexts are isolated.
+Nested scopes are rejected; concurrent contexts are isolated. Enter and mutate
+the scope in the actual inference execution thread. Copying its ContextVar into
+a child thread does not grant collector mutation ownership. Finalized immutable
+frame tuples remain readable across threads and after scope exit.
 
 The packet uses little-endian float32/base64 and binds canonical context, snapshot
 and input bytes with SHA256. This is integrity checking, not authentication,
