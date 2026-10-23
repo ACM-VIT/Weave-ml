@@ -247,10 +247,12 @@ def test_interrupted_real_discovery_preserves_audit_totals(tmp_path, monkeypatch
 
 def test_successful_batches_bound_checkpoint_fsyncs(tmp_path, monkeypatch):
     import os
+    import stat
     calls = []
+    directories = []
     fsync = os.fsync
     def measured(fd):
-        calls.append(fd)
+        (directories if stat.S_ISDIR(os.fstat(fd).st_mode) else calls).append(fd)
         fsync(fd)
     monkeypatch.setattr('acquisition.checkpoint.os.fsync', measured)
     names = [f'owner/repo{i}' for i in range(10)]
@@ -263,6 +265,7 @@ def test_successful_batches_bound_checkpoint_fsyncs(tmp_path, monkeypatch):
     # Per-batch stage+ack writes and three run-level writes. An additional
     # unchanged fsync after every acknowledgement violates this IO budget.
     assert len(calls) <= 2 * len(names) + 3
+    assert len(directories) == len(calls), 'atomic replacements must also fsync their parent directory'
     assert CorpusCheckpoint(tmp_path / 'state.json').pending_persistence == []
 
 

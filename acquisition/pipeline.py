@@ -13,7 +13,7 @@ from .identity import (
     repository_identity_key,
     repository_name_from_candidate,
 )
-from .models import AcquisitionFailure, AcquisitionRunResult
+from .models import AcquisitionFailure, AcquisitionRunResult, github_failure_disposition
 from .config import metadata_batch_size as configured_metadata_batch_size, readme_workers
 from .readme_scheduler import ReadmeScheduler
 
@@ -249,6 +249,7 @@ def enrich_repositories(
                                         result.repo_id,
                                         "readme_enrichment",
                                         "; ".join(warnings)[:500],
+                                        disposition=getattr(result, "failure_disposition", "retryable"),
                                     )
                                 )
                             else:
@@ -275,7 +276,8 @@ def enrich_repositories(
                         diagnostic = exc.safe_diagnostic if isinstance(exc, GitHubGraphQLClientError) else str(exc)
                         logger.warning("  Batch %d/%d failed: %s", batch_index + 1, batch_count, diagnostic)
                         batch_failures.extend(
-                            AcquisitionFailure(repository_name_from_candidate(candidate), "batch_enrichment", diagnostic)
+                            AcquisitionFailure(repository_name_from_candidate(candidate), "batch_enrichment", diagnostic,
+                                               disposition=github_failure_disposition(exc))
                             for candidate in batch
                         )
                     # Delivery failures must escape the enrichment exception

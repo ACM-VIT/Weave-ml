@@ -32,6 +32,7 @@ class RepositoryDeliveryResult:
     succeeded: list[str] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)
     mappings: dict[str, dict[str, Any]] = field(default_factory=dict)
+    failure_dispositions: dict[str, str] = field(default_factory=dict)
 
     @property
     def count(self) -> int:
@@ -44,10 +45,24 @@ class _EncodedRepositoryBatch:
     body: bytes
 
 
+class BackendIngestionError(RuntimeError):
+    def __init__(self, *, disposition: str = "retryable", status: int | None = None, reason: str = "transport"):
+        reason = reason if reason in {"transport", "http", "invalid_response", "observation_expired"} else "transport"
+        self.status = status if type(status) is int and 100 <= status <= 599 else None
+        self.reason = reason
+        super().__init__(f"backend ingestion failed (status={self.status or 'unknown'}, reason={reason})")
+        self.disposition = disposition
+
+
+class BackendConfigurationError(RuntimeError):
+    """Global authentication/endpoint incidents must not exhaust repo retries."""
+
+
 class BackendIngestionClient:
     """Publish source data without accessing backend PostgreSQL or Qdrant."""
 
     enabled = True
+    indexing_ownership = "backend_outbox"
 
     def __init__(
         self,
@@ -131,6 +146,7 @@ class BackendIngestionClient:
                     yield name, github_id, encoded
                 except Exception as exc:
                     result.failed[_source_name(source)] = str(exc)[:500]
+                    result.failure_dispositions[_source_name(source)] = "permanent"
 
         for batch in _bounded_batches(encoded_records()):
             names = [name for name, _ in batch.identities]
@@ -168,25 +184,31 @@ class BackendIngestionClient:
                 for name in names:
                     if name not in mapped_names:
                         result.failed[name] = "backend returned no repository mapping"
+            except BackendConfigurationError:
+                raise
             except Exception as exc:
                 for name in names:
                     result.failed[name] = str(exc)[:500]
+                    result.failure_dispositions[name] = getattr(exc, "disposition", "retryable")
 
         self._accepted_count += result.count
         return result
 
     def publish_trending_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        observed = timestamp(payload.get("computed_at"))
+        remaining = observed.timestamp() + 30 * 60 - time.time()
         return self._post(
-            "/api/internal/v2/ingestion/trending/snapshots", payload
+            "/api/internal/v2/ingestion/trending/snapshots", payload,
+            deadline=time.monotonic() + remaining,
         )
 
-    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post(self, path: str, payload: dict[str, Any], *, deadline: float | None = None) -> dict[str, Any]:
         encoded = json.dumps(
             payload, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
-        return self._post_encoded(path, encoded)
+        return self._post_encoded(path, encoded, deadline=deadline)
 
-    def _post_encoded(self, path: str, encoded: bytes) -> dict[str, Any]:
+    def _post_encoded(self, path: str, encoded: bytes, *, deadline: float | None = None) -> dict[str, Any]:
         if len(encoded) > MAX_BODY_BYTES:
             raise ValueError("backend request exceeds the 8 MiB body limit")
         headers = {
@@ -195,7 +217,12 @@ class BackendIngestionClient:
             "x-request-id": str(uuid.uuid4()),
         }
         last_error: Exception | None = None
+        disposition = "retryable"
+        status = None
+        reason = "transport"
         for attempt in range(self.max_retries):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise BackendIngestionError(reason="observation_expired")
             try:
                 response = self.session.post(
                     f"{self.base_url}{path}",
@@ -216,11 +243,20 @@ class BackendIngestionClient:
             except (requests.RequestException, ValueError) as exc:
                 last_error = exc
                 status = getattr(getattr(exc, "response", None), "status_code", None)
+                reason = "http" if status is not None else "invalid_response" if isinstance(exc, ValueError) else "transport"
+                if status in (401, 403, 404, 405):
+                    raise BackendConfigurationError(
+                        "backend ingestion authorization or endpoint configuration failed"
+                    ) from exc
                 if status is not None and status < 500 and status != 429:
+                    disposition = "permanent" if status in (400, 413, 422) else "retryable"
                     break
                 if attempt + 1 < self.max_retries:
-                    time.sleep(min(2**attempt, 4))
-        raise RuntimeError(f"backend ingestion failed: {last_error}") from last_error
+                    delay = min(2**attempt, 4)
+                    if deadline is not None:
+                        delay = min(delay, max(0, deadline - time.monotonic()))
+                    time.sleep(delay)
+        raise BackendIngestionError(disposition=disposition, status=status, reason=reason) from last_error
 
 
 def repository_upsert_record(source: Any) -> dict[str, Any]:

@@ -6,11 +6,23 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+class AcquisitionConfigurationError(RuntimeError):
+    """A global incident pauses acquisition without exhausting repository work."""
+
+
+def github_failure_disposition(error: object) -> str:
+    return (
+        "configuration" if getattr(error, "category", None) == "http"
+        and getattr(error, "status_code", None) in (401, 403) else "retryable"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class AcquisitionFailure:
     repository: str
     stage: str
     error: str
+    disposition: str = "retryable"
 
 
 @dataclass(slots=True)
@@ -34,6 +46,11 @@ class CorpusRunReport:
     indexed: int = 0
     resumed_persistence: int = 0
     resumed_indexing: int = 0
+    backend_handoffs: int = 0
+    legacy_pending_index: int = 0
+    quarantined: int = 0
+    pending_delivery: int = 0
+    pending_local_index: int = 0
     failures: dict[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
@@ -48,5 +65,10 @@ class CorpusRunReport:
             "indexed": self.indexed,
             "resumed_persistence": self.resumed_persistence,
             "resumed_indexing": self.resumed_indexing,
+            "backend_handoffs": self.backend_handoffs,
+            "legacy_pending_index": self.legacy_pending_index,
+            "quarantined": self.quarantined,
+            "pending_delivery": self.pending_delivery,
+            "pending_local_index": self.pending_local_index,
             "failures": dict(self.failures),
         }

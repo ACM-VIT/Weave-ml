@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 import threading
 from types import SimpleNamespace
 
@@ -287,6 +288,7 @@ def test_batch_index_failure_isolates_repo_and_resume_clears_checkpoint(tmp_path
         quality_filter=lambda values, **_: (values, []),
         indexer=partially_failing_indexer,
         settings=_settings(path, target=2),
+        checkpoint=CorpusCheckpoint(path, clock=lambda: datetime(2026, 10, 23, tzinfo=timezone.utc)),
     )
     first_report = first_run.run(limit=2, batch_size=2, workers=1, min_readme_chars=1)
 
@@ -306,6 +308,7 @@ def test_batch_index_failure_isolates_repo_and_resume_clears_checkpoint(tmp_path
         quality_filter=lambda values, **_: (values, []),
         indexer=lambda values: resumed.extend(values) or values,
         settings=_settings(path, target=2),
+        checkpoint=CorpusCheckpoint(path, clock=lambda: datetime(2026, 10, 23, tzinfo=timezone.utc) + timedelta(minutes=2)),
     )
     second_report = second_run.run(limit=1, batch_size=1, workers=1, min_readme_chars=1)
 
@@ -386,3 +389,266 @@ def test_settings_validation_returns_runtime_safe_integer_values(tmp_path):
 
     assert settings.target_count == 5
     assert settings.max_cycles == 2
+
+
+def _ownership_pipeline(path, database=None, **kwargs):
+    defaults = dict(
+        database=database or _SuccessfulDatabase(),
+        acquire=lambda **_: [],
+        acquire_retries=lambda names: [_source(name) for name in names],
+        quality_filter=lambda values, **_: (values, []),
+        indexer=lambda _: pytest.fail("backend-owned indexing reached local indexer"),
+        settings=_settings(path),
+        indexing_ownership="backend_outbox",
+    )
+    defaults.update(kwargs)
+    return CorpusPipeline(**defaults)
+
+
+def _run_pipeline(pipeline):
+    return pipeline.run(limit=2, batch_size=1, workers=1, min_readme_chars=1)
+
+
+def test_backend_handoff_does_not_accumulate_local_work_or_stale_failures(tmp_path):
+    path = tmp_path / "checkpoint.json"
+    checkpoint = CorpusCheckpoint(path)
+    checkpoint.add_pending_persistence(["Owner/Repo"])
+    checkpoint.record_failure("Owner/Repo", "persistence", "offline")
+    checkpoint.record_rejection("Owner/Repo", ["old rejection"])
+    checkpoint.save()
+    for _ in range(3):
+        pipeline = _ownership_pipeline(path, acquire=lambda **_: [_source("owner/repo")])
+        report = _run_pipeline(pipeline)
+        loaded = CorpusCheckpoint(path)
+        assert loaded.pending_persistence == loaded.pending_index == []
+        assert loaded.data["failures"] == loaded.data["rejected"] == {}
+        assert report.indexed == 0
+        assert report.backend_handoffs == report.persisted
+    assert len(path.read_bytes()) < 1_000
+
+
+def test_backend_mode_preserves_legacy_and_genuinely_deferred_local_work(tmp_path):
+    path = tmp_path / "checkpoint.json"
+    checkpoint = CorpusCheckpoint(path)
+    checkpoint.data["legacy_pending_index"] = ["owner/unknown"]
+    checkpoint.add_pending_index(["owner/local"])
+    checkpoint.record_failure("owner/local", "indexing", "previous local failure")
+    checkpoint.data["failures"]["owner/local"]["first_failed_at"] = "2020-01-01T00:00:00Z"
+    checkpoint.save()
+    report = _run_pipeline(_ownership_pipeline(path, acquire=lambda **_: [_source("owner/new")]))
+    loaded = CorpusCheckpoint(path)
+    assert loaded.legacy_pending_index == ["owner/unknown"]
+    assert loaded.pending_index == ["owner/local"]
+    assert loaded.data["failures"]["owner/local"]["disposition"] == "retryable"
+    assert report.legacy_pending_index == 1
+    assert report.backend_handoffs == 1
+
+
+def test_disabled_indexing_remains_deferred_for_legacy_callers(tmp_path):
+    path = tmp_path / "checkpoint.json"
+    pipeline = _ownership_pipeline(
+        path, indexing_ownership=None, indexing_enabled=False,
+        acquire=lambda **_: [_source("owner/repo")],
+    )
+    report = _run_pipeline(pipeline)
+    assert pipeline.indexing_ownership == "local_deferred"
+    assert CorpusCheckpoint(path).pending_index == ["owner/repo"]
+    assert report.backend_handoffs == report.indexed == 0
+
+
+def test_backend_client_cannot_silently_take_the_local_indexing_path(tmp_path):
+    from acquisition.backend_client import BackendIngestionClient
+
+    backend = BackendIngestionClient(base_url="https://backend.test", internal_secret="test")
+    with pytest.raises(ValueError, match="backend_outbox"):
+        _ownership_pipeline(tmp_path / "checkpoint.json", database=backend, indexing_ownership=None)
+    with pytest.raises(ValueError, match="Conflicting"):
+        _ownership_pipeline(tmp_path / "checkpoint.json", indexing_enabled=True)
+
+
+def test_unacknowledged_delivery_survives_worker_crash_and_restart(tmp_path):
+    path = tmp_path / "checkpoint.json"
+    database = _SuccessfulDatabase()
+
+    def crash_after_acceptance(_sources):
+        assert CorpusCheckpoint(path).pending_persistence == ["owner/repo"]
+        raise RuntimeError("response lost after commit")
+
+    database.upsert_repositories_detailed = crash_after_acceptance
+    with pytest.raises(RuntimeError, match="response lost"):
+        _run_pipeline(_ownership_pipeline(path, database, acquire=lambda **_: [_source("owner/repo")]))
+    assert CorpusCheckpoint(path).pending_persistence == ["owner/repo"]
+    report = _run_pipeline(_ownership_pipeline(path))
+    assert report.resumed_persistence == report.backend_handoffs == 1
+    assert CorpusCheckpoint(path).pending_persistence == []
+
+
+def test_partial_backend_acknowledgement_keeps_only_failed_work(tmp_path):
+    path = tmp_path / "checkpoint.json"
+    database = _Database(RepositoryUpsertResult(
+        succeeded=["owner/good"], failed={"owner/bad": "temporary failure"},
+    ))
+    pipeline = _ownership_pipeline(path, database, acquire=lambda **_: [
+        _source("owner/good"), _source("owner/bad"),
+    ])
+    report = _run_pipeline(pipeline)
+    checkpoint = CorpusCheckpoint(path)
+    assert report.backend_handoffs == 1
+    assert checkpoint.pending_persistence == ["owner/bad"]
+    assert checkpoint.pending_index == []
+
+
+@pytest.mark.parametrize("outcome", [
+    RepositoryUpsertResult(succeeded=["owner/unexpected"]),
+    RepositoryUpsertResult(succeeded=["owner/repo"], failed={"OWNER/REPO": "conflict"}),
+])
+def test_conflicting_acknowledgements_preserve_work_for_reconciliation(tmp_path, outcome):
+    path = tmp_path / "checkpoint.json"
+    with pytest.raises(ValueError, match="acknowledgement"):
+        _run_pipeline(_ownership_pipeline(path, _Database(outcome), acquire=lambda **_: [_source("owner/repo")]))
+    assert CorpusCheckpoint(path).pending_persistence == ["owner/repo"]
+
+
+def test_missing_acknowledgement_is_reported_and_remains_pending(tmp_path):
+    path = tmp_path / "checkpoint.json"
+    report = _run_pipeline(_ownership_pipeline(path, _Database(), acquire=lambda **_: [_source("owner/repo")]))
+    assert report.backend_handoffs == 0
+    assert "owner/repo" in report.failures
+    assert CorpusCheckpoint(path).pending_persistence == ["owner/repo"]
+
+
+def test_retry_selection_is_bounded_and_failures_rotate_without_losing_work(tmp_path):
+    path = tmp_path / "checkpoint.json"
+    checkpoint = CorpusCheckpoint(path)
+    checkpoint.add_pending_persistence(["owner/first", "owner/second", "owner/third"])
+    checkpoint.save()
+    calls = []
+
+    def fail(names):
+        calls.append(names)
+        return AcquisitionRunResult(failures=[AcquisitionFailure(names[0], "enrichment", "offline")])
+
+    for _ in range(3):
+        pipeline = _ownership_pipeline(path, acquire_retries=fail, settings=CorpusPipelineSettings(
+            checkpoint_path=path, recovery_batch_size=1,
+        ))
+        _run_pipeline(pipeline)
+    assert calls == [["owner/first"], ["owner/second"], ["owner/third"]]
+    assert set(CorpusCheckpoint(path).pending_persistence) == {"owner/first", "owner/second", "owner/third"}
+
+
+def test_resumed_quality_rejection_resolves_failure_and_is_counted(tmp_path):
+    path = tmp_path / "checkpoint.json"
+    now = datetime(2026, 10, 23, tzinfo=timezone.utc)
+    checkpoint = CorpusCheckpoint(path, clock=lambda: now)
+    checkpoint.add_pending_persistence(["owner/repo"])
+    checkpoint.record_failure("owner/repo", "enrichment", "temporary failure")
+    checkpoint.save()
+    pipeline = _ownership_pipeline(path, checkpoint=CorpusCheckpoint(path, clock=lambda: now + timedelta(minutes=2)), quality_filter=lambda values, **_: (
+        [], [(value, ["no README"]) for value in values],
+    ))
+    report = _run_pipeline(pipeline)
+    checkpoint = CorpusCheckpoint(path)
+    assert report.rejected == 1
+    assert checkpoint.pending_persistence == []
+    assert checkpoint.data["failures"] == {}
+    assert "owner/repo" in checkpoint.data["rejected"]
+
+
+def test_resumed_local_index_success_resolves_stale_failure(tmp_path):
+    path = tmp_path / "checkpoint.json"
+    now = datetime(2026, 10, 23, tzinfo=timezone.utc)
+    checkpoint = CorpusCheckpoint(path, clock=lambda: now)
+    checkpoint.add_pending_index(["owner/repo"])
+    checkpoint.record_failure("OWNER/REPO", "indexing", "offline")
+    checkpoint.save()
+    report = _run_pipeline(_ownership_pipeline(
+        path, indexing_ownership="local_immediate", indexer=lambda values: values,
+        checkpoint=CorpusCheckpoint(path, clock=lambda: now + timedelta(minutes=2)),
+    ))
+    assert report.resumed_indexing == 1
+    assert CorpusCheckpoint(path).data["failures"] == {}
+
+
+def test_global_github_incident_preserves_partial_work_without_spending_repo_attempts(tmp_path):
+    from acquisition.models import AcquisitionConfigurationError
+
+    path = tmp_path / "checkpoint.json"
+    acquired = AcquisitionRunResult(
+        repositories=[_source("owner/resolved")],
+        failures=[AcquisitionFailure("owner/auth", "metadata", "authorization failed", disposition="configuration")],
+    )
+    with pytest.raises(AcquisitionConfigurationError, match="configuration incident"):
+        _run_pipeline(_ownership_pipeline(path, acquire=lambda **_: acquired))
+    checkpoint = CorpusCheckpoint(path)
+    assert set(checkpoint.pending_persistence) == {"owner/auth", "owner/resolved"}
+    assert checkpoint.data["failures"] == {}
+    assert checkpoint.data["last_run"]["status"] == "paused"
+
+
+def test_full_name_takes_precedence_over_backend_uuid_for_recovery_identity(tmp_path):
+    from acquisition.models import CorpusRunReport
+
+    path = tmp_path / "checkpoint.json"
+    database = _Database(RepositoryUpsertResult(succeeded=["owner/repo"]))
+    pipeline = _ownership_pipeline(path, database)
+    with pipeline.checkpoint.session():
+        pipeline._persist_and_index([
+            {"id": "00000000-0000-0000-0000-000000000001", "full_name": "owner/repo"},
+        ], database_ready=True, report=CorpusRunReport())
+    assert CorpusCheckpoint(path).pending_persistence == []
+
+
+@pytest.mark.parametrize('streaming', [False, True])
+def test_rejection_overflow_retains_every_received_batch_identity(tmp_path, streaming):
+    from acquisition.checkpoint_policy import CheckpointPolicy
+    path = tmp_path / 'checkpoint.json'
+    checkpoint = CorpusCheckpoint(path, policy=CheckpointPolicy(max_history_entries=1))
+    checkpoint.record_rejection('owner/previous', ['no README'])
+    checkpoint.save()
+    values = [_source('owner/approved'), _source('owner/rejected'), _source('owner/remaining')]
+    def acquire(**kwargs):
+        result = AcquisitionRunResult(repositories=values)
+        if streaming:
+            kwargs['on_batch'](result)
+            return AcquisitionRunResult()
+        return result
+    pipeline = _ownership_pipeline(
+        path, checkpoint=checkpoint, streaming=streaming, acquire=acquire,
+        quality_filter=lambda values, **_: (values[:1], [(value, ['no README']) for value in values[1:]]),
+    )
+    with pytest.raises(RuntimeError, match='rejection history capacity'):
+        _run_pipeline(pipeline)
+    assert set(CorpusCheckpoint(path).pending_persistence) == {value.repo_id for value in values}
+
+
+@pytest.mark.parametrize('streaming', [False, True])
+@pytest.mark.parametrize('partial_failure', [False, True])
+def test_local_only_indexing_releases_successful_work_and_preserves_failures(tmp_path, streaming, partial_failure):
+    path = tmp_path / 'checkpoint.json'
+    sources = [_source('owner/good'), _source('owner/retry')]
+    def acquire(**kwargs):
+        result = AcquisitionRunResult(repositories=sources)
+        if streaming:
+            kwargs['on_targets']([source.repo_id for source in sources])
+            kwargs['on_batch'](result)
+            return AcquisitionRunResult()
+        return result
+    def index(values):
+        if partial_failure and any(source.repo_id == 'owner/retry' for source in values):
+            raise RuntimeError('local index unavailable')
+        return values
+    pipeline = _ownership_pipeline(
+        path, database=SimpleNamespace(enabled=False),
+        indexing_ownership='local_immediate', allow_qdrant_without_postgres=True,
+        acquire=acquire, indexer=index, streaming=streaming,
+    )
+    report = _run_pipeline(pipeline)
+    checkpoint = CorpusCheckpoint(path)
+    expected = ['owner/retry'] if partial_failure else []
+    assert checkpoint.pending_persistence == expected
+    assert checkpoint.pending_index == []
+    assert set(checkpoint.data['failures']) == set(expected)
+    assert checkpoint.excluded_names() == set(expected)
+    assert report.indexed == (1 if partial_failure else 2)
+    assert report.persisted == report.backend_handoffs == 0

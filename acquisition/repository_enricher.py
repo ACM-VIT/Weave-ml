@@ -19,7 +19,7 @@ from .github_graphql_client import (
     build_readme_base_url,
 )
 from .graphql_queries import README_CANDIDATES
-from .models import AcquisitionFailure
+from .models import AcquisitionFailure, github_failure_disposition
 from .repository_lineage import lineage_from_graphql
 from utils.readme_processor import README_PROCESSING_VERSION, ReadmeDocument, process_markdown
 from .github_rate_limit import GitHubRequestBudget
@@ -41,6 +41,7 @@ class EnrichmentResult:
     topics: list[str]
     languages: dict[str, int]
     warnings: list[str] = field(default_factory=list)
+    failure_disposition: str = "retryable"
 
 
 class EnrichmentBatch(list[EnrichmentResult]):
@@ -169,7 +170,8 @@ class RepositoryEnricher:
 
         def failed_rows(rows: list[tuple[str, str]], error: GitHubGraphQLClientError) -> None:
             metadata_failures.extend(
-                AcquisitionFailure(f"{owner}/{name}", "metadata_enrichment", error.safe_diagnostic)
+                AcquisitionFailure(f"{owner}/{name}", "metadata_enrichment", error.safe_diagnostic,
+                                   disposition=github_failure_disposition(error))
                 for owner, name in rows
             )
             logger.warning("Metadata chunk failed: %s", error.safe_diagnostic)
@@ -254,6 +256,7 @@ class RepositoryEnricher:
                     diagnostic = exc.safe_diagnostic if isinstance(exc, GitHubGraphQLClientError) else str(exc)
                     warning = f"README fetch failed: {type(exc).__name__}: {diagnostic}"
                     result.warnings.append(warning[:500])
+                    result.failure_disposition = github_failure_disposition(exc)
                     logger.warning("README fetch failed for %s: %s", repo_id, diagnostic)
 
             if readme_text or isinstance(readme_text, FetchedReadme):

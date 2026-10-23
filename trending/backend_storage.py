@@ -8,7 +8,7 @@ import json
 import logging
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 import uuid
 
 from acquisition.backend_client import (
@@ -17,9 +17,10 @@ from acquisition.backend_client import (
     repository_upsert_record,
 )
 from acquisition.identity import repository_identity_key
-from acquisition.models import AcquisitionRunResult
+from acquisition.models import AcquisitionConfigurationError, AcquisitionRunResult
 from acquisition.pipeline import enrich_repositories
 from .errors import IncompleteTrendingSnapshot
+from .coordination import SingletonTrendingCoordinator
 
 logger = logging.getLogger(__name__)
 _RETRY_CACHE_SECONDS = 300
@@ -35,9 +36,15 @@ class BackendTrendingStorage:
         *,
         backend: BackendIngestionClient,
         github_token: str,
+        coordinator: SingletonTrendingCoordinator | None = None,
+        clock: Callable[[], datetime] | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> None:
         self.backend = backend
         self._github_token = github_token
+        self.coordinator = coordinator
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._monotonic = monotonic or time.monotonic
         self._last_refresh: datetime | None = None
         self._refresh_lock = threading.Lock()
         self._retry_key: str | None = None
@@ -45,13 +52,23 @@ class BackendTrendingStorage:
         # Immutable encoded records cannot be mutated while adding rank/score.
         self._retry_records: dict[str, bytes] = {}
         self._retry_bytes = 0
+        self._snapshot_id: str | None = None
+        self._snapshot_observed_at: datetime | None = None
         self.last_enrichment_counts: dict[str, int] = {}
 
     def init_schema(self) -> None:
         """Compatibility no-op: backend migrations own durable schemas."""
 
     def get_last_refresh_time(self) -> datetime | None:
-        return self._last_refresh
+        return self.coordinator.last_refresh() if self.coordinator else self._last_refresh
+
+    def refresh_session(self, *, force: bool, refresh_hours: int):
+        if self.coordinator is None:
+            raise RuntimeError(
+                "Trending scheduling requires explicit persistent singleton coordination; "
+                "configure TRENDING_COORDINATION_MODE=singleton_file and TRENDING_STATE_PATH"
+            )
+        return self.coordinator.refresh_session(force=force, refresh_hours=refresh_hours)
 
     def _enrich_candidates(self, repositories: list[dict[str, Any]]) -> AcquisitionRunResult:
         return enrich_repositories(
@@ -62,6 +79,8 @@ class BackendTrendingStorage:
         self._retry_records.clear()
         self._retry_bytes = 0
         self._retry_key = None
+        self._snapshot_id = None
+        self._snapshot_observed_at = None
 
     def upsert_repositories(
         self,
@@ -78,7 +97,9 @@ class BackendTrendingStorage:
         repositories: list[dict[str, Any]],
         refresh_timestamp: datetime | None,
     ) -> int:
-        computed_at = refresh_timestamp or datetime.now(timezone.utc)
+        computed_at = refresh_timestamp or self._clock()
+        if computed_at.tzinfo is None:
+            raise ValueError("trending observation time must include a timezone")
         identities = [repository_identity_key(repo.get("full_name")) for repo in repositories]
         if not identities or not all(identities) or len(set(identities)) != len(identities):
             raise ValueError("trending snapshot requires unique valid repository identities")
@@ -88,16 +109,27 @@ class BackendTrendingStorage:
             repositories, sort_keys=True, separators=(",", ":"),
             ensure_ascii=False, allow_nan=False,
         ).encode("utf-8")).hexdigest()
-        now = time.monotonic()
+        now = self._monotonic()
         if snapshot_key != self._retry_key or now >= self._retry_expires:
             self._clear_retry()
             self._retry_key = snapshot_key
             self._retry_expires = now + _RETRY_CACHE_SECONDS
+            self._snapshot_id = str(uuid.uuid4())
+            self._snapshot_observed_at = computed_at
+        computed_at = self._snapshot_observed_at
+        if computed_at is None:
+            raise RuntimeError("trending snapshot has no observation time")
+        age = (self._clock() - computed_at).total_seconds()
+        if age < 0 or age >= 30 * 60:
+            self._clear_retry()
+            raise ValueError("refusing stale trending snapshot workset")
 
         pending = [repo for key, repo in zip(identities, repositories) if key not in self._retry_records]
         reused = len(identities) - len(pending)
         if pending:
             result = self._enrich_candidates(pending)
+            if any(failure.disposition == "configuration" for failure in result.failures):
+                raise AcquisitionConfigurationError("GitHub configuration incident during trending acquisition")
             pending_keys = {repository_identity_key(repo["full_name"]) for repo in pending}
             failed_keys = {repository_identity_key(failure.repository) for failure in result.failures}
             if not failed_keys.issubset(pending_keys):
@@ -152,7 +184,7 @@ class BackendTrendingStorage:
             self._clear_retry()
             raise ValueError("trending snapshot requires unique GitHub repository IDs")
         snapshot = {
-            "snapshot_id": str(uuid.uuid4()),
+            "snapshot_id": self._snapshot_id,
             "period": "daily",
             "computed_at": computed_at.astimezone(timezone.utc).isoformat(),
             "source": "github-trending",
@@ -168,7 +200,12 @@ class BackendTrendingStorage:
             raise ValueError(
                 "refusing trending snapshot larger than the 8 MiB transport limit"
             )
+        if (self._clock() - computed_at).total_seconds() >= 30 * 60:
+            self._clear_retry()
+            raise ValueError("refusing stale trending snapshot workset")
         self.backend.publish_trending_snapshot(snapshot)
+        if self.coordinator:
+            self.coordinator.mark_success(snapshot_id=snapshot["snapshot_id"], observed_at=computed_at)
         self._last_refresh = computed_at
         self._clear_retry()
         return len(records)

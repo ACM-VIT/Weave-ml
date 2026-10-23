@@ -56,6 +56,7 @@ Examples:
         action="store_true",
         help="Run a single refresh cycle and exit",
     )
+    parser.add_argument("--force", action="store_true", help="Override freshness for an explicitly requested --once refresh")
 
     parser.add_argument(
         "--limit",
@@ -92,7 +93,10 @@ Examples:
         help="Validate configuration and exit without running",
     )
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.force and not args.once:
+        parser.error("--force requires --once")
+    return args
 
 
 def main(argv: list[str] | None = None):
@@ -127,6 +131,12 @@ def main(argv: list[str] | None = None):
         readme_workers()
     except ValueError as exc:
         config_errors.append(str(exc))
+    state_path = os.getenv("TRENDING_STATE_PATH", "").strip()
+    if os.getenv("TRENDING_COORDINATION_MODE") != "singleton_file" or not state_path:
+        config_errors.append(
+            "Choose TRENDING_COORDINATION_MODE=singleton_file and a shared persistent "
+            "TRENDING_STATE_PATH; independent scheduler hosts require backend lease support"
+        )
     if config_errors:
         logger.error("Configuration validation failed:")
         for error in config_errors:
@@ -154,6 +164,7 @@ def main(argv: list[str] | None = None):
     try:
         from acquisition.backend_client import BackendIngestionClient
         from trending.backend_storage import BackendTrendingStorage
+        from trending.coordination import SingletonTrendingCoordinator
 
         backend = BackendIngestionClient(
             base_url=os.environ["BACKEND_URL"],
@@ -162,13 +173,14 @@ def main(argv: list[str] | None = None):
         storage = BackendTrendingStorage(
             backend=backend,
             github_token=os.environ["GITHUB_TOKEN"],
+            coordinator=SingletonTrendingCoordinator(state_path),
         )
         if args.scheduled:
             logger.info("Starting scheduled mode...")
             run_scheduler(storage=storage)
         elif args.once:
             logger.info("Starting single refresh cycle...")
-            success = run_once(force=True, storage=storage)
+            success = run_once(force=args.force, storage=storage)
             if success:
                 logger.info("Single refresh cycle completed successfully.")
                 sys.exit(0)

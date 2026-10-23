@@ -446,6 +446,46 @@ def test_trending_retry_reuses_successes_and_restores_original_rank_order():
     assert storage._retry_records == {}
 
 
+def test_backend_malformed_mapping_suffix_does_not_acknowledge_a_valid_prefix():
+    session = _Session()
+    valid = {"github_id": "123", "repo_id": str(uuid.uuid4()), "content_version": 1}
+    session.post = lambda *_args, **_kwargs: _Response({"mappings": [valid, {"github_id": "999"}]})
+    result = BackendIngestionClient(
+        base_url="https://backend.test", internal_secret="test", session=session,
+    ).upsert_repositories_detailed([_source()])
+    assert result.succeeded == []
+    assert result.mappings == {}
+    assert set(result.failed) == {"owner/repo"}
+
+
+def test_invalid_delivery_record_is_classified_as_permanent():
+    source = _source()
+    source.payload["github_id"] = "invalid"
+    result = BackendIngestionClient(
+        base_url="https://backend.test", internal_secret="test", session=_Session(),
+    ).upsert_repositories_detailed([source])
+    assert result.failure_dispositions == {"owner/repo": "permanent"}
+
+
+def test_backend_auth_failure_pauses_worker_without_exhausting_repository_attempts():
+    import requests
+    from acquisition.backend_client import BackendConfigurationError
+
+    class Unauthorized(_Response):
+        status_code = 401
+
+        def raise_for_status(self):
+            raise requests.HTTPError("credential-bearing message must not be persisted", response=self)
+
+    session = _Session()
+    session.post = lambda *_args, **_kwargs: Unauthorized({})
+    client = BackendIngestionClient(
+        base_url="https://backend.test", internal_secret="test", session=session,
+    )
+    with pytest.raises(BackendConfigurationError, match="configuration failed"):
+        client.upsert_repositories_detailed([_source()])
+
+
 @pytest.mark.parametrize('invalid', [
     {'github_id': 'unexpected', 'repo_id': 'invalid', 'content_version': 1},
     {'github_id': '123', 'repo_id': str(uuid.uuid4()), 'content_version': 1},
@@ -465,3 +505,46 @@ def test_ambiguous_mapping_suffix_does_not_acknowledge_a_valid_prefix(invalid):
     assert result.succeeded == [] and result.mappings == {}
     assert set(result.failed) == {'owner/one', 'owner/two'}
     assert client.get_repo_count() == 0 and client._accepted_names == set()
+
+
+@pytest.mark.parametrize('status', [400, 413, 422, 503])
+def test_backend_failure_retains_safe_status_without_raw_response(status):
+    import requests
+    class Failed(_Response):
+        status_code = status
+        def raise_for_status(self):
+            raise requests.HTTPError('secret-token https://credential@example.test/private', response=self)
+    session = _Session()
+    session.post = lambda *args, **kwargs: Failed({})
+    result = BackendIngestionClient(
+        base_url='https://backend.test', internal_secret='test', session=session, max_retries=1,
+    ).upsert_repositories_detailed([_source()])
+    assert f'status={status}' in result.failed['owner/repo']
+    assert 'reason=http' in result.failed['owner/repo']
+    assert 'secret-token' not in result.failed['owner/repo']
+    assert 'credential' not in result.failed['owner/repo']
+
+
+@pytest.mark.parametrize('failure', ['server', 'timeout'])
+def test_snapshot_http_retry_cannot_start_after_observation_window(monkeypatch, failure):
+    import requests
+    from acquisition.backend_client import BackendIngestionError
+    elapsed = [0.0]
+    calls = []
+    observed = '2026-10-23T00:00:00+00:00'
+    from datetime import datetime
+    monkeypatch.setattr(backend_client.time, 'time', lambda: datetime.fromisoformat(observed).timestamp() + 1799)
+    monkeypatch.setattr(backend_client.time, 'monotonic', lambda: elapsed[0])
+    monkeypatch.setattr(backend_client.time, 'sleep', lambda delay: elapsed.__setitem__(0, elapsed[0] + delay))
+    def post(*args, **kwargs):
+        calls.append(kwargs['data'])
+        elapsed[0] += 2
+        if failure == 'timeout':
+            raise requests.Timeout('secret url')
+        response = _Response({})
+        response.status_code = 503
+        return response
+    client = BackendIngestionClient(base_url='https://backend.test', internal_secret='test', session=SimpleNamespace(post=post))
+    with pytest.raises(BackendIngestionError, match='observation_expired'):
+        client.publish_trending_snapshot({'computed_at': observed})
+    assert len(calls) == 1
