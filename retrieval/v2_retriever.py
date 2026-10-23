@@ -1771,7 +1771,9 @@ class QdrantV2Retriever:
                                 social_points.pop(point_id, None)
                                 continue
                             seen_social.add(point_id)
-                            point = self._eligible_repository_point(record, snapshots, require_vector=False)
+                            point = self._eligible_repository_point(
+                                record, snapshots if social_policy.injects else None, require_vector=False,
+                            )
                             if point is not None and point.repo_id not in excluded:
                                 social_points[point.repo_id] = point
                         record_candidate_read("social", records, len(social_points))
