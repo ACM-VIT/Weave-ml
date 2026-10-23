@@ -1,0 +1,79 @@
+{
+  "k": 3,
+  "min_profiles": 2,
+  "policy_id": "synthetic-smoke-v1",
+  "reference": "Synthetic correctness limits, not production quality thresholds",
+  "rules": [
+    {
+      "max_regression": 0.02,
+      "maximum": null,
+      "metric": "judged_ndcg_at_k",
+      "minimum": 0.8,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 0.02,
+      "maximum": null,
+      "metric": "judged_recall_at_k",
+      "minimum": 0.8,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 0.01,
+      "maximum": null,
+      "metric": "catalogue_coverage",
+      "minimum": 0.8,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 0.1,
+      "maximum": 0.9,
+      "metric": "intra_list_similarity",
+      "minimum": null,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 0.0,
+      "maximum": 0.0,
+      "metric": "repeat_rate",
+      "minimum": null,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 0.0,
+      "maximum": 0.0,
+      "metric": "excluded_rate",
+      "minimum": null,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 0.0,
+      "maximum": 0.0,
+      "metric": "archived_rate",
+      "minimum": null,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 0.0,
+      "maximum": 0.0,
+      "metric": "fork_repeat_rate",
+      "minimum": null,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 0.5,
+      "maximum": 20.0,
+      "metric": "latency_p95_ms",
+      "minimum": null,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 0.0,
+      "maximum": null,
+      "metric": "judgment_coverage",
+      "minimum": 1.0,
+      "stage": "assembly"
+    }
+  ],
+  "schema_version": 1
+}

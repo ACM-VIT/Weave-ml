@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import asyncio
 import threading
 import uuid
 from unittest.mock import MagicMock
@@ -93,16 +94,29 @@ def test_timeout_after_durable_acceptance_never_guesses_ack_ids(monkeypatch):
     redis = ProducerRedis()
     producer = producer_for(redis)
     started, release = threading.Event(), threading.Event()
+    original_wait_for = asyncio.wait_for
+    controlled_deadlines = []
+
+    async def wait_after_durable_acceptance(awaitable, timeout):
+        if timeout == .1:
+            # Exercise timeout AFTER durable enqueue. Starting the observation
+            # clock before the worker arrives tests a different valid scenario.
+            assert await asyncio.to_thread(started.wait, 5), 'durable worker did not start'
+            controlled_deadlines.append(timeout)
+        return await original_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(runtime.asyncio, 'wait_for', wait_after_durable_acceptance)
 
     def delayed_return(events):
         counts = producer.enqueue(events)
         started.set()
-        assert release.wait(2)
+        assert release.wait(10)
         return counts
 
     monkeypatch.setattr(v2, '_enqueue_feedback', delayed_return)
     try:
         response = post([event()])
+        assert controlled_deadlines == [.1]
         assert started.is_set() and len(redis.messages) == 1
         assert response.status_code == 503
         assert 'acknowledged_event_ids' not in response.json()
