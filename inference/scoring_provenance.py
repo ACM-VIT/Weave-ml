@@ -131,6 +131,7 @@ class ScoredFrame:
     generation_id: str
     snapshot: RepositorySnapshot
     input_bytes: bytes = field(repr=False)
+    context: ScoringContext = field(repr=False)
 
 
 def _validate_input(raw: bytes, context: ScoringContext):
@@ -145,6 +146,8 @@ def _validate_input(raw: bytes, context: ScoringContext):
 def packet_for_frame(frame: ScoredFrame, context: ScoringContext) -> ScoredPacket:
     if frame.user_id != context.user_id or frame.generation_id != context.generation_id:
         raise ValueError('Scored frame ownership does not match captured context')
+    if frame.context != context:
+        raise ValueError('Scored frame context does not match capture-time context')
     if frame.snapshot.embedding_version_index >= len(context.repository_embedding_versions):
         raise ValueError('Repository embedding version is not in captured context')
     _validate_input(frame.input_bytes, context)
@@ -169,7 +172,7 @@ def decode_owned_packet(packet: ScoredPacket, context: ScoringContext, *,
         raw = base64.b64decode(packet.input_base64, validate=True)
     except (ValueError, TypeError) as exc:
         raise ValueError('Invalid scored packet encoding') from exc
-    expected = packet_for_frame(ScoredFrame(context.user_id, context.generation_id, packet.snapshot, raw), context)
+    expected = packet_for_frame(ScoredFrame(context.user_id, context.generation_id, packet.snapshot, raw, context), context)
     if expected.binding_sha256 != packet.binding_sha256:
         raise ValueError('Scored packet integrity mismatch')
     return raw
@@ -193,6 +196,8 @@ def seal_scoring_response(response: dict, context: ScoringContext, frames: tuple
         raise ValueError('Response ownership/version does not match scored context')
     if any(frame.user_id != context.user_id or frame.generation_id != context.generation_id for frame in frames):
         raise ValueError('Scored frame pool ownership mismatch')
+    if any(frame.context != context for frame in frames):
+        raise ValueError('Scored frame pool context mismatch')
     if (response.get('served_ranker') != 'heavy' or response.get('ranker_applied') is not True
             or response.get('heavy_ranker_selected') is not True
             or response.get('fallback_code') is not None or response.get('fallback_reason') is not None
@@ -238,6 +243,7 @@ class ScoredInputCapture:
     def __init__(self, context: ScoringContext):
         self.context = context
         self._execution_thread = current_thread()
+        self._closed = False
         self._frames: list[ScoredFrame] = []
         self._ids: set[str] = set()
 
@@ -245,7 +251,14 @@ class ScoredInputCapture:
     def frames(self) -> tuple[ScoredFrame, ...]:
         return tuple(self._frames)
 
+    def close(self):
+        self._closed = True
+        self._frames.clear()
+        self._ids.clear()
+
     def record(self, ranker, candidates, matrix):
+        if self._closed:
+            raise ValueError('Scored capture scope is closed')
         if current_thread() is not self._execution_thread:
             raise ValueError('Scored capture mutation must stay in its owning execution thread')
         if (ranker.model_version != self.context.model_version
@@ -274,7 +287,7 @@ class ScoredInputCapture:
             snapshot=RepositorySnapshot(repo_id=repo_id,content_version=exact_version('content_version'),
                 feature_version=exact_version('feature_version'),content_hash=candidate['content_hash'],
                 source_hash=candidate['source_hash'],embedding_version_index=self.context.repository_embedding_versions.index(version))
-            frame=ScoredFrame(self.context.user_id,self.context.generation_id,snapshot,row.astype('<f4',copy=False).tobytes())
+            frame=ScoredFrame(self.context.user_id,self.context.generation_id,snapshot,row.astype('<f4',copy=False).tobytes(),self.context)
             _validate_input(frame.input_bytes,self.context)
             pending.append(frame)
         self._frames.extend(pending)
@@ -293,9 +306,8 @@ def capture_scored_inputs(context: ScoringContext):
     try:
         yield capture
     finally:
+        capture.close()
         _capture.reset(token)
-        capture._frames.clear()
-        capture._ids.clear()
 
 
 def capture_ranker_input(ranker, candidates, matrix):
