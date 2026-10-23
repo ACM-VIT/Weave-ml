@@ -9,6 +9,7 @@ from typing import Mapping
 
 from retrieval.metrics import render_candidate_metrics, reset_candidate_metrics_for_tests
 from retrieval.runtime import retrieval_runtime_status
+from summarization.runtime import summary_admission_metrics
 
 
 _ROUTES = {
@@ -261,6 +262,12 @@ def render_prometheus(
                 f"ml_retrieval_io_{name}" + _labels(stage=stage)
                 + f" {values.get(name, 0)}"
             )
+    lines.extend((
+        '# HELP ml_summary_provider_events_total Summary admission outcomes in this process.',
+        '# TYPE ml_summary_provider_events_total counter',
+    ))
+    for outcome, count in summary_admission_metrics().items():
+        lines.append('ml_summary_provider_events_total' + _labels(outcome=outcome) + f' {count}')
     return "\n".join(lines) + "\n"
 
 

@@ -714,7 +714,7 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
             artifact, repo=summary_context(artifact)
         ) or (
             job_status != "duplicate"
-            and pipeline.card_summarizer.should_upgrade(artifact)
+            and pipeline.card_summarizer.should_upgrade(artifact, repo={"repo_id": repo_id, "content_hash": request.repository.content_hash})
             and _summary_upgrade_has_time(deadline)
         ):
             payload = payload if payload is not None else _repository_embedding_payload(request)

@@ -50,6 +50,9 @@ class SummarySettings:
     max_output_tokens: int = 240
     request_timeout_seconds: float = 5.0
     rpm_limit: float = 60.0
+    tpm_limit: int = 120_000
+    failure_threshold: int = 3
+    cooldown_seconds: float = 30.0
     max_retries: int = 2
     retry_base_seconds: float = 1.0
 
@@ -93,6 +96,12 @@ class SummarySettings:
             raise ValueError("SUMMARY_REQUEST_TIMEOUT_SECONDS must be between 0.1 and 30")
         if not 0 < self.rpm_limit <= 600:
             raise ValueError("SUMMARY_RPM_LIMIT must be greater than 0 and at most 600")
+        if type(self.tpm_limit) is not int or not 1 <= self.tpm_limit <= 10_000_000:
+            raise ValueError("SUMMARY_TPM_LIMIT must be between 1 and 10000000")
+        if type(self.failure_threshold) is not int or not 1 <= self.failure_threshold <= 20:
+            raise ValueError("SUMMARY_FAILURE_THRESHOLD must be between 1 and 20")
+        if not 1 <= self.cooldown_seconds <= 300:
+            raise ValueError("SUMMARY_COOLDOWN_SECONDS must be between 1 and 300")
         if not 0 <= self.max_retries <= 2:
             raise ValueError("SUMMARY_MAX_RETRIES must be between 0 and 2")
         if not 0.1 <= self.retry_base_seconds <= 1:
@@ -139,6 +148,9 @@ class SummarySettings:
             rpm_limit=_number(
                 "SUMMARY_RPM_LIMIT", 60.0, minimum=0.01, maximum=600
             ),
+            tpm_limit=_integer("SUMMARY_TPM_LIMIT",120_000,minimum=1,maximum=10_000_000),
+            failure_threshold=_integer("SUMMARY_FAILURE_THRESHOLD",3,minimum=1,maximum=20),
+            cooldown_seconds=_number("SUMMARY_COOLDOWN_SECONDS",30,minimum=1,maximum=300),
             max_retries=_integer(
                 "SUMMARY_MAX_RETRIES", 2, minimum=0, maximum=2
             ),

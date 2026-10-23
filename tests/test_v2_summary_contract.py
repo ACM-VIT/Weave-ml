@@ -222,7 +222,9 @@ def test_durable_fallback_is_replayed_when_the_provider_cannot_fit_the_job_budge
 
     with patch("api.v2._repository_points", return_value=[point]), patch(
         "api.v2.repository_embedding_pipeline", return_value=pipeline
-    ), patch("api.v2.repository_store", return_value=store):
+    ), patch("api.v2.repository_store", return_value=store), patch(
+        "api.v2._repository_embedding_payload", side_effect=AssertionError("fallback replay must remain README-free")
+    ):
         response = _embed_repository_job_locked(
             request,
             OwnedLock(),

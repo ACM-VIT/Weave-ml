@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import threading
 import time
 from typing import Any, Callable, Protocol
@@ -11,6 +12,8 @@ import requests
 
 from .prompt import RESPONSE_JSON_SCHEMA, SYSTEM_PROMPT, user_prompt
 from .settings import SummarySettings
+from .transport import BoundedSummarySession
+from .admission import AdmissionDenied, LocalSummaryAdmission, fallback_key
 
 
 logger = logging.getLogger(__name__)
@@ -24,6 +27,10 @@ SUMMARY_COMPLETION_RESERVE_SECONDS = 10.0
 
 class SummaryProviderError(RuntimeError):
     """Provider or transport failure safe for description fallback."""
+
+    def __init__(self, message: str, *, defer_upgrade: bool = True):
+        super().__init__(message)
+        self.defer_upgrade = defer_upgrade
 
 
 class SummaryProvider(Protocol):
@@ -71,18 +78,30 @@ class OpenRouterSummaryProvider:
         session: Any | None = None,
         limiter: SummaryRateLimiter | None = None,
         sleeper: Callable[[float], None] = time.sleep,
+        admission: Any | None = None,
     ) -> None:
         if not settings.provider_enabled:
             raise ValueError("SUMMARY_API_KEY is required to enable the summary provider")
         self.settings = settings
-        self.session = session or requests.Session()
+        self.session = session or BoundedSummarySession()
         self.limiter = limiter or SummaryRateLimiter(settings.rpm_limit)
         self.sleeper = sleeper
+        self.admission = admission or LocalSummaryAdmission(settings)
+
+    def defer_fallback(self, repo: Any) -> None:
+        key = fallback_key(repo, self.settings)
+        if key is not None: self.admission.defer(key)
+
+    def fallback_deferred(self, repo: Any) -> bool:
+        key = fallback_key(repo, self.settings)
+        return key is not None and self.admission.deferred(key)
 
     def close(self) -> None:
         close = getattr(self.session, "close", None)
         if callable(close):
             close()
+        admission_close = getattr(self.admission, 'close', None)
+        if callable(admission_close): admission_close()
 
     def _request_payload(
         self,
@@ -121,10 +140,18 @@ class OpenRouterSummaryProvider:
         for attempt in range(attempts):
             self._request_budget(deadline)
             self.limiter.wait()
-            request_timeout = min(
-                self.settings.request_timeout_seconds,
-                self._request_budget(deadline),
-            )
+            # UTF-8 bytes upper-bound input tokens; charge the output ceiling
+            # for every HTTP attempt, including repair and failed requests.
+            tokens = len(json.dumps(payload, ensure_ascii=False).encode('utf-8')) + self.settings.max_output_tokens
+            try:
+                permit = self.admission.acquire(tokens)
+            except AdmissionDenied as exc:
+                raise SummaryProviderError(str(exc)) from exc
+            try:
+                request_timeout = min(self.settings.request_timeout_seconds, self._request_budget(deadline))
+            except SummaryProviderError:
+                self.admission.report(permit, None)
+                raise
             try:
                 response = self.session.post(
                     self.settings.api_url,
@@ -133,6 +160,7 @@ class OpenRouterSummaryProvider:
                     timeout=request_timeout,
                 )
             except requests.RequestException as exc:
+                self.admission.report(permit, False)
                 if attempt + 1 >= attempts:
                     raise SummaryProviderError("summary provider transport failed") from exc
                 self.sleeper(
@@ -144,20 +172,26 @@ class OpenRouterSummaryProvider:
                 continue
 
             status_code = int(response.status_code)
+            # A model's invalid content goes through validation/repair; it does
+            # not open an availability circuit on a successful HTTP response.
             if status_code == 200:
                 try:
                     body = response.json()
                     content = body["choices"][0]["message"]["content"]
                 except (KeyError, IndexError, TypeError, ValueError) as exc:
+                    self.admission.report(permit, False)
                     raise SummaryProviderError(
                         "summary provider returned an invalid response envelope"
                     ) from exc
                 if not isinstance(content, str) or len(content) > 8_192:
+                    self.admission.report(permit, False)
                     raise SummaryProviderError(
                         "summary provider returned invalid bounded content"
                     )
+                self.admission.report(permit, True)
                 return content.strip()
 
+            self.admission.report(permit, False)
             retryable = status_code == 429 or 500 <= status_code <= 599
             if not retryable or attempt + 1 >= attempts:
                 raise SummaryProviderError(
@@ -189,6 +223,7 @@ class OpenRouterSummaryProvider:
         remaining = deadline - time.monotonic() - SUMMARY_COMPLETION_RESERVE_SECONDS
         if remaining < 0.1:
             raise SummaryProviderError(
-                "summary generation would consume the embedding completion reserve"
+                "summary generation would consume the embedding completion reserve",
+                defer_upgrade=False,
             )
         return remaining

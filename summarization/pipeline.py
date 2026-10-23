@@ -212,9 +212,11 @@ class CardSummaryPipeline:
             return True
         return artifact.model_version == CARD_SUMMARY_FALLBACK_MODEL_VERSION
 
-    def should_upgrade(self, artifact: CardSummaryArtifact) -> bool:
+    def should_upgrade(self, artifact: CardSummaryArtifact, *, repo: Mapping[str, Any] | None = None) -> bool:
         """Keep durable fallback replay independent from provider availability."""
-        return artifact.source == "description_fallback" and self.provider is not None
+        deferred = getattr(self.provider, "fallback_deferred", None)
+        return (artifact.source == "description_fallback" and self.provider is not None
+                and not (repo is not None and callable(deferred) and deferred(repo)))
 
     def _reuse_key(self, source: Any, repo: Mapping[str, Any]) -> bytes | None:
         identity = source_identity(source, repo)
@@ -244,7 +246,8 @@ class CardSummaryPipeline:
         )
 
     def summarize(self, source: Any, repo: Mapping[str, Any], *, deadline: float | None = None) -> CardSummaryArtifact:
-        if self.provider is None:
+        deferred = getattr(self.provider, "fallback_deferred", None)
+        if self.provider is None or (callable(deferred) and deferred(repo)):
             return self._fallback(repo)
         key = self._reuse_key(source, repo)
         if key is None:
@@ -305,6 +308,11 @@ class CardSummaryPipeline:
                     )
                 except SummaryValidationError as exc:
                     repair_feedback = str(exc)
-                except (SummaryProviderError, ValueError, TypeError):
+                except SummaryProviderError as exc:
+                    defer = getattr(self.provider, "defer_fallback", None)
+                    if exc.defer_upgrade and callable(defer):
+                        defer(repo)
+                    break
+                except (ValueError, TypeError):
                     break
         return self._fallback(repo)
