@@ -134,6 +134,9 @@ def test_measurement_contract_is_independent_of_ambient_collection_and_dimension
             vector,payload=reader._user_profile(uid)
             assert len(vector)==384 and payload['embedding_dim']==384
             assert reader.user_collection=="user_profiles"
+            import os
+            assert os.environ['V2_DIVERSITY_MODE']=='enabled'
+            assert reader.diversity_mode=='disabled'
             return {"name":kwargs['name']}
         bench.run_scenario=verify
         try:
@@ -143,7 +146,7 @@ def test_measurement_contract_is_independent_of_ambient_collection_and_dimension
             QdrantClient.close(client)
     """)
     env={**os.environ,'APP_ENV':'development','USER_PROFILES_COLLECTION':'ambient-profile-collection',
-         'VECTOR_DIMENSION':'32','V2_DIVERSITY_MODE':'disabled'}
+         'VECTOR_DIMENSION':'32','V2_DIVERSITY_MODE':'enabled'}
     subprocess.run([sys.executable,'-c',script],cwd=Path(__file__).resolve().parents[1],
                    env=env,check=True,capture_output=True,text=True,timeout=30)
 
