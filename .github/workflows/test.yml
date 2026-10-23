@@ -103,6 +103,8 @@ jobs:
         path: |
           ${{ runner.temp }}/actual-recommendation-stage-run.json
           ${{ runner.temp }}/actual-recommendation-diagnostic.json
+          ${{ runner.temp }}/public-catalog-stage-run.json
+          ${{ runner.temp }}/public-catalog-diagnostic.json
     - name: Check versioned ML contract drift
       run: uv run python -m scripts.export_ml_openapi --check
 
