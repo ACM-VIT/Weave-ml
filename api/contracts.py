@@ -109,12 +109,42 @@ class RecommendationContext(StrictModel):
 from retrieval.social_candidates import SocialCandidate, validate_social_candidates
 
 
+class ScoringCaptureRequest(StrictModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    schema_version: Literal[1]
+    encoding: Literal["float32-le-v1"]
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def exact_schema(cls, value):
+        if type(value) is not int:
+            raise ValueError("Capture schema must be an integer")
+        return value
+
+
 class RecommendationRequest(StrictModel):
     schema_version: Literal[2]
     generation_id: uuid.UUID
     user_id: uuid.UUID
-    feed_version: int = Field(ge=1)
+    feed_version: Annotated[int, Field(strict=True, ge=1, le=2**53-1)] | Annotated[str, StringConstraints(strict=True, pattern=r"^[1-9][0-9]{0,18}$")]
+    scoring_capture: ScoringCaptureRequest | None = None
     limit: int = Field(ge=1, le=100)
+
+    @field_validator("feed_version", mode="before")
+    @classmethod
+    def exact_feed_version(cls, value):
+        import re
+        if type(value) is int and 1 <= value <= 2**53-1:
+            return value
+        if type(value) is str and re.fullmatch(r"[1-9][0-9]{0,18}", value) and int(value) <= 2**63-1:
+            return value
+        raise ValueError("Feed version must be a safe integer or canonical int64 decimal")
+
+    @model_validator(mode="after")
+    def negotiated_feed_version(self):
+        if (self.scoring_capture is not None) != (type(self.feed_version) is str):
+            raise ValueError("Captured requests require an exact decimal string; ordinary requests require an integer")
+        return self
     exclude_repo_ids: list[uuid.UUID] = Field(default_factory=list, max_length=500)
     social_repo_ids: list[uuid.UUID] = Field(default_factory=list, max_length=500)
     social_candidates: list[SocialCandidate] = Field(default_factory=list, max_length=100, json_schema_extra={"uniqueItems": True})
@@ -504,6 +534,88 @@ class RecommendationResponse(StrictModel):
         if len({item.repo_id for item in value}) != len(value):
             raise ValueError("recommendation IDs must be unique")
         return value
+
+
+from inference.scoring_provenance import ScoringContext, ScoredPacket, decode_owned_packet
+
+
+class CapturedRecommendationItem(RecommendationItem):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    raw_heavy_score: float = Field(allow_inf_nan=False)
+    scored_input: ScoredPacket = Field(repr=False)
+
+
+class CapturedScoringStatus(StrictModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    schema_version: Literal[1]
+    status: Literal["captured"]
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def exact_schema(cls, value):
+        if type(value) is not int:
+            raise ValueError("Capture schema must be an integer")
+        return value
+
+
+class EmptyScoringStatus(StrictModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    schema_version: Literal[1]
+    status: Literal["not_scored_empty"]
+
+    _exact_schema = field_validator("schema_version", mode="before")(CapturedScoringStatus.exact_schema.__func__)
+
+
+class CapturedRecommendationResponse(RecommendationResponse):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    feed_version: Annotated[str, StringConstraints(strict=True, pattern=r"^[1-9][0-9]{0,18}$")]
+    scoring_capture: CapturedScoringStatus
+    scoring_context: ScoringContext = Field(repr=False)
+    scoring_metadata_complete: bool = Field(strict=True)
+    served_ranker: Literal["heavy"]
+    heavy_ranker_selected: Literal[True]
+    ranker_applied: Literal[True]
+    fallback_code: None
+    fallback_reason: None
+    retrieval_mode: Literal["personalized", "cold_start_profile"]
+    items: list[CapturedRecommendationItem] = Field(min_length=1, max_length=150, repr=False)
+
+    @model_validator(mode="after")
+    def exact_captured_bindings(self):
+        context = self.scoring_context
+        if (context.user_id != str(self.user_id) or context.generation_id != str(self.generation_id)
+                or context.feed_version != self.feed_version or context.model_version != self.model_version
+                or self.scoring_metadata_complete != (context.user_embedding_version is not None)):
+            raise ValueError("Captured response context binding mismatch")
+        versions = []
+        for item in self.items:
+            decode_owned_packet(item.scored_input, context, owner_user_id=str(self.user_id),
+                                generation_id=str(self.generation_id), repo_id=str(item.repo_id))
+            versions.append(context.repository_embedding_versions[item.scored_input.snapshot.embedding_version_index])
+        versions = sorted(set(versions))
+        version = versions[0] if len(versions) == 1 else "compatible-mixed:" + ",".join(versions)
+        if self.embedding_versions != versions or self.embedding_version != version:
+            raise ValueError("Captured response embedding binding mismatch")
+        return self
+
+
+class UnscoredEmptyRecommendationResponse(RecommendationResponse):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    feed_version: Annotated[str, StringConstraints(strict=True, pattern=r"^[1-9][0-9]{0,18}$")]
+    scoring_capture: EmptyScoringStatus
+    fallback_code: None
+    fallback_reason: None
+    items: list[RecommendationItem] = Field(max_length=0)
+
+    @field_validator("feed_version")
+    @classmethod
+    def bounded_empty_version(cls, value):
+        if int(value) > 2**63-1:
+            raise ValueError("Captured feed version exceeds int64")
+        return value
+
+
+RecommendationWireResponse = RecommendationResponse | CapturedRecommendationResponse | UnscoredEmptyRecommendationResponse
 
 
 class FeedbackResponse(StrictModel):
