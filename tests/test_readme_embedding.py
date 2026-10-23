@@ -100,6 +100,8 @@ for text in ('[' + 'x' * 62000,
              ('[ref]: /url\\n' * 4000),
              ('[bad]\\n===\\n' * 5000),
              ('[bad]: /url \"unclosed\\n===\\n' * 2500),
+             ('[bad]: /url \"unclosed\\n<div>\\n' * 2500),
+             '<' + 'div' * 20000,
              '*' + ' \\t*' * 20000):
     _sections(text)
 """
@@ -171,10 +173,6 @@ def test_setext_title_stops_at_block_boundaries(boundary):
     "[home]: <>",
     "[home]:\n    /url\n    'Title'",
     "[multi\nline label]: /url 'A title\nwith more text'",
-    '[home]: /url "Title\n===\nmore text"',
-    '[home]: /url\n"Title\n===\nmore text"',
-    "[multi\n===\nline label]: /url",
-    "[home]:\n===",
     "[first]: /url\n[second]: /other-url",
 ])
 def test_leading_reference_definitions_do_not_enter_setext_titles(definition):
@@ -470,3 +468,49 @@ def test_frozen_evaluation_report_binds_inputs_and_metrics():
     metrics = retrieval_metrics([[.9, 1., .1]], [{"query": "sample", "relevant_repo_ids": ["relevant"]}], ["relevant", "other", "third"], k=1)
     assert metrics["mrr"] == .5 and metrics["recall_at_1"] == 0
     assert metrics["ndcg_at_1"] == 0
+
+
+@pytest.mark.parametrize("underline", ["=", "===", "-", "--", "---", "   ===  "])
+@pytest.mark.parametrize("prefix", ['[ref]: /url "Title', '[multi', '[ref]:'])
+def test_reference_lookahead_stops_before_setext_heading(underline, prefix):
+    markdown = prefix + "\n" + underline + '\nMeaningful project description"'
+    text = " ".join(text for _, text in _sections(markdown))
+    assert "Meaningful project description" in text
+    assert prefix.strip('"') in text
+
+
+@pytest.mark.parametrize("opening", [
+    "<div>", "   <DIV class=x>", "</table>", "<section/>", "<summary", "<script>",
+    "<pre >", "<style", "<!-- comment -->", "<?instruction?>", "<!DOCTYPE html>", "<![CDATA[value]]>",
+])
+def test_reference_lookahead_stops_at_interrupting_html(opening):
+    markdown = '[ref]: /url "unfinished\n' + opening + '\nImportant project overview\n</div>\n"'
+    assert "Important project overview" in " ".join(text for _, text in _sections(markdown))
+
+
+@pytest.mark.parametrize("continuation", [
+    "<span>", "<custom-widget>", "<diversion>", "<scripture>", "<script/>",
+    "<div=wrong>", "</div=wrong>", "<!lowercase>", "<not a block", "text <div>",
+    "    <div>", "\t<div>", "    ===", "    --",
+])
+def test_noninterrupting_lines_remain_inside_valid_reference_title(continuation):
+    markdown = '[ref]: /url "Title\n' + continuation + '\ncontinued"\n\nVisible overview.'
+    assert _sections(markdown) == [("neutral", "Visible overview.")]
+
+
+@pytest.mark.parametrize("underline", ["===", "-", "--", "---"])
+def test_complete_reference_before_underline_does_not_create_empty_heading(underline):
+    sections = _sections('[ref]: /url "complete"\n' + underline + "\nVisible overview.")
+    assert len(sections) == 1
+    assert sections[0][0] == "neutral" and "Visible overview." in sections[0][1]
+    assert "[ref]" not in sections[0][1]
+
+
+@pytest.mark.parametrize("markdown, visible", [
+    ('[home]: /url "Title\n===\nmore text"', 'more text'),
+    ('[home]: /url\n"Title\n===\nmore text"', 'more text'),
+    ("[multi\n===\nline label]: /url", 'line label'),
+    ("[home]:\n===", '[home]:'),
+])
+def test_setext_lines_are_not_reference_labels_titles_or_destinations(markdown, visible):
+    assert visible in " ".join(text for _, text in _sections(markdown))
