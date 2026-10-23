@@ -25,18 +25,37 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from qdrant_client import QdrantClient, models
-from config import EMBEDDING_MODEL_REVISION, REPOSITORY_EMBEDDING_MODEL
 from retrieval.v2_retriever import QdrantV2Retriever, _USER_RETRIEVAL_PAYLOAD_FIELDS
 
 VERSION_FIELDS = ("profile_version", "last_feedback_version", "feedback_state_revision")
 IMAGE = "qdrant/qdrant:v1.18.2"
+FIXTURE_COLLECTION = "user_profiles"
+FIXTURE_DIMENSIONS = 384
+FIXTURE_MODEL = "all-MiniLM-L6-v2"
+FIXTURE_REVISION = "c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+
+
+def fixture_reader(client):
+    """Use the existing profile method with an explicit isolated MiniLM contract."""
+    reader = QdrantV2Retriever(client=client, user_collection=FIXTURE_COLLECTION,
+        heavy_ranker_enabled=False, heavy_ranker_required=False,
+        heavy_ranker_traffic_percent=0, allow_unqualified_ranker=False,
+        minimum_eligible_repositories=0, candidate_vector_mode="deferred")
+    # Only the profile read is measured, not recommendation construction/health.
+    # A developer's unrelated collection/dimension overrides must not change the
+    # synthetic contract used by both writer and actual profile validation.
+    reader.embedding_dim = FIXTURE_DIMENSIONS
+    reader.embedding_model = FIXTURE_MODEL
+    reader.embedding_model_revision = FIXTURE_REVISION
+    reader.allow_missing_embedding_revision = False
+    return reader
 
 
 def profile_payload() -> dict[str, Any]:
     return {"skills": ["Python"], "tech_stack": ["FastAPI"], "interests": ["search"],
-            "topics": ["vectors"], "embedding_dim": 384,
-            "embedding_model": REPOSITORY_EMBEDDING_MODEL,
-            "embedding_model_revision": EMBEDDING_MODEL_REVISION,
+            "topics": ["vectors"], "embedding_dim": FIXTURE_DIMENSIONS,
+            "embedding_model": FIXTURE_MODEL,
+            "embedding_model_revision": FIXTURE_REVISION,
             "profile_version": 1, "last_feedback_version": 0,
             "feedback_state_revision": 0, "fixture_ledger": "x" * 16384}
 
@@ -82,7 +101,7 @@ class WireSpans:
         request.extensions["profile_measurement_start"] = time.perf_counter()
 
     def response(self, response: Any) -> None:
-        if response.request.method == "POST" and response.request.url.path == "/collections/user_profiles/points":
+        if response.request.method == "POST" and response.request.url.path == f"/collections/{FIXTURE_COLLECTION}/points":
             response.read()
             self.milliseconds.append(1000 * (time.perf_counter() - response.request.extensions["profile_measurement_start"]))
             self.decoded_body_bytes.append(len(response.content))
@@ -100,6 +119,7 @@ def docker(*args: str) -> str:
 @contextmanager
 def owned_qdrant():
     name = "weave-profile-measure-" + uuid.uuid4().hex[:12]
+    primary_error = None
     try:
         docker("run", "--pull=never", "-d", "--name", name,
                "-p", "127.0.0.1::6333", "-e", "QDRANT__TELEMETRY_DISABLED=true", IMAGE)
@@ -115,19 +135,40 @@ def owned_qdrant():
                         raise
                     time.sleep(.1)
         yield url
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        subprocess.run(["docker", "rm", "-f", name], check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=40)
+        cleanup_failure = None
+        try:
+            result = subprocess.run(["docker", "rm", "-f", name], check=False,
+                                    capture_output=True, text=True, timeout=40)
+            if result.returncode != 0:
+                cleanup_failure = f"Docker removal exited {result.returncode}"
+        except Exception as exc:
+            cleanup_failure = type(exc).__name__
+        if cleanup_failure is not None:
+            message = f"Owned Qdrant cleanup failed for {name}: {cleanup_failure}; verify/remove this owned container"
+            if primary_error is None:
+                raise RuntimeError(message)
+            # Preserve the measurement/startup exception even if stderr itself
+            # fails; cleanup diagnostics must not replace the primary failure.
+            if hasattr(primary_error, 'add_note'):
+                primary_error.add_note(message)
+            try:
+                print(message, file=sys.stderr)
+            except Exception:
+                pass
 
 
 def run_scenario(writer: QdrantClient, reader: QdrantV2Retriever,
                  spans: WireSpans, *, name: str, users: int, reads: int,
                  update_every: int = 0, version_only: bool = False) -> dict[str, Any]:
     ids = [str(uuid.UUID(int=index + 630000)) for index in range(users)]
-    vector = np.random.default_rng(63).normal(size=384)
+    vector = np.random.default_rng(63).normal(size=FIXTURE_DIMENSIONS)
     vector /= np.linalg.norm(vector)
     oracle = profile_payload()
-    writer.upsert("user_profiles", points=[models.PointStruct(id=uid, vector=vector.tolist(),
+    writer.upsert(FIXTURE_COLLECTION, points=[models.PointStruct(id=uid, vector=vector.tolist(),
                   payload=oracle) for uid in ids], wait=True)
     analyzer = Opportunities()
     walls: list[float] = []
@@ -139,10 +180,10 @@ def run_scenario(writer: QdrantClient, reader: QdrantV2Retriever,
             oracle["last_feedback_version"] += 1
             oracle["feedback_state_revision"] += 1
             if version_only:
-                writer.set_payload("user_profiles", payload={key: oracle[key] for key in VERSION_FIELDS}, points=[uid], wait=True)
+                writer.set_payload(FIXTURE_COLLECTION, payload={key: oracle[key] for key in VERSION_FIELDS}, points=[uid], wait=True)
             else:
                 vector = np.roll(vector, 1)
-                writer.upsert("user_profiles", points=[models.PointStruct(id=uid, vector=vector.tolist(), payload=oracle)], wait=True)
+                writer.upsert(FIXTURE_COLLECTION, points=[models.PointStruct(id=uid, vector=vector.tolist(), payload=oracle)], wait=True)
         before = time.perf_counter()
         actual, payload = reader._user_profile(uid)
         walls.append(1000 * (time.perf_counter() - before))
@@ -174,9 +215,8 @@ def measure(reads: int = 128) -> dict[str, Any]:
             url=url, api_key=None, timeout=10,
             event_hooks={"request": [spans.request], "response": [spans.response]},
         )) as wire:
-            writer.create_collection("user_profiles", vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE))
-            reader = QdrantV2Retriever(client=wire, heavy_ranker_enabled=False,
-                                       minimum_eligible_repositories=0)
+            writer.create_collection(FIXTURE_COLLECTION, vectors_config=models.VectorParams(size=FIXTURE_DIMENSIONS, distance=models.Distance.COSINE))
+            reader = fixture_reader(wire)
             scenarios = [run_scenario(writer, reader, spans, reads=reads, **spec) for spec in (
                 {"name": "all_unique", "users": reads},
                 {"name": "hot_unchanged", "users": 1},
@@ -189,8 +229,10 @@ def measure(reads: int = 128) -> dict[str, Any]:
     return {"schema": "profile-fetch-measurement-v1", "source_hashes": before,
             "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
             "qdrant_image": IMAGE, "qdrant_image_id": json.loads(docker("image", "inspect", IMAGE))[0]["Id"],
-            "embedding_model": REPOSITORY_EMBEDDING_MODEL, "embedding_revision": EMBEDDING_MODEL_REVISION,
+            "embedding_model": FIXTURE_MODEL, "embedding_revision": FIXTURE_REVISION,
             "projection": _USER_RETRIEVAL_PAYLOAD_FIELDS,
+            "fixture_contract": {"collection": FIXTURE_COLLECTION, "dimensions": FIXTURE_DIMENSIONS,
+                                 "model": FIXTURE_MODEL, "revision": FIXTURE_REVISION},
             "scope": "local sequential uncached reads; synthetic free-oracle opportunities; no cache or traffic estimate",
             "scenarios": scenarios}
 

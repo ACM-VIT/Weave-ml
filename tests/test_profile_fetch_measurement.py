@@ -17,8 +17,8 @@ def reader(monkeypatch):
     monkeypatch.setenv("V2_ALLOW_MISSING_EMBEDDING_REVISION", "false")
     with closing(QdrantClient(":memory:")) as client:
         client.create_collection("user_profiles", vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE))
-        yield QdrantV2Retriever(client=client, heavy_ranker_enabled=False,
-                                minimum_eligible_repositories=0)
+        from scripts.measure_profile_fetch import fixture_reader
+        yield fixture_reader(client)
 
 
 def test_identical_profiles_are_separated_by_user():
@@ -104,3 +104,79 @@ def test_scenario_never_silently_treats_local_calls_as_measured_http(reader):
     # QdrantLocal exercises the real retrieval path but cannot establish wire cost.
     with pytest.raises(AssertionError, match="real HTTP"):
         run_scenario(reader.client, reader, WireSpans(), name="local", users=1, reads=2)
+
+
+def test_measurement_contract_is_independent_of_ambient_collection_and_dimension():
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    import textwrap
+    script=textwrap.dedent("""
+        from contextlib import contextmanager
+        import json
+        from uuid import UUID
+        from qdrant_client import QdrantClient, models
+        from scripts import measure_profile_fetch as bench
+        class Owned(QdrantClient):
+            def close(self): pass
+        client=Owned(":memory:")
+        @contextmanager
+        def owned(): yield "owned-memory-only"
+        bench.owned_qdrant=owned
+        bench.QdrantClient=lambda **kwargs: client
+        bench.source_hashes=lambda: {}
+        bench.docker=lambda *args: json.dumps([{"Id":"owned-fixture-image"}])
+        def verify(writer,reader,spans,**kwargs):
+            uid=str(UUID(int=63))
+            writer.upsert("user_profiles",points=[models.PointStruct(id=uid,
+                vector=[1.]+[0.]*383,payload=bench.profile_payload())],wait=True)
+            vector,payload=reader._user_profile(uid)
+            assert len(vector)==384 and payload['embedding_dim']==384
+            assert reader.user_collection=="user_profiles"
+            return {"name":kwargs['name']}
+        bench.run_scenario=verify
+        try:
+            result=bench.measure(32)
+            assert len(result['scenarios'])==5
+        finally:
+            QdrantClient.close(client)
+    """)
+    env={**os.environ,'APP_ENV':'development','USER_PROFILES_COLLECTION':'ambient-profile-collection',
+         'VECTOR_DIMENSION':'32','V2_DIVERSITY_MODE':'disabled'}
+    subprocess.run([sys.executable,'-c',script],cwd=Path(__file__).resolve().parents[1],
+                   env=env,check=True,capture_output=True,text=True,timeout=30)
+
+
+@pytest.mark.parametrize('failure', ['nonzero', 'timeout'])
+@pytest.mark.parametrize('primary', [False, True])
+def test_owned_cleanup_reports_name_and_preserves_primary_failure(monkeypatch,capsys,failure,primary):
+    from scripts import measure_profile_fetch as bench
+    from types import SimpleNamespace
+    import subprocess
+    import json
+    class Probe:
+        def get_collections(self): return []
+        def close(self): pass
+    monkeypatch.setattr(bench,'QdrantClient',lambda **kwargs: Probe())
+    def docker(*args):
+        if args[0]=='inspect':
+            return json.dumps([{'NetworkSettings':{'Ports':{'6333/tcp':[{'HostPort':'1'}]}}}])
+        return 'owned-id'
+    monkeypatch.setattr(bench,'docker',docker)
+    names=[]
+    def cleanup(command,**kwargs):
+        names.append(command[-1])
+        if failure=='timeout': raise subprocess.TimeoutExpired(command,40)
+        return SimpleNamespace(returncode=1)
+    monkeypatch.setattr(bench.subprocess,'run',cleanup)
+    original=ValueError('measurement failed')
+    with pytest.raises(ValueError if primary else RuntimeError) as caught:
+        with bench.owned_qdrant():
+            if primary: raise original
+    assert len(names)==1 and names[0].startswith('weave-profile-measure-')
+    if primary:
+        assert caught.value is original
+        assert names[0] in capsys.readouterr().err
+    else:
+        assert names[0] in str(caught.value)

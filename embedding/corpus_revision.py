@@ -230,8 +230,11 @@ def authority_from_environment(*, collection: str, vector: str, endpoint: str | 
         endpoint or os.getenv('QDRANT_URL', 'http://localhost:6333'), collection, vector,
     ], separators=(',', ':')).encode()).hexdigest()
     try:
+        # Every protocol operation already performs an atomic Redis roundtrip
+        # including INFO/epoch validation. Avoid an extra idle PING outside the
+        # documented least-privilege EVAL/INFO/HGET/HSET authority ACL.
         client = redis.from_url(url, decode_responses=True, socket_connect_timeout=2,
-                                socket_timeout=2, health_check_interval=30)
+                                socket_timeout=2, health_check_interval=0)
     except Exception:
         raise ValueError('invalid scoped corpus authority Redis configuration') from None
     return CorpusRevisionAuthority(client, key='weave:corpus-authority:v1:' + scope,

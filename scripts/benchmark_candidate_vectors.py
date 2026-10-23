@@ -37,9 +37,11 @@ class FixtureRanker:
 
     def __init__(self):
         self.candidates = []
+        self.user_vector, self.user_terms = [], []
 
     def score_batch(self, user_vector, skills, candidates):
         self.candidates = candidates
+        self.user_vector, self.user_terms = list(user_vector), list(skills)
         return [{'repo_id': item['id'], 'final_score': 1 - int(UUID(item['id'])) / 10000}
                 for item in candidates]
 
@@ -65,7 +67,13 @@ class WireQdrant:
             feature_version=1, content_hash=f'content-{repo_id}', source_hash=f'source-{repo_id}',
             indexed_at=datetime(2026, 10, 23, tzinfo=timezone.utc).isoformat(),
             primary_language=['Python', 'Rust', 'JavaScript'][index % 3], star_count=100 + index)
-        return {'id': repo_id, 'payload': payload, 'vector': {QDRANT_VECTOR_NAME: self.vector}}
+        payload.update(topics=[f'topic-{index % 7}', f'repository-{index}'],
+                       tags=[f'tag-{index}'], languages=[payload['primary_language']])
+        vector = list(self.vector)
+        vector[0] += (index + 1) / 1000
+        norm = math.sqrt(sum(value * value for value in vector))
+        vector = [value / norm for value in vector]
+        return {'id': repo_id, 'payload': payload, 'vector': {QDRANT_VECTOR_NAME: vector}}
 
     def project(self, row, kwargs):
         row = dict(row)
@@ -121,7 +129,8 @@ class WireQdrant:
         if kwargs['ids'] == [self.user_id]:
             payload = {'embedding_dim': REPOSITORY_EMBEDDING_DIM,
                 'embedding_model': REPOSITORY_EMBEDDING_MODEL,
-                'embedding_model_revision': EMBEDDING_MODEL_REVISION, 'last_feedback_version': 0}
+                'embedding_model_revision': EMBEDDING_MODEL_REVISION, 'last_feedback_version': 0,
+                'skills': ['search'], 'topics': ['database']}
             return self.exchange('profile', [{'id': self.user_id, 'vector': USER_VECTOR, 'payload': payload}])
         rows = [self.repo(int(UUID(repo_id)) - 1) for repo_id in kwargs['ids']]
         if self.change and rows:
@@ -152,7 +161,7 @@ def isolated_io():
                 io._pool = None
 
 
-def run_case(*, overlap, inline=False, rtt_ms=0, max_candidates=150, heavy=True, change=None):
+def run_case(*, overlap, inline=False, rtt_ms=0, max_candidates=150, heavy=True, change=None, capture_inputs=False):
     client = WireQdrant(overlap=overlap, rtt_ms=rtt_ms, change=change)
     ranker = FixtureRanker()
     with isolated_io():
@@ -164,13 +173,17 @@ def run_case(*, overlap, inline=False, rtt_ms=0, max_candidates=150, heavy=True,
         elapsed = time.perf_counter() - began
         snapshot = io.retrieval_runtime_status()
     output = [(item.repo_id, item.score, item.source) for item in batch.items]
-    return {'output': output, 'elapsed_ms': elapsed * 1000, 'wire_bytes': sum(row['bytes'] for row in client.records),
+    result = {'output': output, 'elapsed_ms': elapsed * 1000, 'wire_bytes': sum(row['bytes'] for row in client.records),
         'json_encode_cpu_ms': sum(row['encode_cpu_seconds'] for row in client.records) * 1000,
         'json_decode_cpu_ms': sum(row['decode_cpu_seconds'] for row in client.records) * 1000,
         'transport_calls': len(client.records), 'ranker_candidate_ids': [row['id'] for row in ranker.candidates],
         'repository_vector_ids': [repo_id for row in client.records for repo_id in row['vector_ids']],
         'records': client.records, 'runtime': snapshot, 'ranker_applied': batch.ranker_applied,
         'changed_id': client.changed_id}
+    if capture_inputs:
+        result['ranker_inputs'] = {'user_vector': ranker.user_vector, 'user_terms': ranker.user_terms,
+                                   'candidates': {row['id']: row for row in ranker.candidates}}
+    return result
 
 
 def main():
