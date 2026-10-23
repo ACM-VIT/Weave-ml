@@ -94,7 +94,7 @@ def main(argv=None):
         print(json.dumps({'passed': assessment['passed'], 'failures': assessment['failures'],
                           'report_sha256': assessment['report_sha256']}, sort_keys=True))
         return 0 if assessment['passed'] else 1
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, RecursionError) as exc:
         # Pydantic errors can contain private input values. Export only a type.
         print(json.dumps({'passed': False, 'error': type(exc).__name__}))
         return 2

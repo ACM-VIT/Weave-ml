@@ -114,3 +114,16 @@ def test_test_only_qualification_binds_actual_artifact_files(tmp_path, corrupt):
         assert manifest['model_artifact']['model_sha256'] == run['model_sha256']
         assert manifest['model_artifact']['scaler_sha256'] == run['scaler_sha256']
         assert manifest['report_sha256'] == digest(payload['report'])
+
+
+def test_overdeep_json_cli_is_invalid_input_without_traceback_or_report(tmp_path):
+    bad=tmp_path/'deep.json'
+    bad.write_text('['*10000+'0'+']'*10000)
+    output=tmp_path/'report.json'
+    args=arguments(output)
+    args[args.index('--bundle')+1]=str(bad)
+    result=subprocess.run([sys.executable,'-m','scripts.evaluate_recommendations',*args],
+                          text=True,capture_output=True,timeout=10)
+    assert result.returncode==2
+    assert json.loads(result.stdout)=={'passed':False,'error':'RecursionError'}
+    assert result.stderr=='' and not output.exists()

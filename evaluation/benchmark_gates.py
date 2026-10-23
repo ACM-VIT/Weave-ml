@@ -189,7 +189,7 @@ def assess(report: dict, baseline: Baseline, policy: Policy, *, qualify: bool = 
                 failures.append(f'{stage}.{metric}: qualification requires {required_limit}')
         for stage in STAGES:
             metrics = candidate.stages[stage].metrics
-            for name in SAFETY:
+            for name in sorted(SAFETY):
                 if metrics[name] != 0:
                     failures.append(f'{stage}: {name} must be zero')
             if metrics['judgment_coverage'] != 1:

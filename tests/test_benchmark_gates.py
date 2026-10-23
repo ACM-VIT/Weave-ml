@@ -148,3 +148,21 @@ def test_qualification_rejects_required_gate_with_wrong_direction_only(metric):
     baseline = baseline.model_copy(update={'policy_sha256': digest(changed)})
     assessment = assess(result, baseline, changed, qualify=True)
     assert assessment['failures'] == [f'assembly.{metric}: qualification requires {expected}']
+
+
+def test_qualification_failure_bytes_are_independent_of_python_hash_seed():
+    import os, subprocess, sys
+    script="""
+import json
+from tests.test_benchmark_gates import report, policy_and_baseline
+from evaluation.benchmark_gates import assess
+result=report()
+policy,baseline=policy_and_baseline(result)
+for stage in result['stages'].values():
+    for metric in ('repeat_rate','excluded_rate','archived_rate'):
+        stage['metrics'][metric]=.5
+print(json.dumps(assess(result,baseline,policy,qualify=True),sort_keys=True))
+"""
+    outputs=[subprocess.run([sys.executable,'-c',script],env={**os.environ,'PYTHONHASHSEED':str(seed)},
+        capture_output=True,check=True,timeout=10).stdout for seed in (1,2,3,4)]
+    assert len(set(outputs))==1
