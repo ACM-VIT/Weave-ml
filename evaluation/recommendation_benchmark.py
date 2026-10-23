@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import datetime
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -20,6 +21,9 @@ Digest = Annotated[str, StringConstraints(pattern=r'^[a-f0-9]{64}$')]
 Commit = Annotated[str, StringConstraints(pattern=r'^[a-f0-9]{40}$')]
 Number = Annotated[float, Field(allow_inf_nan=False)]
 STAGES = ('retrieval', 'ranking', 'assembly')
+# Bound additional memory independently of corpus size/profile count. Each run
+# owns its cache, so identical IDs in another snapshot cannot reuse old vectors.
+_SIMILARITY_CACHE_PAIRS = 65536
 
 
 class StrictModel(BaseModel):
@@ -196,6 +200,12 @@ def _quantile(values, fraction):
     return sorted(values)[max(0, math.ceil(len(values) * fraction) - 1)]
 
 
+def _clamped_cosine(left: list[float], right: list[float]) -> float:
+    # Keep the original product/reduction order and per-pair clamp. Normalized
+    # inputs permit a small tolerance, so an averaged-vector shortcut can differ.
+    return max(-1., min(1., sum(x * y for x, y in zip(left, right))))
+
+
 def evaluate(bundle: Bundle, run: Run, *, k: int) -> dict:
     """Measure supplied stage outputs, retaining violations and unknown labels."""
     if type(k) is not int or not 1 <= k <= 1000:
@@ -206,6 +216,11 @@ def evaluate(bundle: Bundle, run: Run, *, k: int) -> dict:
     if len(run.outputs) != len(profiles) or {o.profile_id for o in run.outputs} != set(profiles):
         raise ValueError('run profiles must match every frozen profile exactly once')
     repos = {r.repo_id: r for r in bundle.repositories}
+
+    @lru_cache(maxsize=_SIMILARITY_CACHE_PAIRS)
+    def pair_similarity(first: str, second: str) -> float:
+        return _clamped_cosine(repos[first].vector, repos[second].vector)
+
     labels_by_profile = defaultdict(dict)
     for row in bundle.judgments:
         labels_by_profile[row.profile_id][row.repo_id] = row.grade
@@ -274,7 +289,10 @@ def evaluate(bundle: Bundle, run: Run, *, k: int) -> dict:
                 topics.append(max(topic_counts.values(), default=0) / len(selected))
             for i, a in enumerate(selected):
                 for b in selected[i + 1:]:
-                    similarity_sum += max(-1., min(1., sum(x * y for x, y in zip(a.vector, b.vector))))
+                    # Reuse only the pair score, not the visit: duplicates still
+                    # contribute at every original position in every stage.
+                    first, second = sorted((a.repo_id, b.repo_id))
+                    similarity_sum += pair_similarity(first, second)
                     similarity_pairs += 1
             sources.update(row.source for row in rows)
             latencies.append(output.latency_ms[stage])
