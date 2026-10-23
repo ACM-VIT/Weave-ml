@@ -20,7 +20,7 @@ from .vector_contract import validate_embedding_vector
 
 
 # Bump when text projection, chunking, normalization or aggregation changes.
-TOWER_PREPROCESSING_VERSION = "repository-tower-text-chunk-mean-l2-v1"
+TOWER_PREPROCESSING_VERSION = "repository-tower-token-sections-l2-v4"
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +59,8 @@ class TowerEmbeddingCache:
     def owns(self, model: Any) -> bool:
         return model is self.model and getattr(model, "_model", model) is self._encoder
 
-    def fingerprint(self, *, tower: str, texts: list[str], config: Any) -> bytes:
+    def fingerprint(self, *, tower: str, texts: list[str], config: Any,
+                    readme_plan: list[tuple[str, float]] | None = None) -> bytes:
         """Hash exact semantic inputs and the complete tower computation spec."""
         spec = {
             "tower": tower, "texts": texts,
@@ -71,6 +72,8 @@ class TowerEmbeddingCache:
             "encoder_batch_tokens": MAX_ENCODER_BATCH_TOKENS,
             "chunk_chars": config.readme_chunk_chars,
             "chunk_overlap_chars": config.readme_chunk_overlap_chars,
+            "chunk_overlap_tokens": config.readme_chunk_overlap_tokens,
+            "readme_plan": readme_plan,
             "weights": config.tower_weights,
             "max_seq_length": getattr(self.model, "max_seq_length", 256),
             "normalize": True, "encoder_output": "float32",

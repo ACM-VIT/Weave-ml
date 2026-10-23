@@ -1,0 +1,496 @@
+{
+  "fixture_sha256": "daafdef84724656040342ea37cf5d4a3f01eba6f72307e2b5979a99cf8c9af2d",
+  "fixture_version": "readme-retrieval-v1",
+  "max_seq_length": 256,
+  "model": "all-MiniLM-L6-v2",
+  "model_revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+  "provenance": "Fixed synthetic diagnostic repositories with manually assigned query relevance; not a production relevance benchmark. Each complete README is frozen in this file.",
+  "query_count": 12,
+  "repository_count": 12,
+  "strategies": {
+    "character_mean_baseline": {
+      "cost": {
+        "encoded_tokens_after_truncation": 8726,
+        "encoder_input_count": 60,
+        "input_tokens_before_truncation": 11669,
+        "max_readme_chunk_tokens": 477,
+        "readme_chunk_count": 36,
+        "readme_chunks_over_limit": 28,
+        "wall_seconds": 0.808773790995474
+      },
+      "embedding_version": "repo-embedding-v2",
+      "final_tower": {
+        "mrr": 0.9444444444444443,
+        "ndcg_at_3": 0.9583333333333334,
+        "queries": [
+          {
+            "first_relevant_rank": 1,
+            "query": "semantic similarity search over document embeddings",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000001",
+              "00000000-0000-4000-8000-000000000004",
+              "00000000-0000-4000-8000-000000000011"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "durable event streaming with replayable ordered logs",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000002",
+              "00000000-0000-4000-8000-000000000012",
+              "00000000-0000-4000-8000-000000000009"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "version database schema migrations and roll back SQL changes",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000003",
+              "00000000-0000-4000-8000-000000000004",
+              "00000000-0000-4000-8000-000000000007"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "type safe SQLite queries from application models",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000004",
+              "00000000-0000-4000-8000-000000000003",
+              "00000000-0000-4000-8000-000000000011"
+            ]
+          },
+          {
+            "first_relevant_rank": 3,
+            "query": "accessible keyboard navigable web interface components",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000009",
+              "00000000-0000-4000-8000-000000000011",
+              "00000000-0000-4000-8000-000000000005"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "segment objects and generate pixel masks from images",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000006",
+              "00000000-0000-4000-8000-000000000011",
+              "00000000-0000-4000-8000-000000000008"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "detect leaked API credentials in git repository history",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000007",
+              "00000000-0000-4000-8000-000000000010",
+              "00000000-0000-4000-8000-000000000002"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "embedded robot motion control with real time sensor feedback",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000008",
+              "00000000-0000-4000-8000-000000000006",
+              "00000000-0000-4000-8000-000000000009"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "route HTTP requests with asynchronous middleware",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000009",
+              "00000000-0000-4000-8000-000000000012",
+              "00000000-0000-4000-8000-000000000008"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "collect time series metrics and evaluate monitoring alerts",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000010",
+              "00000000-0000-4000-8000-000000000002",
+              "00000000-0000-4000-8000-000000000012"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "parse Markdown documents into HTML with syntax extensions",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000011",
+              "00000000-0000-4000-8000-000000000005",
+              "00000000-0000-4000-8000-000000000009"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "schedule dependent tasks using a directed acyclic graph",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000012",
+              "00000000-0000-4000-8000-000000000008",
+              "00000000-0000-4000-8000-000000000006"
+            ]
+          }
+        ],
+        "recall_at_3": 1.0
+      },
+      "readme_only": {
+        "mrr": 0.810515873015873,
+        "ndcg_at_3": 0.7916666666666666,
+        "queries": [
+          {
+            "first_relevant_rank": 3,
+            "query": "semantic similarity search over document embeddings",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000011",
+              "00000000-0000-4000-8000-000000000004",
+              "00000000-0000-4000-8000-000000000001"
+            ]
+          },
+          {
+            "first_relevant_rank": 4,
+            "query": "durable event streaming with replayable ordered logs",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000012",
+              "00000000-0000-4000-8000-000000000009",
+              "00000000-0000-4000-8000-000000000003"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "version database schema migrations and roll back SQL changes",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000003",
+              "00000000-0000-4000-8000-000000000002",
+              "00000000-0000-4000-8000-000000000007"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "type safe SQLite queries from application models",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000004",
+              "00000000-0000-4000-8000-000000000003",
+              "00000000-0000-4000-8000-000000000011"
+            ]
+          },
+          {
+            "first_relevant_rank": 7,
+            "query": "accessible keyboard navigable web interface components",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000009",
+              "00000000-0000-4000-8000-000000000011",
+              "00000000-0000-4000-8000-000000000003"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "segment objects and generate pixel masks from images",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000006",
+              "00000000-0000-4000-8000-000000000011",
+              "00000000-0000-4000-8000-000000000008"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "detect leaked API credentials in git repository history",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000007",
+              "00000000-0000-4000-8000-000000000002",
+              "00000000-0000-4000-8000-000000000010"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "embedded robot motion control with real time sensor feedback",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000008",
+              "00000000-0000-4000-8000-000000000006",
+              "00000000-0000-4000-8000-000000000012"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "route HTTP requests with asynchronous middleware",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000009",
+              "00000000-0000-4000-8000-000000000012",
+              "00000000-0000-4000-8000-000000000008"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "collect time series metrics and evaluate monitoring alerts",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000010",
+              "00000000-0000-4000-8000-000000000012",
+              "00000000-0000-4000-8000-000000000002"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "parse Markdown documents into HTML with syntax extensions",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000011",
+              "00000000-0000-4000-8000-000000000001",
+              "00000000-0000-4000-8000-000000000005"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "schedule dependent tasks using a directed acyclic graph",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000012",
+              "00000000-0000-4000-8000-000000000008",
+              "00000000-0000-4000-8000-000000000009"
+            ]
+          }
+        ],
+        "recall_at_3": 0.8333333333333334
+      }
+    },
+    "token_sections": {
+      "cost": {
+        "encoded_tokens_after_truncation": 6369,
+        "encoder_input_count": 68,
+        "input_tokens_before_truncation": 6369,
+        "max_readme_chunk_tokens": 256,
+        "readme_chunk_count": 44,
+        "readme_chunks_over_limit": 0,
+        "wall_seconds": 0.901635249996616
+      },
+      "embedding_version": "repo-embedding-v3-token-sections-v1",
+      "final_tower": {
+        "mrr": 1.0,
+        "ndcg_at_3": 1.0,
+        "queries": [
+          {
+            "first_relevant_rank": 1,
+            "query": "semantic similarity search over document embeddings",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000001",
+              "00000000-0000-4000-8000-000000000004",
+              "00000000-0000-4000-8000-000000000011"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "durable event streaming with replayable ordered logs",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000002",
+              "00000000-0000-4000-8000-000000000010",
+              "00000000-0000-4000-8000-000000000012"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "version database schema migrations and roll back SQL changes",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000003",
+              "00000000-0000-4000-8000-000000000004",
+              "00000000-0000-4000-8000-000000000007"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "type safe SQLite queries from application models",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000004",
+              "00000000-0000-4000-8000-000000000003",
+              "00000000-0000-4000-8000-000000000011"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "accessible keyboard navigable web interface components",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000005",
+              "00000000-0000-4000-8000-000000000001",
+              "00000000-0000-4000-8000-000000000009"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "segment objects and generate pixel masks from images",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000006",
+              "00000000-0000-4000-8000-000000000011",
+              "00000000-0000-4000-8000-000000000007"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "detect leaked API credentials in git repository history",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000007",
+              "00000000-0000-4000-8000-000000000002",
+              "00000000-0000-4000-8000-000000000010"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "embedded robot motion control with real time sensor feedback",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000008",
+              "00000000-0000-4000-8000-000000000009",
+              "00000000-0000-4000-8000-000000000006"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "route HTTP requests with asynchronous middleware",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000009",
+              "00000000-0000-4000-8000-000000000012",
+              "00000000-0000-4000-8000-000000000002"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "collect time series metrics and evaluate monitoring alerts",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000010",
+              "00000000-0000-4000-8000-000000000002",
+              "00000000-0000-4000-8000-000000000012"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "parse Markdown documents into HTML with syntax extensions",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000011",
+              "00000000-0000-4000-8000-000000000005",
+              "00000000-0000-4000-8000-000000000006"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "schedule dependent tasks using a directed acyclic graph",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000012",
+              "00000000-0000-4000-8000-000000000008",
+              "00000000-0000-4000-8000-000000000001"
+            ]
+          }
+        ],
+        "recall_at_3": 1.0
+      },
+      "readme_only": {
+        "mrr": 1.0,
+        "ndcg_at_3": 1.0,
+        "queries": [
+          {
+            "first_relevant_rank": 1,
+            "query": "semantic similarity search over document embeddings",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000001",
+              "00000000-0000-4000-8000-000000000011",
+              "00000000-0000-4000-8000-000000000010"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "durable event streaming with replayable ordered logs",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000002",
+              "00000000-0000-4000-8000-000000000010",
+              "00000000-0000-4000-8000-000000000012"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "version database schema migrations and roll back SQL changes",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000003",
+              "00000000-0000-4000-8000-000000000004",
+              "00000000-0000-4000-8000-000000000007"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "type safe SQLite queries from application models",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000004",
+              "00000000-0000-4000-8000-000000000003",
+              "00000000-0000-4000-8000-000000000011"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "accessible keyboard navigable web interface components",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000005",
+              "00000000-0000-4000-8000-000000000001",
+              "00000000-0000-4000-8000-000000000011"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "segment objects and generate pixel masks from images",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000006",
+              "00000000-0000-4000-8000-000000000011",
+              "00000000-0000-4000-8000-000000000007"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "detect leaked API credentials in git repository history",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000007",
+              "00000000-0000-4000-8000-000000000003",
+              "00000000-0000-4000-8000-000000000009"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "embedded robot motion control with real time sensor feedback",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000008",
+              "00000000-0000-4000-8000-000000000006",
+              "00000000-0000-4000-8000-000000000012"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "route HTTP requests with asynchronous middleware",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000009",
+              "00000000-0000-4000-8000-000000000012",
+              "00000000-0000-4000-8000-000000000002"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "collect time series metrics and evaluate monitoring alerts",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000010",
+              "00000000-0000-4000-8000-000000000002",
+              "00000000-0000-4000-8000-000000000007"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "parse Markdown documents into HTML with syntax extensions",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000011",
+              "00000000-0000-4000-8000-000000000005",
+              "00000000-0000-4000-8000-000000000006"
+            ]
+          },
+          {
+            "first_relevant_rank": 1,
+            "query": "schedule dependent tasks using a directed acyclic graph",
+            "top_repo_ids": [
+              "00000000-0000-4000-8000-000000000012",
+              "00000000-0000-4000-8000-000000000008",
+              "00000000-0000-4000-8000-000000000009"
+            ]
+          }
+        ],
+        "recall_at_3": 1.0
+      }
+    }
+  }
+}

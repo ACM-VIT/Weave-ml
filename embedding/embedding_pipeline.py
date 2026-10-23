@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Iterable
 from typing import Any
 
+from config import TOKEN_SECTION_EMBEDDING_VERSION
 from summarization.contracts import CardSummaryArtifact
 from summarization.pipeline import CardSummaryPipeline
 
 from .embeddings import SentenceTransformerEmbedder, aggregate_vectors, chunk_text
 from .qdrant_store import QdrantRepositoryStore
+from .readme_embedding import README_STRATEGY_VERSION, prepare_readme_chunks, readme_source
 from .repository_embedding import (
     RepositoryEmbeddingConfig,
     RepositoryEmbeddingResult,
@@ -66,16 +69,35 @@ class RepositoryEmbeddingPipeline:
         repo["full_name"] = full_name
         # The below text builders are for splitting source material into the
         # three approved towers before final weighted composition.
-        readme_text = build_readme_text(source)
+        # Preserve legacy projection exactly; v3 parses the bounded Markdown
+        # source once instead of first flattening it through the old cleaner.
+        legacy_readme = self.config.version != TOKEN_SECTION_EMBEDDING_VERSION
+        readme_text = (
+            build_readme_text(source) if legacy_readme else readme_source(source, repo)
+        )
         metadata_text = build_metadata_text(repo)
         topic_text = build_topic_text(repo)
         card_summary = self.summarize_repository(source, repo, deadline=deadline)
 
-        readme_chunks = chunk_text(
-            readme_text,
-            max_chars=self.config.readme_chunk_chars,
-            overlap_chars=self.config.readme_chunk_overlap_chars,
-        )
+        # The reserved v2 identity must continue producing v2 vectors while a
+        # separately versioned corpus and ranker are qualified for cutover.
+        readme_weights = None
+        readme_plan = None
+        if legacy_readme:
+            readme_chunks = chunk_text(
+                readme_text,
+                max_chars=self.config.readme_chunk_chars,
+                overlap_chars=self.config.readme_chunk_overlap_chars,
+            )
+        else:
+            model = self.embedder.model
+            readme_chunks = prepare_readme_chunks(
+                readme_text, model.tokenizer,
+                sequence_limit=model.max_seq_length,
+                overlap_tokens=self.config.readme_chunk_overlap_tokens,
+            )
+            readme_weights = [chunk.weight for chunk in readme_chunks]
+            readme_plan = [(chunk.section_class, chunk.weight) for chunk in readme_chunks]
         # A cache is supplied only by the frozen, revision-pinned runtime.
         # Unknown/injected encoders continue through the uncached path.
         cache = self.tower_cache
@@ -97,7 +119,10 @@ class RepositoryEmbeddingPipeline:
             if not texts:
                 vectors[tower] = []
                 continue
-            key = cache.fingerprint(tower=tower, texts=texts, config=self.config) if cache else None
+            key = cache.fingerprint(
+                tower=tower, texts=texts, config=self.config,
+                readme_plan=readme_plan if tower == "readme" else None,
+            ) if cache else None
             fingerprints[tower] = key
             vector = cache.get(key, expected_size=self.config.embedding_dim) if cache else None
             if vector is None:
@@ -122,7 +147,8 @@ class RepositoryEmbeddingPipeline:
             ]
             offset += count
             vectors[tower] = (
-                aggregate_vectors(tower_vectors) if tower == "readme" else tower_vectors[0]
+                aggregate_vectors(tower_vectors, weights=readme_weights)
+                if tower == "readme" else tower_vectors[0]
             )
         readme_embedding = vectors["readme"]
         metadata_embedding = vectors["metadata"]
@@ -146,6 +172,13 @@ class RepositoryEmbeddingPipeline:
             metadata_text,
             topic_text,
         )
+        if not legacy_readme:
+            source_hash = source_fingerprint(source_hash, README_STRATEGY_VERSION, json.dumps({
+                "chunks": [(chunk.text, chunk.section_class, chunk.weight) for chunk in readme_chunks],
+                "overlap_tokens": self.config.readme_chunk_overlap_tokens,
+                "max_seq_length": self.embedder.model.max_seq_length,
+                "tower_weights": self.config.tower_weights,
+            }, sort_keys=True, separators=(",", ":")))
         payload = build_vector_payload(
             repo,
             repo_id=repo_id,
