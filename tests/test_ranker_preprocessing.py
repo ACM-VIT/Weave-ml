@@ -55,6 +55,7 @@ def test_validation_only_changes_cannot_leak_into_fitted_scaler_or_training_rows
 def test_export_reload_matches_real_serving_inputs_for_normal_extreme_and_missing_values(tmp_path):
     dense = np.arange(10, dtype=np.float32)[:, None] * np.arange(1, FEATURE_COUNT + 1)
     dense[:, -1] = 0  # No user keywords => the serving skill-match feature is zero.
+    dense[0, :3] = [np.nan, np.inf, -np.inf]
     output, document = export_fixture(tmp_path, dense, "export")
     assert document["preprocessing_version"] == PREPROCESSING_VERSION
     assert document["feature_order"] == FEATURE_ORDER
@@ -64,6 +65,12 @@ def test_export_reload_matches_real_serving_inputs_for_normal_extreme_and_missin
         "split": "input_order_80_20", "training_rows": 8, "validation_rows": 2,
     }
     split = chronological_split_index(len(dense))
+    expected_fit = dense[:split].astype(np.float64)
+    expected_fit[0, :3] = [FEATURE_DEFAULTS[name] for name in FEATURE_ORDER[:3]]
+    expected_scale = expected_fit.std(axis=0)
+    expected_scale[expected_scale == 0] = 1
+    np.testing.assert_array_equal(document["mean"], expected_fit.mean(axis=0))
+    np.testing.assert_array_equal(document["scale"], expected_scale)
     _, mean, scale = standardize_dense_features(dense, fit_rows=split)
     loaded_mean, loaded_scale = load_scaler_document(json.loads(json.dumps(document)))
     rows = np.vstack([dense[2], np.full(FEATURE_COUNT, 1e100),
