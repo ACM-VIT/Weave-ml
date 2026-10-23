@@ -212,7 +212,7 @@ def evaluate(bundle: Bundle, run: Run, *, k: int) -> dict:
     stages = {}
     for stage in STAGES:
         recalls, ndcgs, mrrs, similarities, novelties, owners, topics = [], [], [], [], [], [], []
-        returned = unjudged = repeats = excluded = archived = forks = owner_known = topic_known = 0
+        returned = unjudged = repeats = excluded = archived = forks = owner_known = topic_known = family_known = 0
         sources = Counter()
         catalogue = set()
         latencies = []
@@ -247,6 +247,7 @@ def evaluate(bundle: Bundle, run: Run, *, k: int) -> dict:
             selected = [repos[repo_id] for repo_id in ids]
             family_counts = Counter(r.fork_family for r in selected if r.fork_family is not None)
             forks += sum(count - 1 for count in family_counts.values())
+            family_known += sum(family_counts.values())
             owner_counts = Counter(r.owner for r in selected if r.owner is not None)
             owner_known += sum(owner_counts.values())
             topic_counts = Counter()
@@ -272,7 +273,7 @@ def evaluate(bundle: Bundle, run: Run, *, k: int) -> dict:
                 'catalogue_coverage': len(catalogue) / eligible_count,
                 'intra_list_similarity': _mean(similarities), 'novelty_bits': _mean(novelties),
                 'owner_concentration': _mean(owners), 'topic_concentration': _mean(topics),
-                'owner_metadata_coverage': ratio(owner_known), 'topic_metadata_coverage': ratio(topic_known),
+                'fork_metadata_coverage': ratio(family_known), 'owner_metadata_coverage': ratio(owner_known), 'topic_metadata_coverage': ratio(topic_known),
                 'repeat_rate': ratio(repeats), 'excluded_rate': ratio(excluded),
                 'archived_rate': ratio(archived), 'fork_repeat_rate': ratio(forks),
                 'latency_p50_ms': _quantile(latencies, .5), 'latency_p95_ms': _quantile(latencies, .95),
