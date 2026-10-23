@@ -32,6 +32,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config import TOKEN_SECTION_EMBEDDING_VERSION
+from evaluation.embedding_budget import load_budget_fixture, budget_retrieval_report
 from embedding.embeddings import SentenceTransformerEmbedder, aggregate_vectors, chunk_text
 from embedding.readme_embedding import prepare_readme_chunks, readme_source
 from embedding.repository_embedding import (
@@ -60,6 +61,8 @@ def select_prefix(counts: list[int], mandatory: list[int], budget: Budget | None
     if budget is None:
         return len(counts)
     used, selected = sum(mandatory), 0
+    if used > budget.tokens or len(mandatory) > budget.chunks:
+        raise ValueError("experimental budget cannot retain mandatory towers")
     for count in counts:
         if selected + len(mandatory) >= budget.chunks or used + count > budget.tokens:
             break
@@ -133,7 +136,7 @@ class MeasuredModel:
 
 def encode_job(case, *, version, model, budget):
     config = RepositoryEmbeddingConfig(version=version)
-    repo = {"full_name": "diagnostic/repository", "description": "Offline budget diagnostic", "readme": case["readme"], "topics": ["search"], "languages": ["Python"]}
+    repo = dict(case["repository"]) if "repository" in case else {"full_name": "diagnostic/repository", "description": "Offline budget diagnostic", "readme": case["readme"], "topics": ["search"], "languages": ["Python"]}
     tracemalloc.start()
     started, cpu = time.perf_counter(), time.process_time()
     modern = version == TOKEN_SECTION_EMBEDDING_VERSION
@@ -170,11 +173,11 @@ def encode_job(case, *, version, model, budget):
               "job_chunks": keep + 2, "job_encoded_tokens": sum(counts[:keep]) + sum(required),
               "baseline_readme_tokens_before_model_truncation": sum(raw),
               "baseline_readme_tokens_after_model_truncation": sum(counts),
-              "retained_encoded_token_fraction": sum(counts[:keep]) / sum(counts),
-              "model_truncated_input_fraction": 1 - sum(counts) / sum(raw),
-              "budget_dropped_encoded_token_fraction": 1 - sum(counts[:keep]) / sum(counts),
+              "retained_encoded_token_fraction": sum(counts[:keep]) / sum(counts) if sum(counts) else None,
+              "model_truncated_input_fraction": 1 - sum(counts) / sum(raw) if sum(raw) else None,
+              "budget_dropped_encoded_token_fraction": 1 - sum(counts[:keep]) / sum(counts) if sum(counts) else None,
               "section_class_coverage": classes,
-              "heading_label_presence": {heading: heading.casefold() in retained_text for heading in headings},
+              "heading_label_presence": {(hashlib.sha256(heading.encode()).hexdigest() if "repository" in case else heading): heading.casefold() in retained_text for heading in headings},
               "wall_seconds": wall, "cpu_seconds": cpu_elapsed,
               "python_tracemalloc_peak_bytes": peak, "encoder_groups": measured.groups,
               "encoder_padded_tokens": measured.padded_tokens, "final_vector": final}
@@ -202,7 +205,7 @@ def source_hashes():
     # broader conservative guard also rejects unrelated source drift mid-run.
     tracked = local_git(ROOT, "ls-files", "-z").split("\0")
     names = {name for name in tracked if name.endswith(".py")}
-    names.update(("pyproject.toml", "uv.lock", "scripts/sweep_embedding_budget.py"))
+    names.update(("pyproject.toml", "uv.lock", "scripts/sweep_embedding_budget.py", "evaluation/embedding_budget.py"))
     return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sorted(names)}
 
 
@@ -213,8 +216,11 @@ def peak_rss_mib():
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / divisor
 
 
-def cohort(budget, include_sibling):
+def cohort(budget, include_sibling, fixture_path=None, retrieval_k=3):
     before = source_hashes()
+    supplied = load_budget_fixture(Path(fixture_path)) if fixture_path else None
+    if supplied and not 1 <= retrieval_k <= len(supplied.cases):
+        raise ValueError("retrieval k must fit the supplied corpus")
     with no_network() as attempts:
         import torch
         from sentence_transformers import SentenceTransformer
@@ -223,22 +229,36 @@ def cohort(budget, include_sibling):
         loaded = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", revision=PIN, local_files_only=True, device="cpu")
         model = BoundedEmbeddingModel(loaded, max_concurrency=1)
         model.encode(["Offline warmup"], normalize_embeddings=True, show_progress_bar=False)
-        cases = fixtures(include_sibling)
+        cases = list(supplied.cases) if supplied else fixtures(include_sibling)
         rows = [encode_job(case, version=version, model=model, budget=budget)
                 for case in cases for version in ("repo-embedding-v2", TOKEN_SECTION_EMBEDDING_VERSION)]
+        retrieval = {}
+        query_sha256 = None
+        if supplied:
+            # Same pinned query inputs/encoder for all budget recipes. Query work
+            # is outside per-repository encode timings, with no extra text recipe.
+            query_vectors = SentenceTransformerEmbedder(model=model).embed_texts([row["query"] for row in supplied.queries])
+            query_sha256 = hashlib.sha256(np.asarray(query_vectors,dtype="<f4").tobytes()).hexdigest()
+            for version in ("repo-embedding-v2", TOKEN_SECTION_EMBEDDING_VERSION):
+                vectors = [row["final_vector"] for row in rows if row["version"] == version]
+                retrieval[version] = budget_retrieval_report(vectors,query_vectors,supplied,k=retrieval_k)
     if attempts or before != source_hashes():
         raise RuntimeError("network attempt or measured source drift")
     return {"source_hashes": before, "model_revision": PIN, "max_seq_length": model.max_seq_length,
             "network_attempts": len(attempts), "network_guard_scope": "Python sockets; Git lazy fetching explicitly disabled", "budget": vars(budget) if budget else None,
             "cohort_peak_rss_mib": peak_rss_mib(),
-            "fixtures": [{key: value for key, value in case.items() if key != "readme"} for case in cases], "rows": rows}
+            "input_fixture_sha256": supplied.sha256 if supplied else None,
+            "query_vector_sha256": query_sha256, "retrieval": retrieval,
+            "query_cost_scope": "query encoding excluded from repository timers; included in whole-cohort RSS",
+            "fixtures": [{key: value for key, value in case.items() if key not in {"readme","repository"}} for case in cases], "rows": rows}
 
 
 def verify_cohorts(cohorts):
     """Refuse comparisons across changing source or local README objects."""
     def identity(group):
         return (group["source_hashes"], group["model_revision"], group["max_seq_length"],
-                [(case["name"], case["sha256"]) for case in group["fixtures"]])
+                [(case["name"], case["sha256"]) for case in group["fixtures"]],
+                group.get("input_fixture_sha256"),group.get("query_vector_sha256"))
     expected = identity(cohorts[0])
     if any(identity(group) != expected for group in cohorts[1:]):
         raise RuntimeError("source/model/fixture identity changed between budget cohorts")
@@ -248,11 +268,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--budgets", nargs="+", required=True, help="explicit CHUNKS:TOKENS experimental values")
     parser.add_argument("--include-sibling", action="store_true", help="also read sibling Weave's committed README")
+    parser.add_argument("--fixture", type=Path, help="frozen encoder-comparison corpus/query/qrel JSON; no live acquisition")
+    parser.add_argument("--retrieval-k", type=int, default=3)
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.fixture is not None:
+        args.fixture = args.fixture.absolute()
+        if args.include_sibling:
+            parser.error("supplied corpus cannot be mixed with implicit sibling fixtures")
+        supplied = load_budget_fixture(args.fixture)
+        if not 1 <= args.retrieval_k <= len(supplied.cases):
+            parser.error("retrieval k must fit the supplied corpus")
     os.environ["HF_HUB_OFFLINE"] = os.environ["TRANSFORMERS_OFFLINE"] = "1"
     if args.child:
-        result = cohort(None if args.budgets == ["control"] else Budget.parse(args.budgets[0]), args.include_sibling)
+        result = cohort(None if args.budgets == ["control"] else Budget.parse(args.budgets[0]), args.include_sibling, args.fixture,args.retrieval_k)
     else:
         budgets = [Budget.parse(value) for value in args.budgets]
         if len(budgets) > 4:
@@ -262,6 +291,8 @@ def main():
             command = [sys.executable, str(Path(__file__).resolve()), "--child", "--budgets", value]
             if args.include_sibling:
                 command.append("--include-sibling")
+            if args.fixture:
+                command.extend(["--fixture",str(args.fixture),"--retrieval-k",str(args.retrieval_k)])
             cohorts.append(json.loads(subprocess.check_output(command, cwd=ROOT, text=True, timeout=180)))
         verify_cohorts(cohorts)
         baseline = {(row["name"], row["version"]): row["final_vector"] for row in cohorts[0]["rows"]}
@@ -269,7 +300,7 @@ def main():
             for row in group["rows"]:
                 vector = row.pop("final_vector")
                 row["cosine_to_uncapped_control"] = float(np.clip(np.dot(vector, baseline[row["name"], row["version"]]), -1., 1.))
-        result = {"schema": "embedding-budget-sweep-v1", "scope": "local diagnostic; no production budget/overflow/reindex decision or retrieval-quality evidence", "cohorts": cohorts}
+        result = {"schema": "embedding-budget-sweep-v1", "scope": "local diagnostic; supplied-qrel retrieval evidence only when a fixture is provided; no production budget/overflow/reindex or quality qualification", "cohorts": cohorts}
     print(json.dumps(result, indent=2))
 
 
