@@ -642,7 +642,7 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
             artifact, repo=request.repository.model_dump(mode="json")
         ) or (
             job_status != "duplicate"
-            and pipeline.card_summarizer.should_upgrade(artifact)
+            and pipeline.card_summarizer.should_upgrade(artifact, repo=_repository_embedding_payload(request))
             and _summary_upgrade_has_time(deadline)
         ):
             payload = _repository_embedding_payload(request)
