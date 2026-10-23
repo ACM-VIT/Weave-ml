@@ -624,3 +624,126 @@ def test_known_legacy_capacity_is_terminal_but_corruption_is_not_misclassified(r
     assert runtime.redis.xlen(runtime.stream.limits.namespace+':dlq')==1
     raw=runtime.qdrant.retrieve(runtime.settings.user_collection,ids=[uid(1)],with_payload=True,with_vectors=False)[0]
     assert raw.payload['model_operation_version']==3
+
+
+def test_guard_must_be_durable_before_ready_read_ack_and_ordinary_serving(runtime,monkeypatch):
+    from fastapi.testclient import TestClient
+    from api import main,v2
+    import feedback.model_runtime as provider
+    from retrieval.v2_retriever import QdrantV2Retriever,RetrievalDependencyError
+    p=runtime.policy;raw=wire(p,'profile',1,profile_payload());incoming=parse(raw,p)
+    good=runtime.users.ensure_initialized
+    monkeypatch.setattr(runtime.users,'ensure_initialized',lambda _:(_ for _ in ()).throw(OperationCapacity('guard unavailable')))
+    runtime.stream.admit(raw)
+    with pytest.raises(OperationCapacity):runtime.consumer().run_once()
+    point=runtime.qdrant.retrieve(runtime.settings.user_collection,ids=[uid(1)],with_payload=True,with_vectors=True)[0]
+    assert point.vector==basis(0) and runtime.redis.hget(runtime.stream.guard_key,uid(1))=='pending'
+    with pytest.raises(RetrievalDependencyError):QdrantV2Retriever._profile_from_points(None,uid(1),[point])
+    monkeypatch.setattr(provider,'model_runtime',lambda:runtime);monkeypatch.setenv('INTERNAL_API_SECRET','fixture-secret')
+    request={'schema_version':1,'user_id':uid(1),'operation_id':incoming.header.operation_id,'model_operation_version':'1',
+        'source_envelope_sha256':incoming.header.source_envelope_sha256}
+    response=TestClient(main.app).post('/api/v2/model-operation-status',headers={'x-internal-secret':'fixture-secret'},json=request)
+    assert response.status_code==503
+    assert runtime.redis.xpending(runtime.stream.stream,runtime.stream.group)['pending']==1
+    monkeypatch.setattr(runtime.users,'ensure_initialized',good)
+    time.sleep(.02);assert runtime.consumer().run_once()==1
+    assert runtime.redis.hget(runtime.stream.guard_key,uid(1))=='initialized'
+    response=TestClient(main.app).post('/api/v2/model-operation-status',headers={'x-internal-secret':'fixture-secret'},json=request)
+    assert response.status_code==200 and response.json()['basis_status']=='ready'
+
+
+def test_inflight_original_observes_withdrawal_before_genesis_cas_and_never_serves_it(runtime):
+    import threading
+    p=runtime.policy;raw=wire(p,'profile',1,profile_payload());entered=threading.Event();release=threading.Event();errors=[];calls=[]
+    def encode(context):
+        calls.append(context);entered.set();assert release.wait(10);return basis(0)
+    runtime.processor.profile_encoder=encode
+    runtime.stream.admit(raw);consumer=runtime.consumer()
+    def original():
+        try:consumer.run_once()
+        except Exception as exc:errors.append(exc)
+    thread=threading.Thread(target=original);thread.start();assert entered.wait(10)
+    runtime.stream.admit_withdrawal(withdrawal(p,raw,revoked_at=2));release.set();thread.join(10);assert not thread.is_alive()
+    assert len(errors)==1 and isinstance(errors[0],JournalConflict)
+    assert runtime.users.read_optional(uid(1)) is None
+    assert runtime.consumer().run_once()==1
+    assert isinstance(runtime.users.read(uid(1)).state,model.BootstrapState)
+    time.sleep(.02);assert runtime.consumer().run_once()==1
+    assert runtime.redis.xlen(runtime.stream.stream)==0 and len(calls)==1
+    assert runtime.stream.admit(raw)['status']=='withdrawal_accepted' and len(calls)==1
+
+
+def test_already_applied_original_is_not_rewritten_and_corrective_profile_preserves_learning(runtime):
+    initialize(runtime);p=runtime.policy
+    apply(runtime,wire(p,'feedback',3,feedback_payload()))
+    before=runtime.users.read(uid(1));raw=wire(p,'profile',1,profile_payload())
+    attestation=withdrawal(p,raw,revoked_at=4)
+    runtime.stream.admit_withdrawal(attestation);assert runtime.consumer().run_once()==1
+    assert runtime.users.read(uid(1))==before
+    assert runtime.processor(parse_withdraw(attestation,p),lambda:None)=='already_applied'
+    proof=runtime.processor.coordinator.original_status(before,parse(raw,p).header)
+    assert proof['status']=='applied'
+    runtime.processor.profile_encoder=lambda _:basis(2)
+    apply(runtime,wire(p,'profile',4,profile_payload(True,2),at=4))
+    after=runtime.users.read(uid(1))
+    assert after.state.baseline.vector==tuple(basis(2)) and after.state.long_entries==before.state.long_entries
+    assert after.state.feedback_version==1 and after.state.sessions==before.state.sessions
+
+
+def test_withdrawal_dlq_prepare_orphan_and_lost_cas_retry_have_distinct_authority(runtime,monkeypatch):
+    initialize(runtime);p=runtime.policy;raw=wire(p,'profile',3,profile_payload(True,2));attestation=withdrawal(p,raw,revoked_at=4)
+    runtime.stream.admit_withdrawal(attestation);before=runtime.users.read(uid(1));original=runtime.users.compare_and_set
+    monkeypatch.setattr(runtime.users,'compare_and_set',lambda *_:(_ for _ in ()).throw(RuntimeError('after withdrawal prepare before CAS')))
+    with pytest.raises(RuntimeError):runtime.consumer().run_once()
+    prepare=runtime.redis.xrange(runtime.stream.limits.namespace+':dlq')[0][1]['prepare_sha256']
+    assert runtime.processor.coordinator.rejection_status(prepare)=='prepared_not_committed'
+    assert runtime.users.read(uid(1))==before
+    assert runtime.stream.admit(raw)['status']=='withdrawal_accepted'
+    monkeypatch.setattr(runtime.users,'compare_and_set',original)
+    time.sleep(.02);assert runtime.consumer().run_once()==1
+    assert runtime.processor.coordinator.rejection_status(prepare)=='committed_withdrawal'
+    assert runtime.users.read(uid(1)).state.baseline.content_version==1
+    assert runtime.users.read(uid(1)).state.operation_version==3
+    assert runtime.redis.xlen(runtime.stream.limits.namespace+':dlq')==1
+
+
+@pytest.mark.parametrize('stage',['before_prepare','before_cas','after_cas_before_ack'])
+def test_withdrawal_prefix_recovers_after_abrupt_process_death_without_fake_basis(runtime,tmp_path,stage):
+    from dataclasses import asdict
+    from pathlib import Path
+    import sys
+    p=runtime.policy;raw=wire(p,'profile',1,profile_payload());runtime.stream.admit_withdrawal(withdrawal(p,raw,revoked_at=2))
+    target=tmp_path/'owned-settings.json';target.write_text(json.dumps({'config':runtime_config(p),'settings':asdict(runtime.settings)}))
+    result=subprocess.run([sys.executable,'-m','tests.fixtures.model_operation_worker',str(target),stage],
+        cwd=Path(__file__).parents[1],capture_output=True,text=True,timeout=20)
+    assert result.returncode==71,result.stderr
+    observed=runtime.users.read_optional(uid(1))
+    if stage=='after_cas_before_ack':assert isinstance(observed.state,model.BootstrapState)
+    else:assert observed is None
+    assert runtime.redis.hget(runtime.stream.guard_key,uid(1))=='pending'
+    assert runtime.stream.admit(raw)['status']=='withdrawal_accepted'
+    assert runtime.journal.records.get('operation:'+uid(1)+':1') is None
+    time.sleep(1.05)
+    assert runtime.consumer().run_once()==1
+    final=runtime.users.read(uid(1));assert isinstance(final.state,model.BootstrapState)
+    assert final.state.operation_version==1 and final.state.feedback_version==0
+    assert runtime.redis.xlen(runtime.stream.stream)==0
+
+
+def test_genuine_genesis_process_death_after_cas_has_guard_before_any_ack_and_denies_lost_state(runtime,tmp_path):
+    from dataclasses import asdict
+    from pathlib import Path
+    import sys
+    p=runtime.policy;raw=wire(p,'profile',1,profile_payload());runtime.stream.admit(raw)
+    target=tmp_path/'owned-settings.json';target.write_text(json.dumps({'config':runtime_config(p),'settings':asdict(runtime.settings)}))
+    result=subprocess.run([sys.executable,'-m','tests.fixtures.model_operation_worker',str(target),'after_cas_before_ack'],
+        cwd=Path(__file__).parents[1],capture_output=True,text=True,timeout=20)
+    assert result.returncode==71,result.stderr
+    assert runtime.users.read(uid(1)).state.baseline.content_version==1
+    assert runtime.redis.hget(runtime.stream.guard_key,uid(1))=='initialized'
+    assert runtime.redis.xpending(runtime.stream.stream,runtime.stream.group)['pending']==1
+    runtime.qdrant.delete(runtime.settings.user_collection,points_selector=models.PointIdsList(points=[uid(1)]),wait=True)
+    time.sleep(1.05)
+    with pytest.raises(OperationBytesConflict):runtime.consumer().run_once()
+    assert runtime.qdrant.retrieve(runtime.settings.user_collection,ids=[uid(1)])==[]
+    assert runtime.redis.xpending(runtime.stream.stream,runtime.stream.group)['pending']==1

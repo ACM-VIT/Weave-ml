@@ -26,6 +26,7 @@ def main():
         runtime.journal.put=fail
     elif stage=='before_cas':
         runtime.users.compare_and_set=lambda *_:os._exit(71)
+        runtime.users.insert_once=lambda *_:os._exit(71)
     elif stage=='after_cas_before_ack':
         runtime.stream.acknowledge=lambda *_:os._exit(71)
     else:raise ValueError('unknown fixed test crash boundary')
