@@ -101,6 +101,7 @@ class FrozenSnapshot(StrictModel):
             validate_repository_payload(p)
             if (p['repo_id']!=row.repo_id or p['embedding_model']!=embedding.model
                     or p['embedding_model_revision']!=embedding.revision or p['embedding_version']!=embedding.recipe
+                    or p['model_version']!=embedding.model
                     or p['feature_spec_version']!='v2' or p['content_version']<1):
                 raise ValueError('frozen repository serving identity mismatch')
             # Zero is the authoritative absent feature-revision value.
@@ -151,7 +152,24 @@ class StageRunExport(StrictModel):
         return self
 
 
+class OfflineGitUnavailable(RuntimeError):
+    """The installed Git cannot enforce local-only source inspection."""
+
+
+def require_offline_git():
+    message = 'Frozen replay requires Git supporting --no-lazy-fetch; install a compatible Git before replay.'
+    try:
+        result = subprocess.run(['git', '--no-lazy-fetch', '--version'], cwd=ROOT,
+            capture_output=True, timeout=5, check=False,
+            env={**os.environ, 'GIT_NO_LAZY_FETCH':'1', 'GIT_TERMINAL_PROMPT':'0', 'GIT_OPTIONAL_LOCKS':'0'})
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise OfflineGitUnavailable(message) from error
+    if result.returncode:
+        raise OfflineGitUnavailable(message)
+
+
 def source_identity():
+    require_offline_git()
     def local_git(*args):
         return subprocess.check_output(
             ['git','--no-lazy-fetch','--no-pager',*args],cwd=ROOT,timeout=5,
@@ -184,7 +202,7 @@ def execute_snapshot(snapshot: FrozenSnapshot, artifact_dir: Path) -> StageRunEx
     from qdrant_client import QdrantClient, models
     from inference.ranker_service import RankerService
     from inference.feed_assembly import FeedAssemblySystem
-    from retrieval.v2_retriever import QdrantV2Retriever
+    from retrieval.v2_retriever import QdrantV2Retriever, QDRANT_VECTOR_NAME
     from retrieval.social_candidates import SocialPolicy
     from utils.deadline import RequestDeadline, deadline_scope, check_deadline
     names={'model_sha256':'heavy_ranker.pt','scaler_sha256':'feature_scaler.json','manifest_sha256':'model_manifest.json'}
@@ -255,10 +273,10 @@ def execute_snapshot(snapshot: FrozenSnapshot, artifact_dir: Path) -> StageRunEx
             return self._read('scroll',super().scroll,*args,**kwargs)
 
     with closing(FrozenClient()) as client:
-        client.create_collection('frozen_repos',vectors_config={'repo_embedding':models.VectorParams(size=384,distance=models.Distance.COSINE)})
+        client.create_collection('frozen_repos',vectors_config={QDRANT_VECTOR_NAME:models.VectorParams(size=384,distance=models.Distance.COSINE)})
         client.create_collection('frozen_users',vectors_config=models.VectorParams(size=384,distance=models.Distance.COSINE))
         repos={r.repo_id:r for r in snapshot.bundle.repositories}
-        client.upsert('frozen_repos',points=[models.PointStruct(id=r.repo_id,vector={'repo_embedding':repos[r.repo_id].vector},payload=r.payload)
+        client.upsert('frozen_repos',points=[models.PointStruct(id=r.repo_id,vector={QDRANT_VECTOR_NAME:repos[r.repo_id].vector},payload=r.payload)
             for r in snapshot.repositories if not repos[r.repo_id].archived])
         client.upsert('frozen_users',points=[models.PointStruct(id=r.profile_id,vector=r.vector,payload=r.payload) for r in snapshot.profiles])
         assembler=RecordingAssembler()
@@ -279,7 +297,7 @@ def execute_snapshot(snapshot: FrozenSnapshot, artifact_dir: Path) -> StageRunEx
                 'freshness_window_hours','freshness_boost','explore_fraction','max_same_language',
                 'generation_reference_capacity','generation_reference_ttl_seconds')},
             'social':asdict(engine.social_policy),'diversity':asdict(engine.diversity_policy),
-            'runtime':{'overall_cooperative_deadline_seconds':120,'max_candidate_pool':150,
+            'runtime':{'repository_vector_name':QDRANT_VECTOR_NAME,'overall_cooperative_deadline_seconds':120,'max_candidate_pool':150,
                        'external_social_evidence':False,'device':str(ranker.device),'requested_limit':snapshot.limit,
                        'warmup':'none; first profile includes first actual forward',
                        'torch_threads':torch.get_num_threads(),'torch_interop_threads':torch.get_num_interop_threads(),

@@ -11,8 +11,9 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
-from evaluation.stage_runner import MAX_SNAPSHOT_BYTES, FrozenSnapshot, execute_snapshot
+from evaluation.stage_runner import MAX_SNAPSHOT_BYTES, FrozenSnapshot, StageRunExport, execute_snapshot, require_offline_git, OfflineGitUnavailable
 from evaluation.recommendation_benchmark import digest
 from scripts.evaluate_recommendations import atomic_json, read_json
 
@@ -33,11 +34,19 @@ def main(argv=None):
         if args.expected_snapshot_sha is not None and args.expected_snapshot_sha!=digest(snapshot):
             raise ValueError('frozen snapshot changed before worker execution')
         if not args.worker:
-            result=subprocess.run([sys.executable,'-m','scripts.run_recommendation_stages','--worker',
-                '--snapshot',str(args.snapshot.resolve()),'--output',str(args.output.resolve()),
-                '--artifact-dir',str(args.artifact_dir.resolve()),'--expected-snapshot-sha',digest(snapshot)],timeout=180,check=False,capture_output=True,text=True)
-            if result.returncode:
-                print(json.dumps({'passed':False,'error':'WorkerFailed'}));return 2
+            require_offline_git()
+            # A worker may finish writing and then time out during cleanup. Keep
+            # that result private until it has exited successfully and its owned
+            # temporary directory has also been cleaned up.
+            with tempfile.TemporaryDirectory(prefix='weave-stage-result-') as directory:
+                private_output = Path(directory) / 'result.json'
+                result=subprocess.run([sys.executable,'-m','scripts.run_recommendation_stages','--worker',
+                    '--snapshot',str(args.snapshot.resolve()),'--output',str(private_output),
+                    '--artifact-dir',str(args.artifact_dir.resolve()),'--expected-snapshot-sha',digest(snapshot)],timeout=180,check=False,capture_output=True,text=True)
+                if result.returncode:
+                    print(json.dumps({'passed':False,'error':'WorkerFailed'}));return 2
+                exported = StageRunExport.model_validate(read_json(private_output))
+            atomic_json(args.output, exported.model_dump(mode='json'))
             print(result.stdout.strip());return 0
         import socket
         from unittest.mock import patch
@@ -54,6 +63,8 @@ def main(argv=None):
             shutdown_retrieval_runtime()
         print(json.dumps({'passed':True,'format':exported.format,'profiles':len(exported.run.outputs),
                           'scope':exported.execution_scope,'qualified':False},sort_keys=True));return 0
+    except OfflineGitUnavailable as error:
+        print(json.dumps({'passed':False,'error':'UnsupportedGit','detail':str(error)}));return 2
     except (ValueError,TypeError,OSError,RuntimeError,RecursionError,subprocess.TimeoutExpired):
         print(json.dumps({'passed':False,'error':'InvalidOrFailedReplay'}));return 2
 

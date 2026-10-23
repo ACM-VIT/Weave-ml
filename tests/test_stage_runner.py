@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from evaluation.recommendation_benchmark import digest, evaluate
 from evaluation.stage_runner import FrozenSnapshot, StageRunExport, execute_snapshot
+from tests.test_tower_history import require_local_only_git
 from embedding.vector_contract import repository_payload_defaults
 from config import EMBEDDING_MODEL_REVISION, REPOSITORY_EMBEDDING_MODEL, REPOSITORY_EMBEDDING_VERSION
 ROOT=Path(__file__).resolve().parents[1]
@@ -39,6 +40,7 @@ def snapshot_data():
 
 @pytest.fixture(scope='module')
 def real_export():
+    require_local_only_git()
     snapshot=FrozenSnapshot.model_validate(snapshot_data())
     return snapshot,execute_snapshot(snapshot,ROOT/'inference')
 
@@ -77,7 +79,7 @@ def test_actual_runner_repeats_identical_stages_with_frozen_time(real_export):
     assert first.run.model_sha256==again.run.model_sha256
 
 
-@pytest.mark.parametrize('case',['vector','revision','payload','features','duplicate_profile','metadata','size','prompt'])
+@pytest.mark.parametrize('case',['vector','revision','payload','features','duplicate_profile','metadata','size','prompt','model-version'])
 def test_snapshot_rejects_incoherent_or_unbounded_inputs(case):
     value=snapshot_data()
     if case=='vector':value['profiles'][0]['vector'][0]=float('nan')
@@ -85,6 +87,7 @@ def test_snapshot_rejects_incoherent_or_unbounded_inputs(case):
     if case=='payload':value['repositories'][0]['payload']['repo_id']=value['repositories'][1]['repo_id']
     if case=='features':value['repositories'][0]['payload']['feature_version']=-1
     if case=='duplicate_profile':value['profiles'][1]=copy.deepcopy(value['profiles'][0])
+    if case=='model-version':value['repositories'][0]['payload']['model_version']='stale-model'
     if case=='metadata':value['repositories'][0]['payload']['star_count']=999
     if case=='size':value['profiles']*=33
     if case=='prompt':value['bundle']['embedding']['query_prompt']='invented prompt'
@@ -126,6 +129,7 @@ def test_evaluator_consumes_bound_stage_export_and_rejects_other_bundle(real_exp
 
 
 def test_real_cli_worker_is_offline_bounded_and_preserves_old_output(tmp_path):
+    require_local_only_git()
     import json
     from scripts.run_recommendation_stages import main
     source=tmp_path/'snapshot.json';source.write_text(json.dumps(snapshot_data()))
@@ -145,7 +149,11 @@ def test_cli_worker_timeout_and_snapshot_drift_preserve_output(tmp_path,monkeypa
     source=tmp_path/'snapshot.json';source.write_text(json.dumps(snapshot_data()))
     output=tmp_path/'run.json';output.write_bytes(b'previous successful output')
     def timeout(*args,**kwargs):
+        if args[0][0]=='git':
+            return subprocess.CompletedProcess(args[0],0,b'git version fixture',b'')
         assert kwargs['timeout']==180
+        worker_output=Path(args[0][args[0].index('--output')+1])
+        worker_output.write_bytes(b'completed worker evidence before cleanup timeout')
         raise subprocess.TimeoutExpired(args[0],180)
     monkeypatch.setattr(cli.subprocess,'run',timeout)
     assert cli.main(['--snapshot',str(source),'--output',str(output)])==2
@@ -155,6 +163,7 @@ def test_cli_worker_timeout_and_snapshot_drift_preserve_output(tmp_path,monkeypa
 
 
 def test_exported_final_stage_matches_actual_returned_batch_order_and_scores(monkeypatch):
+    require_local_only_git()
     from retrieval.v2_retriever import QdrantV2Retriever
     original=QdrantV2Retriever.recommend_batch
     batches={}
@@ -169,6 +178,7 @@ def test_exported_final_stage_matches_actual_returned_batch_order_and_scores(mon
 
 
 def test_partial_query_failure_cannot_export_discovery_only_success(monkeypatch):
+    require_local_only_git()
     from qdrant_client import QdrantClient
     def unavailable(*args,**kwargs):
         raise RuntimeError('controlled local semantic query failure')
@@ -210,3 +220,31 @@ def test_replay_owns_deep_snapshot_despite_caller_aba_mutation(real_export,monke
     assert calls==2 and digest(snapshot)==original_digest
     assert exported.snapshot_sha256==original_digest and exported.seed==original_seed
     assert [row.stages for row in exported.run.outputs]==[row.stages for row in real_export[1].run.outputs]
+
+
+def test_unsupported_git_fails_with_an_actionable_cli_result_before_worker(tmp_path, monkeypatch, capsys):
+    import json, subprocess
+    from evaluation.stage_runner import OfflineGitUnavailable, source_identity
+    from scripts import run_recommendation_stages as cli
+    source=tmp_path/'snapshot.json';source.write_text(json.dumps(snapshot_data()))
+    output=tmp_path/'run.json';output.write_bytes(b'prior evidence')
+    calls=[]
+    def unsupported(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args,129,b'',b'unknown option: --no-lazy-fetch')
+    monkeypatch.setattr(subprocess,'run',unsupported)
+    with pytest.raises(OfflineGitUnavailable,match='requires Git supporting --no-lazy-fetch'):
+        source_identity()
+    assert cli.main(['--snapshot',str(source),'--output',str(output)])==2
+    result=json.loads(capsys.readouterr().out)
+    assert result['error']=='UnsupportedGit' and '--no-lazy-fetch' in result['detail']
+    assert output.read_bytes()==b'prior evidence'
+    assert calls==[['git','--no-lazy-fetch','--version']]*2
+
+
+def test_replay_uses_the_production_readers_effective_vector_name(monkeypatch):
+    require_local_only_git()
+    monkeypatch.setattr('retrieval.v2_retriever.QDRANT_VECTOR_NAME','custom_repository_vector')
+    exported=execute_snapshot(FrozenSnapshot.model_validate(snapshot_data()),ROOT/'inference')
+    assert exported.configuration['runtime']['repository_vector_name']=='custom_repository_vector'
+    assert all(output.stages['retrieval'] and output.stages['assembly'] for output in exported.run.outputs)
