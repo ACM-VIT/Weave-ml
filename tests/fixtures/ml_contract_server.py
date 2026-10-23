@@ -3,7 +3,9 @@
 Routes, Pydantic contracts, HTTP authentication and admission are real. External
 model/storage boundaries are replaced; this is not distributed persistence QA.
 """
+import json
 import os
+import uuid
 import socket
 from types import SimpleNamespace
 
@@ -13,6 +15,7 @@ os.environ['APP_ENV'] = 'development'
 import uvicorn
 from api import v2
 from api.main import app
+from feedback.v2 import FeedbackEventIdConflictError
 from retrieval.v2_retriever import RankedRepository, RecommendationBatch
 
 
@@ -40,16 +43,21 @@ def recommend(*args):
     )
 
 
-accepted_events = set()
+accepted_events = {}
 
 def feedback(events):
     accepted = duplicates = 0
     for event in events:
         assert isinstance(event['feedback_version'], int)
+        assert event['event_id'] == str(uuid.UUID(event['event_id']))
+        fingerprint = json.dumps(event, sort_keys=True)
         if event['event_id'] in accepted_events:
+            if accepted_events[event['event_id']] != fingerprint:
+                raise FeedbackEventIdConflictError(accepted=accepted, duplicates=duplicates,
+                                                   failed_event_id=event['event_id'])
             duplicates += 1
         else:
-            accepted_events.add(event['event_id'])
+            accepted_events[event['event_id']] = fingerprint
             accepted += 1
     return accepted, duplicates
 
