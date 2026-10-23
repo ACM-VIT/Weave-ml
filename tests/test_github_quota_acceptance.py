@@ -14,7 +14,9 @@ from scripts.benchmark_github_quota import (
 
 def test_concurrent_reset_admission_is_bounded_and_staggered():
     clock = Clock()
-    with fixture_clock(clock):
+    original_admit = quota.GitHubRateLimitCoordinator.admit
+    with fixture_clock(clock, observe_admissions=False):
+        assert quota.GitHubRateLimitCoordinator.admit is original_admit
         coordinator = quota.GitHubRateLimitCoordinator()
         coordinator.observe({'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1005'})
         coordinator.throttle({'Retry-After': '5'})

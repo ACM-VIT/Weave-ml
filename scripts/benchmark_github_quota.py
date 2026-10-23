@@ -45,7 +45,7 @@ class Clock:
 
 
 @contextmanager
-def fixture_clock(clock):
+def fixture_clock(clock, *, observe_admissions=True):
     fake_time = SimpleNamespace(monotonic=clock.monotonic, time=clock.wall,
                                 sleep=clock.forbidden_worker_sleep)
     original_admit = quota.GitHubRateLimitCoordinator.admit
@@ -65,8 +65,11 @@ def fixture_clock(clock):
                                        'ready_at': result})
             return result
     with ExitStack() as stack:
-        stack.enter_context(patch.object(quota.GitHubRateLimitCoordinator, 'admit', observe_admit))
-        stack.enter_context(patch.object(quota.GitHubRateLimitCoordinator, 'throttle', observe_throttle))
+        # Concurrency acceptance must exercise only production synchronization.
+        # Benchmark timestamp observation deliberately extends the critical section.
+        if observe_admissions:
+            stack.enter_context(patch.object(quota.GitHubRateLimitCoordinator, 'admit', observe_admit))
+            stack.enter_context(patch.object(quota.GitHubRateLimitCoordinator, 'throttle', observe_throttle))
         for module in (quota, graphql, scheduling):
             stack.enter_context(patch.object(module, 'time', fake_time))
         stack.enter_context(patch.object(quota.random, 'uniform', return_value=.1))
