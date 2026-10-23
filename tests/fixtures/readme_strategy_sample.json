@@ -1,0 +1,8 @@
+{
+  "status": "proposed_not_approved",
+  "repositories": [
+    "ACM-VIT/Weave", "ACM-VIT/Weave-ml", "python/cpython",
+    "django/django", "nodejs/node", "rust-lang/rust", "golang/go",
+    "microsoft/vscode", "pallets/flask", "redis/redis"
+  ]
+}
