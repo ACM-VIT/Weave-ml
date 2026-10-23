@@ -100,6 +100,7 @@ class CorpusPipeline:
                 if database_ready
                 else set()
             )
+            report.manifest_status = getattr(self.database, "manifest_status", "not_supported")
             acquired = self._as_acquisition_result(
                 self.acquire(
                     limit=cycle_limit,
