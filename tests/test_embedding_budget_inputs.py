@@ -91,3 +91,38 @@ def test_existing_encoder_comparison_fixture_is_a_supported_frozen_input():
     path=Path(__file__).resolve().parent/'fixtures/readme_retrieval.json'
     loaded=load_budget_fixture(path)
     assert loaded.cases and loaded.queries and 'synthetic' in loaded.label_provenance.lower()
+
+
+def test_cohort_encodes_queries_and_selects_each_recipe_in_repository_order(tmp_path, monkeypatch):
+    import hashlib
+    import sys
+    from types import SimpleNamespace
+    from scripts import sweep_embedding_budget as sweep
+    import embedding.runtime
+    from config import TOKEN_SECTION_EMBEDDING_VERSION
+    value=fixture();path=write(tmp_path,value)
+    x=np.eye(1,384,dtype=np.float32)[0]
+    y=np.eye(2,384,dtype=np.float32)[1]
+    calls=[]
+    class Model:
+        max_seq_length=256
+        def encode(self, texts, **kwargs):
+            calls.append(list(texts))
+            return np.asarray([x for _ in texts])
+    monkeypatch.setitem(sys.modules,'sentence_transformers',SimpleNamespace(SentenceTransformer=lambda *a,**kw:Model()))
+    monkeypatch.setattr(embedding.runtime,'BoundedEmbeddingModel',lambda loaded,**kw:loaded)
+    monkeypatch.setattr(sweep,'source_hashes',lambda:{'fixture':'stable'})
+    def encoded(case, *, version, **kwargs):
+        first=case['name']==value['repositories'][0]['repo_id']
+        vector=x if first==(version=='repo-embedding-v2') else y
+        return {'name':case['name'],'version':version,'final_vector':vector.tolist()}
+    monkeypatch.setattr(sweep,'encode_job',encoded)
+    report=sweep.cohort(None,False,path,retrieval_k=1)
+    assert calls==[['Offline warmup'],[value['queries'][0]['query']]]
+    assert report['query_vector_sha256']==hashlib.sha256(np.asarray([x],dtype='<f4').tobytes()).hexdigest()
+    assert report['input_fixture_sha256']==load_budget_fixture(path).sha256
+    assert report['retrieval']['repo-embedding-v2']['recall_at_1']==1
+    assert report['retrieval'][TOKEN_SECTION_EMBEDDING_VERSION]['recall_at_1']==0
+    for result in report['retrieval'].values():
+        assert result['repository_ids']==[row['repo_id'] for row in value['repositories']]
+    assert report['network_attempts']==0
