@@ -53,3 +53,14 @@ def test_expected_reference_is_strict_and_does_not_accept_full_generated_reports
     elif fault=='missing_stage':del raw['stages']['assembly']
     else:raw['format']='unrecognized-reference'
     with pytest.raises(ValueError):load_baseline(raw)
+
+
+@pytest.mark.parametrize('comparison',['same_embedding','cross_embedding'])
+def test_mandatory_scalar_reference_dataset_identity_is_bound_in_every_mode(comparison):
+    baseline,policy,raw=fixture()
+    policy=Policy.model_validate({**policy.model_dump(mode='json'),'embedding_comparison':comparison})
+    raw['policy_sha256']=digest(policy)
+    raw['evaluation_dataset_sha256']='f'*64
+    result=assess(baseline.report.model_dump(mode='json'),load_baseline(raw),policy)
+    assert result['passed'] is False
+    assert any('identical verified raw' in reason for reason in result['failures'])
