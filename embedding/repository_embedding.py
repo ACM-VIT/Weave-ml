@@ -181,8 +181,17 @@ def coerce_payload(source: Any) -> dict[str, Any]:
     raise TypeError("repository source must be a payload dict or an object with a payload dict")
 
 
-def build_metadata_text(repo: Mapping[str, Any]) -> str:
-    """Project structured repository metadata into stable embedding text."""
+def build_metadata_text(repo: Mapping[str, Any], *, preserve_legacy_zero_recency: bool = False) -> str:
+    """Project metadata, distinguishing a push today from missing recency.
+
+    Reserved embedding identities can explicitly retain their old projection
+    until a separately qualified version adopts this correction.
+    """
+    recency = repo.get("pushed_days_ago")
+    if preserve_legacy_zero_recency:
+        recency = recency or 999
+    elif recency is None:
+        recency = 999
     lines = [
         f"Repository: {repo.get('full_name') or repo.get('id', '')}",
         f"Description: {repo.get('description') or ''}",
@@ -190,7 +199,7 @@ def build_metadata_text(repo: Mapping[str, Any]) -> str:
         f"Stars: {int(repo.get('star_count') or 0)}",
         f"Forks: {int(repo.get('fork_count') or 0)}",
         f"Open issues: {int(repo.get('open_issues_count') or 0)}",
-        f"Pushed days ago: {int(repo.get('pushed_days_ago') or 999)}",
+        f"Pushed days ago: {int(recency)}",
         f"Star deltas: 3d={int(repo.get('delta_3d') or 0)}, 7d={int(repo.get('delta_7d') or 0)}, 30d={int(repo.get('delta_30d') or 0)}",
         f"Contributor signal: mentionable_users_count={int(repo.get('mentionable_users_count') or 0)}",
         f"Discovery category: {repo.get('discovery_category') or ''}",

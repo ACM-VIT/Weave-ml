@@ -7,7 +7,7 @@ import logging
 from collections.abc import Iterable
 from typing import Any
 
-from config import TOKEN_SECTION_EMBEDDING_VERSION
+from config import TOKEN_SECTION_EMBEDDING_VERSION, ZERO_RECENCY_EMBEDDING_VERSION
 from summarization.contracts import CardSummaryArtifact
 from summarization.pipeline import CardSummaryPipeline
 
@@ -75,7 +75,9 @@ class RepositoryEmbeddingPipeline:
         readme_text = (
             build_readme_text(source) if legacy_readme else readme_source(source, repo)
         )
-        metadata_text = build_metadata_text(repo)
+        metadata_text = build_metadata_text(
+            repo, preserve_legacy_zero_recency=self.config.version != ZERO_RECENCY_EMBEDDING_VERSION,
+        )
         topic_text = build_topic_text(repo)
         card_summary = self.summarize_repository(source, repo, deadline=deadline)
 

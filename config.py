@@ -105,6 +105,8 @@ REPOSITORY_EMBEDDING_VERSION = os.getenv("REPOSITORY_EMBEDDING_VERSION", "repo-e
 # Opt in only after corpus/ranker qualification; the exact v2 identity keeps
 # its original character-chunk/equal-mean computation during migration.
 TOKEN_SECTION_EMBEDDING_VERSION = "repo-embedding-v3-token-sections-v1"
+# Metadata-only correction; qualify a separate corpus/ranker before opting in.
+ZERO_RECENCY_EMBEDDING_VERSION = "repo-embedding-v2-zero-recency-v1"
 REPOSITORY_FEATURE_SPEC_VERSION = os.getenv(
     "REPOSITORY_FEATURE_SPEC_VERSION", "v2"
 ).strip()
