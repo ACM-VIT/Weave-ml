@@ -112,3 +112,23 @@ def test_oversized_or_non_utf8_git_objects_are_reported_without_replay(history, 
     assert frozen == commit and rows == []
     assert skipped == [{'commit': commit, 'reason': reason}]
     assert replay(rows)['readme_tower_reuse_ratio'] is None
+
+
+
+@pytest.mark.parametrize('mode', ['120000', '040000'])
+@pytest.mark.parametrize('changes_only', [False, True])
+def test_nonregular_readme_entries_are_explicitly_skipped(history, mode, changes_only):
+    repo, commits = history
+    if mode == '120000':
+        object_id = git(repo, 'hash-object', '-w', '--stdin', input=b'docs/README.md').decode().strip()
+        kind = 'blob'
+    else:
+        object_id = git(repo, 'mktree', input=b'').decode().strip()
+        kind = 'tree'
+    tree = git(repo, 'mktree', input=f'{mode} {kind} {object_id}\tREADME.md\n'.encode()).decode().strip()
+    commit = git(repo, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+        'commit-tree', tree, '-p', commits[-1], input=b'nonregular fixture\n').decode().strip()
+    frozen, rows, skipped = snapshots(repo, ref=commit, limit=1, changes_only=changes_only)
+    assert frozen == commit and rows == []
+    assert skipped == [{'commit': commit, 'reason': 'README is not a regular file'}]
+    assert replay(rows)['readme_tower_reuse_ratio'] is None

@@ -54,11 +54,17 @@ def snapshots(repository, *, ref, limit=40, path='README.md', changes_only=False
     commits = git(repository, *args).decode().splitlines()[::-1]
     rows, skipped = [], []
     for commit in commits:
-        resolved = subprocess.run(['git', '-C', str(repository), 'rev-parse', '--verify', f'{commit}:{path}'], capture_output=True)
-        if resolved.returncode:
+        entries = git(repository, 'ls-tree', '-z', commit, '--', path).split(b'\0')
+        entry = next((value for value in entries
+                      if value and value.split(b'\t', 1)[1].decode('utf-8') == path), None)
+        if entry is None:
             skipped.append({'commit': commit, 'reason': 'README missing'})
             continue
-        blob = resolved.stdout.decode().strip()
+        mode, kind, object_id = entry.split(b'\t', 1)[0].split()
+        if mode not in {b'100644', b'100755'} or kind != b'blob':
+            skipped.append({'commit': commit, 'reason': 'README is not a regular file'})
+            continue
+        blob = object_id.decode('ascii')
         size = int(git(repository, 'cat-file', '-s', blob))
         if size > 1_000_000:
             skipped.append({'commit': commit, 'reason': 'README exceeds bounded input'})
