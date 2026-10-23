@@ -289,3 +289,67 @@ def test_consumer_close_retains_owned_clients_and_renewal_until_apply_exits():
     finally:
         release.set()
         closer.join(2)
+
+
+def test_ordering_gaps_do_not_dead_letter_healthy_successors_at_attempt_limit_one():
+    from feedback.v2 import OrderedFeedbackApplier
+    from tests.test_v2_feedback_hardening import FakeQdrant, _event
+
+    user, repo = str(uuid.uuid4()), str(uuid.uuid4())
+    redis, qdrant = FakeRedis(), FakeQdrant(user, repo)
+    settings = replace(_settings(), max_delivery_attempts=1)
+    consumer = OrderedFeedbackConsumer(
+        redis, OrderedFeedbackApplier(qdrant, settings), settings
+    )
+    later = _event(user, repo, 4, "save")
+    try:
+        for _ in range(3):
+            assert not consumer._process_message("4-0", later)
+        assert redis.acks == [] and redis.dead == [] and redis.attempts == {}
+        for version in [1, 2, 3]:
+            assert consumer._process_message(
+                f"{version}-0", _event(user, repo, version)
+            )
+        assert consumer._process_message("4-0", later)
+        assert qdrant.user.payload["last_feedback_version"] == 4
+    finally:
+        consumer.close()
+
+
+def test_shutdown_during_blocking_read_never_starts_returned_work():
+    redis = FakeRedis()
+    read_started = threading.Event()
+    release_read = threading.Event()
+    calls = []
+    consumer = OrderedFeedbackConsumer(
+        redis,
+        SimpleNamespace(
+            apply=lambda payload: (
+                calls.append(payload) or SimpleNamespace(status="applied")
+            )
+        ),
+        _settings(),
+    )
+
+    def messages():
+        read_started.set()
+        assert release_read.wait(2)
+        yield "1-0", {"user_id": str(uuid.uuid4())}
+
+    consumer._messages = messages
+    runner = threading.Thread(target=lambda: consumer.run_once(wait=False))
+    runner.start()
+    assert read_started.wait(1)
+    closer = threading.Thread(target=consumer.close)
+    closer.start()
+    try:
+        # Stop admission must be observable while close still waits for polling.
+        wait_until(lambda: consumer._admission_stop.is_set())
+        release_read.set()
+        runner.join(2)
+        closer.join(2)
+        assert calls == [] and redis.acks == []
+    finally:
+        release_read.set()
+        runner.join(2)
+        closer.join(2)

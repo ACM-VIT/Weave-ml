@@ -50,3 +50,11 @@ Fixture throughput and completion age use a matched simulated 5 ms dependency de
 they are not production capacity or latency guarantees. No deployment or shared
 service changes are part of this implementation. Separately budget and measure
 real dependency limits before changing deployed worker counts.
+
+Ordering gaps do not consume dependency-failure retry attempts: a later valid
+event waiting on a locally deferred or reclaimed predecessor stays pending even
+when the dependency-attempt cap is 1. Missing predecessors therefore require
+explicit reconciliation rather than silently dead-lettering healthy successors.
+Admission stop is published before acquiring the poll lock and before CLI signal
+drain, and checked at submission and worker entry. Production preflight validates
+the optional worker count with the same 1-16 range as runtime.

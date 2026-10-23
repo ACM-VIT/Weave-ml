@@ -567,3 +567,10 @@ def test_cli_is_network_free_and_returns_safe_json(monkeypatch, capsys) -> None:
     assert main(["--json"]) == 0
     result = json.loads(capsys.readouterr().out)
     assert result == {"errors": [], "valid": True}
+
+
+@pytest.mark.parametrize('value',['0','17','invalid'])
+def test_feedback_worker_preflight_rejects_invalid_optional_count(value):
+    environment=valid_production_env()
+    environment['FEEDBACK_CONSUMER_WORKERS']=value
+    assert 'FEEDBACK_CONSUMER_WORKERS' in issue_names(environment)

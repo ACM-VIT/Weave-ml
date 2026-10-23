@@ -1322,6 +1322,7 @@ class OrderedFeedbackConsumer:
         self._scheduler: UserFeedbackScheduler | None = None
         self._poll_lock = threading.Lock()
         self._closed = False
+        self._admission_stop = threading.Event()
         try:
             self.redis.xgroup_create(
                 self.settings.stream_name,
@@ -1529,6 +1530,15 @@ class OrderedFeedbackConsumer:
         code: str,
         reason: str,
     ) -> bool:
+        if code == "VERSION_GAP":
+            # Reordering from live/reclaim/capacity deferral is not a failed
+            # dependency attempt. Preserve the event until its predecessor is
+            # applied or explicitly reconciled; never move healthy successors
+            # to DLQ solely because scheduling changed their arrival order.
+            logger.info("feedback ordering gap remains pending",
+                extra={"feedback_context": self._context(message_id, payload,
+                    status="retry_pending", code=code)})
+            return False
         attempts_key = self._attempt_key(payload, message_id)
         attempts = int(self.redis.incr(attempts_key))
         self.redis.expire(attempts_key, self.settings.idempotency_ttl_seconds)
@@ -1804,6 +1814,8 @@ class OrderedFeedbackConsumer:
             )
 
     def _scheduled_message(self, work: Work) -> bool:
+        if self._admission_stop.is_set():
+            return False
         if isinstance(self.applier, OrderedFeedbackApplier):
             # Read snapshots are immutable and scoped to their Redis response;
             # install them on the actual worker thread, never user-ledger state.
@@ -1819,7 +1831,7 @@ class OrderedFeedbackConsumer:
         # Default drains for CLI/tests. The production loop keeps bounded lanes
         # alive across live/reclaim polls, so one slow user does not hold a batch.
         with self._poll_lock:
-            if self._closed:
+            if self._closed or self._admission_stop.is_set():
                 return 0
             self._refresh_heartbeat()
             heartbeat_stop = threading.Event()
@@ -1834,6 +1846,8 @@ class OrderedFeedbackConsumer:
             try:
                 if scheduler.wait_capacity():
                     for message_id, payload in self._messages():
+                        if self._admission_stop.is_set():
+                            break
                         try:
                             user_id = str(uuid.UUID(str(payload.get("user_id"))))
                         except (TypeError, ValueError, AttributeError):
@@ -1857,7 +1871,11 @@ class OrderedFeedbackConsumer:
                 heartbeat_thread.join(timeout=1)
                 self._refresh_heartbeat()
 
+    def stop_admission(self) -> None:
+        self._admission_stop.set()
+
     def close(self) -> None:
+        self.stop_admission()
         # Serialize close against polling. Keep heartbeats and dependency clients
         # alive while already executing synchronous vector writes drain.
         with self._poll_lock:
@@ -1900,6 +1918,7 @@ def main() -> None:
             "feedback consumer shutdown requested",
             extra={"feedback_context": {"status": "shutdown_requested", "signal": signum}},
         )
+        consumer.stop_admission()
         stop.set()
 
     signal.signal(signal.SIGTERM, request_shutdown)

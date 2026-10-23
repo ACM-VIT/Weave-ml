@@ -96,7 +96,7 @@ def test_two_processes_reclaim_duplicates_poison_and_ordered_cursors(record_prop
         read_batch_size=4,
         read_block_ms=10,
         reclaim_idle_ms=100,
-        max_delivery_attempts=100,
+        max_delivery_attempts=1,
     )
     client = redis.Redis.from_url(redis_url, decode_responses=True)
     qdrant = QdrantClient(url=qdrant_url)
