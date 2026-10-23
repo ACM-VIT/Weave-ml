@@ -777,7 +777,8 @@ class ModelOperationAcknowledgement(StrictModel):
     operation_id: uuid.UUID
     model_operation_version: str
     source_envelope_sha256: str
-    status: Literal["accepted", "duplicate"]
+    status: Literal["accepted", "duplicate", "withdrawal_accepted"]
+    withdrawal_sha256: str | None = None
 
 
 class ModelOperationResponse(StrictModel):
@@ -794,3 +795,58 @@ class ModelAuthorityRequest(StrictModel):
 class ModelAuthorityResponse(StrictModel):
     schema_version: Literal[1]
     model_context: AppliedModelContext
+
+
+class ProfileWithdrawalInput(StrictModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=False, hide_input_in_errors=True)
+    withdrawal_json: str = Field(min_length=1, max_length=131072)
+
+
+class ProfileWithdrawalBatch(StrictModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    schema_version: Literal[1]
+    withdrawals: list[ProfileWithdrawalInput] = Field(min_length=1, max_length=50)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def exact_schema(cls, value):
+        if type(value) is not int:
+            raise ValueError("Withdrawal schema must be an integer")
+        return value
+
+
+class ProfileWithdrawalAcknowledgement(StrictModel):
+    operation_id: uuid.UUID
+    model_operation_version: PositiveModelDecimal
+    source_envelope_sha256: str
+    withdrawal_sha256: str
+    status: Literal["accepted", "duplicate"]
+
+
+class ProfileWithdrawalResponse(StrictModel):
+    schema_version: Literal[1]
+    withdrawals: list[ProfileWithdrawalAcknowledgement]
+
+
+class ModelOperationStatusRequest(StrictModel):
+    schema_version: Literal[1]
+    user_id: uuid.UUID
+    operation_id: uuid.UUID
+    model_operation_version: PositiveModelDecimal
+    source_envelope_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+
+
+class ModelOperationStatusResponse(StrictModel):
+    schema_version: Literal[1]
+    user_id: uuid.UUID
+    operation_id: uuid.UUID
+    model_operation_version: PositiveModelDecimal
+    source_envelope_sha256: str
+    status: Literal["pending", "applied", "withdrawn_profile", "rejected_capacity"]
+    basis_status: Literal["missing", "awaiting_profile", "ready"]
+    applied_operation_version: PositiveModelDecimal | None = None
+    applied_profile_version: PositiveModelDecimal | None = None
+    applied_feedback_version: NonnegativeModelDecimal | None = None
+    current_head: str | None = None
+    operation_head: str | None = None
+    withdrawal_sha256: str | None = None

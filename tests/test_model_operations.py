@@ -48,7 +48,7 @@ def wire(p, kind, version, payload, *, user=uid(1), at=None):
 
 
 def profile_payload(initial=True, version=1):
-    return dict(job_id=uid(20+version), profile_version=str(version), initial=initial,
+    return dict(job_id=uid(20+version), profile_version=str(version), allow_genesis=initial,
                 original_profile_context={'interests': ['Python', '検索']})
 
 
@@ -77,7 +77,7 @@ def parse(text, p):
     lambda raw: raw.replace('"schema_version":1', '"schema_version":1,"schema_version":1'),
     lambda raw: raw.replace('"model_operation_version":"1"', '"model_operation_version":"01"'),
     lambda raw: raw.replace('"accepted_at_ms":"1"', '"accepted_at_ms":1'),
-    lambda raw: raw.replace('"initial":true', '"initial":1'),
+    lambda raw: raw.replace('"allow_genesis":true', '"allow_genesis":1'),
     lambda raw: raw.replace('"kind":"profile"', '"kind":"reject"'),
     lambda raw: raw.replace('"検索"', '"\\u691c\\u7d22"'),
 ])
@@ -118,7 +118,8 @@ def runtime_config(p=None, namespace='fixture-model'):
     return dict(schema_version=1, policy=asdict(p or policy()),
         stream=asdict(StreamLimits(namespace, 100, 1000, 131072, 10, 10)),
         journal=dict(input_bytes=131072, record_bytes=2097152, combined_user_bytes=1048576, history_operations=1000),
-        journal_collection='fixture_model_journal', max_journal_records=10000, max_journal_bytes=100000000)
+        journal_collection='fixture_model_journal', max_journal_records=10000, max_journal_bytes=100000000,
+        initialization_scope='fixture-weave-deployment-v1', max_initialization_guard_users=1000)
 
 
 @pytest.mark.parametrize('bad_event', [
@@ -150,7 +151,7 @@ def test_registered_route_rejects_nonfinite_numeric_json_before_admission(monkey
     from fastapi.testclient import TestClient
     from api.v2 import router
     import feedback.model_runtime as provider
-    p=policy();raw=wire(p,'profile',1,profile_payload()).replace('"initial":true','"initial":1e999')
+    p=policy();raw=wire(p,'profile',1,profile_payload()).replace('"allow_genesis":true','"allow_genesis":1e999')
     with pytest.raises(WireError):parse(raw,p)
     calls=[];stream=SimpleNamespace(limits=SimpleNamespace(input_bytes=131072),policies={p.sha256},admit=lambda raw:calls.append(raw))
     monkeypatch.setattr(provider,'model_runtime',lambda:SimpleNamespace(stream=stream));monkeypatch.setenv('INTERNAL_API_SECRET','fixture-secret')
@@ -217,3 +218,26 @@ def test_registry_builds_one_client_set_under_concurrent_first_use(monkeypatch,t
 def test_journal_budget_includes_base64_original_bytes_and_complete_state():
     from feedback.model_journal import JournalError
     with pytest.raises(JournalError):Limits(131072,131072,1048576,1000)
+
+
+def withdrawal(p, original_json, *, revoked_at=100, witness='e'*64):
+    import json
+    value=json.loads(original_json);payload=value['operation']
+    fields={key:value[key] for key in ('schema_version','operation_id','user_id','model_operation_version',
+        'previous_model_operation_version','accepted_at_ms','policy_version','policy_sha256')}
+    fields.update(source_envelope_sha256=hashlib.sha256(original_json.encode()).hexdigest(),
+        profile_job_id=payload['job_id'],profile_version=payload['profile_version'],allow_genesis=payload['allow_genesis'],
+        revoked_at_ms=str(revoked_at),revocation_witness_sha256=witness,reason='github_consent_revoked')
+    return canonical_json(fields)
+
+
+def test_withdrawal_attestation_does_not_include_or_reconstruct_private_profile_context():
+    from feedback.model_wire import parse_withdrawal
+    p=policy();raw=wire(p,'profile',1,profile_payload())
+    attestation=withdrawal(p,raw)
+    parsed=parse_withdrawal(attestation,maximum_bytes=131072,allowed_policies={p.sha256})
+    assert parsed.header.source_envelope_sha256==hashlib.sha256(raw.encode()).hexdigest()
+    assert parsed.profile_version==1 and parsed.allow_genesis is True
+    assert 'original_profile_context' not in attestation and '検索' not in attestation
+    invalid=__import__('json').loads(attestation);invalid['original_profile_context']={'bio':'revoked'}
+    with pytest.raises(WireError):parse_withdrawal(canonical_json(invalid),maximum_bytes=131072,allowed_policies={p.sha256})

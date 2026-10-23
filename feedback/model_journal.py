@@ -17,13 +17,14 @@ from feedback import long_session as reducer
 class JournalError(RuntimeError): pass
 class JournalConflict(JournalError): pass
 class JournalMissing(JournalError): pass
+class OriginalIdentityConflict(JournalConflict): pass
 class CasConflict(JournalError): pass
 class HistoryBudget(JournalError): pass
 
 _TYPES = {cls.__name__: cls for cls in (reducer.EmbeddingIdentity, reducer.Policy,
     reducer.PinnedVector, reducer.Signal, reducer.RepositoryLedger, reducer.SessionLedger,
     reducer.State, reducer.Header, reducer.SessionBinding, reducer.Feedback,
-    reducer.Profile, reducer.Begin, reducer.Reset, reducer.End)}
+    reducer.Profile, reducer.Begin, reducer.Reset, reducer.End, reducer.BootstrapState, reducer.WithdrawnProfile)}
 
 
 def _pack(value):
@@ -130,11 +131,27 @@ class Journal:
         digest=self.put('input',stored)
         return operation,digest
 
+    def pin_withdrawal(self, wire, policy):
+        operation = reducer.WithdrawnProfile(wire.header, wire.profile_job_id, wire.profile_version,
+            wire.allow_genesis, wire.revoked_at_ms, wire.revocation_witness_sha256, wire.withdrawal_sha256)
+        raw = wire.original_json.encode('utf-8')
+        if _sha(raw) != wire.withdrawal_sha256 or len(raw) > self.limits.input_bytes:
+            raise JournalConflict('withdrawal attestation bytes differ')
+        value = {'identity': {'header': _pack(wire.header), 'kind': 'profile_withdrawal',
+            'policy_sha256': policy.sha256, 'withdrawal_base64': base64.b64encode(raw).decode()}, 'operation': _pack(operation)}
+        candidate = _canonical(value)
+        _json(candidate, self.limits.record_bytes)
+        key = 'withdrawal:' + wire.header.user_id + ':' + str(wire.header.operation_version)
+        stored = self.records.put_once(key, candidate)
+        if stored != candidate:
+            raise JournalConflict('withdrawal attestation identity differs')
+        return operation, self.put('input', value)
+
 
 @dataclass(frozen=True)
 class Snapshot:
     user_id:str
-    state:reducer.State
+    state:reducer.State | reducer.BootstrapState
     head:str|None
     # Exact canonical complete product-independent ML vector/payload bytes.
     # Includes legacy compatibility state and every CAS token, not a delta.
@@ -172,41 +189,124 @@ class Coordinator:
         body=_json(snapshot.complete,self.journal.limits.combined_user_bytes)
         if set(body)!={'schema_version','user_id','state','legacy'} or body['schema_version']!=1 or body['user_id']!=snapshot.user_id or body['state']!=_pack(snapshot.state):
             raise JournalConflict('complete snapshot identity differs')
-        reducer.recommendation_view(snapshot.state,self.policy,session_id=None,epoch=None,as_of_ms=snapshot.state.effective_ms)
+        if isinstance(snapshot.state, reducer.BootstrapState):
+            reducer.check_bootstrap(snapshot.state, self.policy)
+        else:
+            reducer.recommendation_view(snapshot.state,self.policy,session_id=None,epoch=None,as_of_ms=snapshot.state.effective_ms)
         validate_committed_head(snapshot, self.journal)
-    def initialize(self, header, source_envelope, resolve, legacy, assert_lock):
-        """Insert an explicit first profile, never overwrite an existing user.
+    def _empty_prefix(self, header):
+        if header.previous_operation_version != 0:
+            raise reducer.OperationGap('missing prefix cannot be inferred from a cursor')
+        seed = reducer.bootstrap_state(header.user_id, self.policy, accepted_ms=header.accepted_ms)
+        legacy = {'vector': {}, 'payload': {'user_id': header.user_id, 'last_feedback_version': 0, 'feedback_state_revision': 0}}
+        complete = _canonical({'schema_version': 1, 'user_id': header.user_id, 'state': _pack(seed), 'legacy': legacy})
+        return Snapshot(header.user_id, seed, None, complete)
 
-        The zero-cursor seed is an immutable checkpoint, not a fake persisted
-        profile or an inference about an existing learned user's history.
-        """
-        operation, input_sha = self.journal.pin_input(header, 'profile', self.policy, source_envelope, resolve)
-        if not isinstance(operation, reducer.Profile) or not operation.initial or header.operation_version != 1:
-            raise JournalConflict('explicit first profile required for genesis')
-        seed = reducer.initial_state(header.user_id, operation.baseline, self.policy, accepted_ms=header.accepted_ms)
-        legacy_body = _json(legacy, self.journal.limits.combined_user_bytes)
-        seed_complete = _canonical({'schema_version': 1, 'user_id': header.user_id, 'state': _pack(seed), 'legacy': legacy_body})
-        checkpoint = self.journal.put('checkpoint', {'user_id': header.user_id, 'head': None,
-            'state_sha256': reducer.state_sha256(seed), 'state': _pack(seed),
-            'complete_base64': base64.b64encode(seed_complete).decode(), 'policy_sha256': self.policy.sha256})
-        state = reducer.reduce_operation(seed, operation, self.policy)
-        legacy_body['payload']['feedback_state_revision'] = 1
-        complete = _canonical({'schema_version': 1, 'user_id': header.user_id, 'state': _pack(state), 'legacy': legacy_body})
+    def _checkpoint_snapshot(self, snapshot):
+        self._validate_snapshot(snapshot)
+        return self.journal.put('checkpoint', {'user_id': snapshot.user_id, 'head': snapshot.head,
+            'state_sha256': reducer.state_sha256(snapshot.state), 'state': _pack(snapshot.state),
+            'complete_base64': base64.b64encode(snapshot.complete).decode(), 'policy_sha256': self.policy.sha256})
+
+    def _commit_transition(self, before, operation, input_sha, legacy, assert_lock, *, insert=False, disposition='applied'):
+        after = reducer.reduce_operation(before.state, operation, self.policy)
+        complete = _canonical({'schema_version': 1, 'user_id': before.user_id, 'state': _pack(after),
+                               'legacy': _json(legacy, self.journal.limits.combined_user_bytes)})
+        _json(complete, self.journal.limits.combined_user_bytes)
         complete_sha = self.journal.put('complete', json.loads(complete))
-        head = self.journal.put('prepare', {'user_id': header.user_id, 'previous_head': None,
-            'previous_state_sha256': reducer.state_sha256(seed), 'operation_version': 1, 'input_sha256': input_sha,
-            'disposition': 'applied', 'error_code': None, 'state_sha256': reducer.state_sha256(state),
-            'complete_sha256': complete_sha, 'genesis_checkpoint_sha256': checkpoint})
-        desired = Snapshot(header.user_id, state, head, complete)
+        row = {'user_id': before.user_id, 'previous_head': before.head,
+            'previous_state_sha256': reducer.state_sha256(before.state), 'operation_version': after.operation_version,
+            'input_sha256': input_sha, 'disposition': disposition,
+            'error_code': 'PROFILE_CONSENT_WITHDRAWN' if disposition == 'withdrawn_profile' else None,
+            'state_sha256': reducer.state_sha256(after), 'complete_sha256': complete_sha}
+        if insert:
+            row['genesis_checkpoint_sha256'] = self._checkpoint_snapshot(before)
+        head = self.journal.put('prepare', row)
+        if disposition == 'withdrawn_profile':
+            self.dead_letter_prepare(operation.header, input_sha, head, 'PROFILE_CONSENT_WITHDRAWN')
+        desired = Snapshot(before.user_id, after, head, complete)
         assert_lock()
-        if not self.users.insert_once(desired):
-            existing = self.users.read(header.user_id)
-            self._validate_snapshot(existing)
-            self._prove_committed(existing, input_sha, 1)
-            assert_lock()
-            return 'duplicate'
+        applied = self.users.insert_once(desired) if insert else self.users.compare_and_set(before, desired)
+        if not applied:
+            raise CasConflict('original/profile-withdrawal state race; retry committed proof')
         assert_lock()
-        return 'applied'
+        return disposition
+
+    def initialize(self, header, source_envelope, resolve, legacy, assert_lock):
+        operation, input_sha = self.journal.pin_input(header, 'profile', self.policy, source_envelope, resolve)
+        if not isinstance(operation, reducer.Profile) or not operation.allow_genesis:
+            raise JournalConflict('explicit genesis permission required')
+        assert_lock()
+        before = self.users.read_optional(header.user_id)
+        insert = before is None
+        if insert:
+            before = self._empty_prefix(header)
+        self._validate_snapshot(before)
+        if header.operation_version <= before.state.operation_version:
+            return self.original_status(before, header)['status']
+        if not isinstance(before.state, reducer.BootstrapState):
+            raise JournalConflict('existing genuine basis requires ordinary profile update')
+        body = _json(legacy, self.journal.limits.combined_user_bytes)
+        body['payload']['feedback_state_revision'] = json.loads(before.complete)['legacy']['payload']['feedback_state_revision'] + 1
+        return self._commit_transition(before, operation, input_sha, _canonical(body), assert_lock, insert=insert)
+
+    def apply_withdrawal(self, wire, assert_lock):
+        operation, input_sha = self.journal.pin_withdrawal(wire, self.policy)
+        assert_lock()
+        before = self.users.read_optional(wire.header.user_id)
+        insert = before is None
+        if insert:
+            if not wire.allow_genesis:
+                raise JournalMissing('activated/legacy user cannot acquire a bootstrap prefix')
+            before = self._empty_prefix(wire.header)
+        self._validate_snapshot(before)
+        if wire.header.operation_version <= before.state.operation_version:
+            result = self.original_status(before, wire.header)
+            committed = result['operation']
+            if isinstance(committed, reducer.Profile):
+                source = self.journal.get(result['row']['input_sha256'], 'input')
+                envelope = json.loads(base64.b64decode(source['identity']['source_base64'], validate=True))
+                payload = envelope['operation']
+                if (payload['job_id'] != wire.profile_job_id or int(payload['profile_version']) != wire.profile_version
+                        or payload['allow_genesis'] != wire.allow_genesis):
+                    raise OriginalIdentityConflict('withdrawal names a different original profile')
+                return 'already_applied' if result['status'] == 'applied' else 'already_rejected'
+            if not isinstance(committed, reducer.WithdrawnProfile) or committed.withdrawal_sha256 != wire.withdrawal_sha256:
+                raise JournalConflict('committed withdrawal differs')
+            return 'withdrawn_duplicate'
+        legacy = self.legacy_reject(before.complete, operation)
+        return self._commit_transition(before, operation, input_sha, legacy, assert_lock,
+                                       insert=insert, disposition='withdrawn_profile')
+
+    def original_status(self, snapshot, header):
+        return self.status_for_identity(snapshot, operation_id=header.operation_id,
+            operation_version=header.operation_version, source_sha256=header.source_envelope_sha256, expected_header=header)
+
+    def status_for_identity(self, snapshot, *, operation_id, operation_version, source_sha256, expected_header=None):
+        self._validate_snapshot(snapshot)
+        head = snapshot.head
+        expected = reducer.state_sha256(snapshot.state)
+        version = snapshot.state.operation_version
+        for _ in range(self.journal.limits.history_operations):
+            if head is None:
+                raise JournalMissing('original operation predates committed proof horizon')
+            row = self.journal.get(head, 'prepare')
+            if row.get('user_id') != snapshot.user_id or row.get('state_sha256') != expected or row.get('operation_version') != version:
+                raise JournalConflict('committed original-operation chain differs')
+            if version == operation_version:
+                frozen = self.journal.get(row['input_sha256'], 'input')
+                operation = _unpack(frozen['operation'])
+                if (operation.header.operation_id != operation_id or operation.header.user_id != snapshot.user_id
+                        or operation.header.source_envelope_sha256 != source_sha256
+                        or (expected_header is not None and operation.header != expected_header)):
+                    raise OriginalIdentityConflict('committed original UUID/version/source bytes differ')
+                return {'status': 'withdrawn_profile' if row['disposition'] == 'withdrawn_profile' else
+                    'rejected_capacity' if row['disposition'] == 'rejected' else 'applied',
+                    'operation_head': head, 'operation': operation, 'row': row}
+            if version < operation_version:
+                raise reducer.OperationGap('requested original operation is not applied')
+            head, expected, version = row['previous_head'], row['previous_state_sha256'], version - 1
+        raise HistoryBudget('bounded original-operation proof exhausted')
 
     def apply(self,header,kind,source_envelope,resolve,legacy_prepare,assert_lock):
         # Pin the derived input once. A stale CAS retry never fetches today's
@@ -275,11 +375,7 @@ class Coordinator:
         return 'committed_rejection' if committed == prepared else 'prepared_not_committed'
 
     def checkpoint(self,user_id):
-        snapshot=self.users.read(_uuid(user_id))
-        self._validate_snapshot(snapshot)
-        return self.journal.put('checkpoint',{'user_id':user_id,'head':snapshot.head,
-            'state_sha256':reducer.state_sha256(snapshot.state),'state':_pack(snapshot.state),
-            'complete_base64':base64.b64encode(snapshot.complete).decode(),'policy_sha256':self.policy.sha256})
+        return self._checkpoint_snapshot(self.users.read(_uuid(user_id)))
     def rebuild(self,checkpoint,expected_head,*,expected_user_id):
         seed=self.journal.get(checkpoint,'checkpoint')
         if seed['user_id']!=_uuid(expected_user_id) or seed['policy_sha256']!=self.policy.sha256: raise JournalConflict('checkpoint owner/policy differs')
@@ -306,7 +402,10 @@ class Coordinator:
             body=self.journal.get(row['complete_sha256'],'complete'); complete=_canonical(body)
             if body['user_id']!=expected_user_id or _unpack(body['state'])!=state: raise JournalConflict('complete state differs')
             _json(complete,self.journal.limits.combined_user_bytes)
-        reducer.recommendation_view(state,self.policy,session_id=None,epoch=None,as_of_ms=state.effective_ms)
+        if isinstance(state, reducer.BootstrapState):
+            reducer.check_bootstrap(state, self.policy)
+        else:
+            reducer.recommendation_view(state,self.policy,session_id=None,epoch=None,as_of_ms=state.effective_ms)
         return Snapshot(expected_user_id,state,expected_head,complete)
 
 
@@ -350,13 +449,15 @@ class QdrantAtomicUsers:
     Existing points require an explicitly installed migration checkpoint.
     """
     FIELDS=('profile_version','job_id','last_feedback_version','last_feedback_event_id','feedback_state_revision',
-            'model_operation_version','model_journal_head','model_state_sha256','model_policy_sha256')
-    INTERNAL={'model_complete_base64','model_operation_version','model_journal_head','model_state_sha256','model_policy_sha256'}
-    def __init__(self,client,models,snapshot_filter,*,collection,combined_user_bytes,policy,journal=None):
+            'model_operation_version','model_journal_head','model_state_sha256','model_policy_sha256','model_basis_status')
+    INTERNAL={'model_complete_base64','model_operation_version','model_journal_head','model_state_sha256','model_policy_sha256','model_basis_status'}
+    def __init__(self,client,models,snapshot_filter,*,collection,combined_user_bytes,policy,journal=None,ensure_initialized=None,refuse_missing=None):
         if not collection or not 0<combined_user_bytes<=1024*1024: raise JournalError('explicit user collection/budget required')
         self.client,self.models,self.snapshot_filter=client,models,snapshot_filter
         self.collection,self.limit,self.policy=collection,combined_user_bytes,policy
         self.journal = journal
+        self.ensure_initialized = ensure_initialized
+        self.refuse_missing = refuse_missing
     def _point(self,snapshot):
         body=_json(snapshot.complete,self.limit)
         if set(body)!={'schema_version','user_id','state','legacy'} or body['schema_version']!=1 or body['user_id']!=snapshot.user_id:
@@ -367,26 +468,45 @@ class QdrantAtomicUsers:
             raise JournalError('legacy complete vector/payload required')
         if self.INTERNAL.intersection(legacy['payload']): raise JournalConflict('legacy callback overwrote journal fields')
         if (legacy['payload'].get('user_id') != snapshot.user_id
-                or legacy['payload'].get('profile_version') != snapshot.state.baseline.content_version
                 or legacy['payload'].get('last_feedback_version') != snapshot.state.feedback_version):
-            raise JournalConflict('compatibility owner/profile/feedback identity differs from model state')
-        vector=legacy['vector']
-        if type(vector) is not list or len(vector)!=384 or any(type(x) not in (int,float) for x in vector): raise JournalError('legacy vector dimension/type')
-        import math
-        if any(not math.isfinite(x) for x in vector) or not math.isclose(math.sqrt(sum(x*x for x in vector)),1.,abs_tol=1e-5):
-            raise JournalError('legacy vector finite/unit validation')
+            raise JournalConflict('compatibility owner/feedback identity differs from model state')
+        vector = legacy['vector']
+        if isinstance(snapshot.state, reducer.BootstrapState):
+            reducer.check_bootstrap(snapshot.state, self.policy)
+            if vector != {} or set(legacy['payload']) != {'user_id', 'last_feedback_version', 'feedback_state_revision'}:
+                raise JournalConflict('uninitialized prefix contains an invented basis/profile')
+        else:
+            if legacy['payload'].get('profile_version') != snapshot.state.baseline.content_version:
+                raise JournalConflict('compatibility profile version differs')
+            if type(vector) is not list or len(vector)!=384 or any(type(x) not in (int,float) for x in vector):
+                raise JournalError('legacy vector dimension/type')
+            import math
+            if any(not math.isfinite(x) for x in vector) or not math.isclose(math.sqrt(sum(x*x for x in vector)),1.,abs_tol=1e-5):
+                raise JournalError('legacy vector finite/unit validation')
         payload=dict(legacy['payload'])
         payload.update(model_complete_base64=base64.b64encode(snapshot.complete).decode(),
             model_operation_version=snapshot.state.operation_version,model_journal_head=snapshot.head,
-            model_state_sha256=reducer.state_sha256(snapshot.state),model_policy_sha256=self.policy.sha256)
+            model_state_sha256=reducer.state_sha256(snapshot.state),model_policy_sha256=self.policy.sha256,
+            model_basis_status='awaiting_profile' if isinstance(snapshot.state,reducer.BootstrapState) else 'ready')
         # Count the ACTUAL persisted payload, including compatibility duplication
         # and base64 expansion, against the one shared user-state budget.
         if len(_canonical({'vector':vector,'payload':payload}))>self.limit: raise reducer.StateOverflow('combined persisted user point exceeds byte budget')
         return vector,payload
-    def read(self,user_id):
-        rows=self.client.retrieve(collection_name=self.collection,ids=[_uuid(user_id)],with_payload=True,with_vectors=True)
-        if len(rows)!=1: raise JournalMissing('canonical checkpointed user missing')
-        return self.decode_point(rows[0],user_id)
+    def read_optional(self, user_id):
+        rows = self.client.retrieve(collection_name=self.collection, ids=[_uuid(user_id)], with_payload=True, with_vectors=True)
+        if not rows:
+            if self.refuse_missing is not None:
+                self.refuse_missing(user_id)
+            return None
+        if len(rows) != 1:
+            raise JournalConflict('ambiguous canonical user point')
+        return self.decode_point(rows[0], user_id)
+
+    def read(self, user_id):
+        snapshot = self.read_optional(user_id)
+        if snapshot is None:
+            raise JournalMissing('canonical checkpointed user missing')
+        return snapshot
     def decode_point(self,point,user_id):
         """Validate a supplied owned point; never query another user revision."""
         if str(point.id)!=_uuid(user_id): raise JournalConflict('canonical snapshot owner differs')
@@ -397,13 +517,22 @@ class QdrantAtomicUsers:
         snapshot=Snapshot(user_id,state,payload.get('model_journal_head'),complete)
         vector,expected=self._point(snapshot)
         if payload!=expected: raise JournalConflict('stored complete state/payload mismatch')
-        actual=point.vector
-        import math
-        if type(actual) is not list or len(actual)!=384 or any(not math.isfinite(x) or not math.isclose(x,y,abs_tol=1e-6,rel_tol=1e-6) for x,y in zip(actual,vector)):
-            raise JournalConflict('stored compatibility vector mismatch')
-        reducer.recommendation_view(state,self.policy,session_id=None,epoch=None,as_of_ms=state.effective_ms)
+        actual = point.vector
+        if isinstance(state, reducer.BootstrapState):
+            if actual != {}:
+                raise JournalConflict('withdrawn-only prefix contains a real vector')
+            reducer.check_bootstrap(state, self.policy)
+        else:
+            import math
+            if type(actual) is not list or len(actual)!=384 or any(not math.isfinite(x) or not math.isclose(x,y,abs_tol=1e-6,rel_tol=1e-6) for x,y in zip(actual,vector)):
+                raise JournalConflict('stored compatibility vector mismatch')
+            reducer.recommendation_view(state,self.policy,session_id=None,epoch=None,as_of_ms=state.effective_ms)
         if self.journal is not None:
             validate_committed_head(snapshot, self.journal)
+        if not isinstance(state, reducer.BootstrapState) and self.ensure_initialized is not None:
+            # Negative guard must become durable before a basis is observable
+            # as ready, not only before the first worker ACK.
+            self.ensure_initialized(user_id)
         return snapshot
     def insert_once(self, desired):
         if desired.state.operation_version != 1 or desired.state.feedback_version != 0:

@@ -5,17 +5,18 @@ from copy import deepcopy
 from types import SimpleNamespace
 
 from feedback import long_session as model
-from feedback.model_journal import Coordinator, JournalConflict, _canonical, _json
-from feedback.model_wire import decimal
+from feedback.model_journal import Coordinator, JournalConflict, OriginalIdentityConflict, _canonical, _json
+from feedback.model_wire import decimal, WireWithdrawal
 from feedback.v2 import FeedbackStateError, MissingVectorError
 from scripts.user_onboarding import _has_feedback_state, _is_feedback_payload_key
 from config import REPOSITORY_EMBEDDING_MODEL, EMBEDDING_MODEL_REVISION
 
 
 class ModelProcessor:
-    def __init__(self, journal, users, policy, legacy_applier, profile_encoder, *, dead_letter_prepare):
+    def __init__(self, journal, users, policy, legacy_applier, profile_encoder, *, dead_letter_prepare, withdrawal_lookup=None):
         self.journal, self.users, self.policy = journal, users, policy
         self.legacy, self.profile_encoder = legacy_applier, profile_encoder
+        self.withdrawal_lookup = withdrawal_lookup or (lambda user, version: None)
         self.coordinator = Coordinator(journal, users, policy, reject_capacity=True,
                                        legacy_reject=self._legacy_reject, dead_letter_prepare=dead_letter_prepare)
 
@@ -25,7 +26,7 @@ class ModelProcessor:
             vector = self.profile_encoder(payload['original_profile_context'])
             pinned = model.PinnedVector.pin('profile', h.user_id, decimal(payload['profile_version'], 1), 0,
                                             self.policy.baseline_recipe, self.policy.embedding, list(vector))
-            return model.Profile(h, pinned, payload['initial'])
+            return model.Profile(h, pinned, payload['allow_genesis'])
         if wire.kind == 'begin':
             return model.Begin(h, payload['session_id'], decimal(payload['epoch_started_ms']), payload['witness_sha256'])
         if wire.kind == 'reset':
@@ -113,14 +114,66 @@ class ModelProcessor:
                            last_feedback_status='rejected')
         return _canonical(legacy)
 
+    def _matching_withdrawal(self, wire):
+        withdrawn = self.withdrawal_lookup(wire.header.user_id, wire.header.operation_version)
+        if withdrawn is not None and (withdrawn.header != wire.header
+                or withdrawn.profile_job_id != wire.payload['job_id']
+                or withdrawn.profile_version != decimal(wire.payload['profile_version'], 1)
+                or withdrawn.allow_genesis != wire.payload['allow_genesis']):
+            raise OriginalIdentityConflict('withdrawal attestation names a different original profile')
+        return withdrawn
+
+    def preflight_original(self, wire):
+        """Recognize a committed original without re-encoding private context."""
+        snapshot = self.users.read_optional(wire.header.user_id)
+        if snapshot is None or snapshot.state.operation_version < wire.header.operation_version:
+            return None
+        result = self.coordinator.original_status(snapshot, wire.header)
+        operation = result['operation']
+        response = {'operation_id': wire.header.operation_id,
+            'model_operation_version': str(wire.header.operation_version),
+            'source_envelope_sha256': wire.header.source_envelope_sha256, 'status': 'duplicate'}
+        if isinstance(operation, model.WithdrawnProfile):
+            if (operation.profile_job_id != wire.payload['job_id']
+                    or operation.profile_version != decimal(wire.payload['profile_version'], 1)
+                    or operation.allow_genesis != wire.payload['allow_genesis']):
+                raise OriginalIdentityConflict('late original profile differs from committed withdrawal')
+            response.update(status='withdrawal_accepted', withdrawal_sha256=operation.withdrawal_sha256)
+        elif not isinstance(operation, model.Profile):
+            raise OriginalIdentityConflict('original profile identity belongs to another operation kind')
+        return response
+
     def __call__(self, wire, assert_lock):
         if wire.policy_sha256 != self.policy.sha256:
             raise JournalConflict('processor policy differs')
+        if isinstance(wire, WireWithdrawal):
+            return self.coordinator.apply_withdrawal(wire, assert_lock)
         raw = wire.original_json.encode('utf-8')
         resolve = lambda: self._resolve(wire)
-        if wire.kind == 'profile' and wire.payload['initial']:
-            operation, _ = self.journal.pin_input(wire.header, wire.kind, self.policy, raw, resolve)
-            return self.coordinator.initialize(wire.header, raw, lambda: operation,
-                                                _canonical(self._profile_legacy(wire, operation)), assert_lock)
+        snapshot = self.users.read_optional(wire.header.user_id)
+        if wire.kind == 'profile':
+            proven = self.preflight_original(wire)
+            if proven is not None:
+                return 'withdrawn_duplicate' if proven['status'] == 'withdrawal_accepted' else 'duplicate'
+            withdrawn = self._matching_withdrawal(wire)
+            if withdrawn is not None:
+                return self.coordinator.apply_withdrawal(withdrawn, assert_lock)
+            def profile_lock():
+                assert_lock()
+                if self._matching_withdrawal(wire) is not None:
+                    raise JournalConflict('profile withdrawal is pending; retry its terminal disposition')
+            if snapshot is None or isinstance(snapshot.state, model.BootstrapState):
+                if not wire.payload['allow_genesis']:
+                    raise model.OperationGap('real profile basis is not applied')
+                previous = 0 if snapshot is None else snapshot.state.operation_version
+                if wire.header.previous_operation_version != previous:
+                    raise model.OperationGap('profile genesis predecessor is pending')
+                operation, _ = self.journal.pin_input(wire.header, wire.kind, self.policy, raw, resolve)
+                return self.coordinator.initialize(wire.header, raw, lambda: operation,
+                    _canonical(self._profile_legacy(wire, operation)), profile_lock)
+            return self.coordinator.apply(wire.header, wire.kind, raw, resolve,
+                lambda complete, operation: self._legacy_prepare(wire, complete, operation), profile_lock)
+        if snapshot is None or isinstance(snapshot.state, model.BootstrapState):
+            raise model.OperationGap('real profile basis must precede model feedback and controls')
         return self.coordinator.apply(wire.header, wire.kind, raw, resolve,
-                                       lambda complete, operation: self._legacy_prepare(wire, complete, operation), assert_lock)
+            lambda complete, operation: self._legacy_prepare(wire, complete, operation), assert_lock)

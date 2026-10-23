@@ -249,6 +249,19 @@ class State:
 
 
 @dataclass(frozen=True)
+class BootstrapState:
+    """Proven withdrawn-only prefix. It contains no invented user vector."""
+    version: str
+    user_id: str
+    policy_sha256: str
+    operation_version: int
+    feedback_version: int
+    effective_ms: int
+    last_operation_id: str | None
+    last_operation_sha256: str | None
+
+
+@dataclass(frozen=True)
 class Header:
     operation_id: str
     user_id: str
@@ -295,7 +308,18 @@ class Feedback:
 class Profile:
     header: Header
     baseline: PinnedVector
-    initial: bool = False
+    allow_genesis: bool = False
+
+
+@dataclass(frozen=True)
+class WithdrawnProfile:
+    header: Header
+    profile_job_id: str
+    profile_version: int
+    allow_genesis: bool
+    revoked_at_ms: int
+    revocation_witness_sha256: str
+    withdrawal_sha256: str
 
 
 @dataclass(frozen=True)
@@ -323,7 +347,7 @@ class End:
     epoch_started_ms: int
 
 
-Operation = Feedback | Profile | Begin | Reset | End
+Operation = Feedback | Profile | Begin | Reset | End | WithdrawnProfile
 _ACTIONS = MappingProxyType({'like':('reaction',1),'dislike':('reaction',-1),'save':('save',1),
             'readme_open':('readme_open',1),'github_open':('github_open',1),'share':('share',1),'dwell':('dwell',1)})
 _INVERSE = MappingProxyType({'unlike':('reaction','like'),'undislike':('reaction','dislike'),'unsave':('save','save')})
@@ -420,6 +444,60 @@ def _check_state(state,policy):
     return state
 
 
+def check_bootstrap(state, policy):
+    if type(state) is not BootstrapState or state.version != VERSION or state.policy_sha256 != policy.sha256:
+        raise CompatibilityError('invalid uninitialized policy prefix')
+    _uuid(state.user_id); _integer(state.operation_version); _integer(state.effective_ms)
+    if state.feedback_version != 0 or type(state.feedback_version) is not int:
+        raise ModelError('uninitialized prefix cannot contain applied feedback')
+    if state.operation_version:
+        _uuid(state.last_operation_id); _hex(state.last_operation_sha256)
+    elif state.last_operation_id is not None or state.last_operation_sha256 is not None:
+        raise ModelError('uninitialized seed has a false operation witness')
+    return state
+
+
+def bootstrap_state(user_id, policy, *, accepted_ms):
+    return check_bootstrap(BootstrapState(VERSION, _uuid(user_id), policy.sha256, 0, 0,
+        _integer(accepted_ms), None, None), policy)
+
+
+def _check_withdrawal(operation):
+    _uuid(operation.profile_job_id); _integer(operation.profile_version, 1)
+    _integer(operation.revoked_at_ms); _hex(operation.revocation_witness_sha256); _hex(operation.withdrawal_sha256)
+    if type(operation.allow_genesis) is not bool:
+        raise ModelError('explicit genesis authority required')
+
+
+def _reduce_bootstrap(state, operation, policy):
+    check_bootstrap(state, policy)
+    header = operation.header
+    if header.user_id != state.user_id:
+        raise CompatibilityError('uninitialized operation owner differs')
+    fingerprint = operation_sha256(operation)
+    if header.operation_version == state.operation_version:
+        if header.operation_id == state.last_operation_id and fingerprint == state.last_operation_sha256:
+            return state
+        raise OperationConflict('uninitialized operation identity differs')
+    if header.operation_version < state.operation_version:
+        raise JournalProofRequired('older withdrawn-prefix duplicate needs committed proof')
+    if header.previous_operation_version != state.operation_version:
+        raise OperationGap('uninitialized predecessor is pending')
+    now = max(state.effective_ms, header.accepted_ms)
+    if isinstance(operation, WithdrawnProfile):
+        _check_withdrawal(operation)
+        if not operation.allow_genesis:
+            raise CompatibilityError('an activated or legacy user cannot enter bootstrap')
+        return replace(state, operation_version=header.operation_version,
+            effective_ms=max(now, operation.revoked_at_ms), last_operation_id=header.operation_id,
+            last_operation_sha256=fingerprint)
+    if isinstance(operation, Profile) and operation.allow_genesis:
+        _check_vector(operation.baseline, policy, 'profile', state.user_id)
+        return _check_state(State(VERSION, state.user_id, policy.sha256, operation.baseline, (), (),
+            header.operation_version, 0, now, header.operation_id, fingerprint), policy)
+    raise OperationGap('a genuine profile basis must precede feedback and session controls')
+
+
 def initial_state(user_id,baseline,policy,*,accepted_ms):
     state=State(VERSION,_uuid(user_id),policy.sha256,baseline,(),(),0,0,_integer(accepted_ms),None,None)
     return _check_state(state,policy)
@@ -468,8 +546,10 @@ def _session_update(session,feedback,now,policy):
 
 
 def reduce_operation(state:State,operation:Operation,policy:Policy):
+    if isinstance(state, BootstrapState):
+        return _reduce_bootstrap(state, operation, policy)
     _check_state(state,policy)
-    if not isinstance(operation,(Feedback,Profile,Begin,Reset,End)): raise ModelError('unknown typed operation')
+    if not isinstance(operation,(Feedback,Profile,Begin,Reset,End,WithdrawnProfile)): raise ModelError('unknown typed operation')
     header=operation.header
     if not isinstance(header,Header) or header.user_id != state.user_id: raise CompatibilityError('operation owner mismatch')
     fingerprint=operation_sha256(operation)
@@ -527,12 +607,15 @@ def reduce_operation(state:State,operation:Operation,policy:Policy):
         feedback_version=operation.feedback_version
     elif isinstance(operation,Profile):
         _check_vector(operation.baseline,policy,'profile',state.user_id)
-        if type(operation.initial) is not bool:raise ModelError('explicit profile initialization required')
-        if operation.initial:
-            if state.operation_version != 0 or state.feedback_version != 0 or operation.baseline != baseline:
+        if type(operation.allow_genesis) is not bool:raise ModelError('explicit profile initialization authority required')
+        if state.operation_version == 0:
+            if not operation.allow_genesis or state.feedback_version != 0 or operation.baseline != baseline:
                 raise OperationConflict('initial profile requires exact empty genesis basis')
         elif operation.baseline.content_version<=baseline.content_version:raise OperationConflict('profile revision did not advance')
         baseline=operation.baseline
+    elif isinstance(operation,WithdrawnProfile):
+        _check_withdrawal(operation)
+        now = max(now, operation.revoked_at_ms)
     elif isinstance(operation,Begin):
         _uuid(operation.session_id);_integer(operation.epoch_started_ms);_hex(operation.source_witness_sha256)
         if operation.session_id in sessions:raise EpochConflict('Begin requires a fresh authenticated session')
@@ -599,6 +682,8 @@ class View:
 
 
 def recommendation_view(state,policy,*,session_id,epoch,as_of_ms):
+    if isinstance(state, BootstrapState):
+        raise CompatibilityError('withdrawn-only prefix has no real profile basis')
     _check_state(state,policy);_integer(as_of_ms)
     if as_of_ms<state.effective_ms:raise ModelError('generation clock precedes applied effective clock')
     baseline=_normalize(state.baseline.vector,state.baseline.vector,policy.normalization_epsilon)

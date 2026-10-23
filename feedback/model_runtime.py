@@ -75,7 +75,7 @@ class BudgetedRecords:
 class ModelRuntime:
     def __init__(self, config, *, redis=None, qdrant=None, encoder=None, settings=None):
         exact_keys(config, ('schema_version', 'policy', 'stream', 'journal', 'journal_collection',
-                            'max_journal_records', 'max_journal_bytes'))
+                            'max_journal_records', 'max_journal_bytes', 'initialization_scope', 'max_initialization_guard_users'))
         if type(config['schema_version']) is not int or config['schema_version'] != 1:
             raise ValueError('unsupported model-lane configuration')
         policy_data = dict(config['policy'])
@@ -102,18 +102,21 @@ class ModelRuntime:
         self.redis = redis if redis is not None else _redis_client(self.settings)
         self.qdrant = qdrant if qdrant is not None else QdrantClient(url=self.settings.qdrant_url,
             api_key=self.settings.qdrant_api_key, timeout=self.settings.qdrant_timeout_seconds)
-        self.stream = OperationStream(self.redis, stream_limits, {self.policy.sha256})
+        self.stream = OperationStream(self.redis, stream_limits, {self.policy.sha256},
+            initialization_scope=config['initialization_scope'], max_guard_users=config['max_initialization_guard_users'])
         records = QdrantRecords(self.qdrant, models, collection=config['journal_collection'], record_bytes=limits.record_bytes)
         self.journal = Journal(BudgetedRecords(records, self.redis, key=self.stream.limits.namespace + ':journal-budget',
             max_records=config['max_journal_records'], max_bytes=config['max_journal_bytes']), limits)
         self.users = QdrantAtomicUsers(self.qdrant, models, payload_snapshot_filter, collection=self.settings.user_collection,
-                                       combined_user_bytes=limits.combined_user_bytes, policy=self.policy, journal=self.journal)
+                                       combined_user_bytes=limits.combined_user_bytes, policy=self.policy, journal=self.journal,
+            ensure_initialized=self.stream.ensure_initialized, refuse_missing=self.stream.refuse_missing_initialized)
         self.legacy = OrderedFeedbackApplier(qdrant=self.qdrant, settings=self.settings)
         if encoder is None:
             from embedding.runtime import user_onboarding_pipeline
             encoder = lambda profile: user_onboarding_pipeline().generate_interest_vector(profile)
         self.processor = ModelProcessor(self.journal, self.users, self.policy, self.legacy, encoder,
-                                         dead_letter_prepare=self.stream.prepare_dead_letter)
+                                         dead_letter_prepare=self.stream.prepare_dead_letter, withdrawal_lookup=self.stream.lookup_withdrawal)
+        self.stream.profile_preflight = self.processor.preflight_original
 
     def consumer(self):
         from feedback.user_lock import user_vector_lock

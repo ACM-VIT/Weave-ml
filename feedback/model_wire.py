@@ -120,17 +120,15 @@ def parse_operation(text, *, maximum_bytes, allowed_policies):
         raise WireError("invalid operation order or identity") from exc
     payload, kind, feedback = envelope['operation'], envelope['kind'], None
     if kind == 'profile':
-        exact_keys(payload, ('job_id', 'profile_version', 'initial', 'original_profile_context'))
+        exact_keys(payload, ('job_id', 'profile_version', 'allow_genesis', 'original_profile_context'))
         canonical_uuid(payload['job_id']); decimal(payload['profile_version'], 1)
-        if type(payload['initial']) is not bool or type(payload['original_profile_context']) is not dict:
+        if type(payload['allow_genesis']) is not bool or type(payload['original_profile_context']) is not dict:
             raise WireError('explicit profile initialization and context required')
         from api.contracts import OnboardingProfile
         try:
             OnboardingProfile.model_validate(payload['original_profile_context'])
         except ValueError as exc:
             raise WireError('invalid bounded original profile context') from exc
-        if payload['initial'] and header.operation_version != 1:
-            raise WireError('initial profile must be the first common operation')
     elif kind == 'feedback':
         exact_keys(payload, ('original_feedback_json',), ('canonical_attribution',))
         feedback = strict_json(payload['original_feedback_json'], maximum_bytes=maximum_bytes)
@@ -186,3 +184,40 @@ def parse_operation(text, *, maximum_bytes, allowed_policies):
     else:
         raise WireError('unsupported model operation kind')
     return WireOperation(header, kind, envelope['policy_sha256'], text, payload, feedback)
+
+
+@dataclass(frozen=True)
+class WireWithdrawal:
+    header: Header
+    policy_sha256: str
+    profile_job_id: str
+    profile_version: int
+    allow_genesis: bool
+    revoked_at_ms: int
+    revocation_witness_sha256: str
+    withdrawal_sha256: str
+    original_json: str
+
+
+def parse_withdrawal(text, *, maximum_bytes, allowed_policies):
+    """Authenticated backend attestation; never contains revoked context."""
+    value = strict_json(text, maximum_bytes=maximum_bytes)
+    exact_keys(value, ('schema_version', 'operation_id', 'user_id', 'model_operation_version',
+        'previous_model_operation_version', 'accepted_at_ms', 'policy_version', 'policy_sha256',
+        'source_envelope_sha256', 'profile_job_id', 'profile_version', 'allow_genesis',
+        'revoked_at_ms', 'revocation_witness_sha256', 'reason'))
+    if type(value['schema_version']) is not int or value['schema_version'] != 1 or canonical_json(value) != text:
+        raise WireError('unsupported or noncanonical withdrawal attestation')
+    if value['policy_version'] != VERSION or digest(value['policy_sha256']) not in allowed_policies:
+        raise WireError('withdrawal policy is not registered')
+    if value['reason'] != 'github_consent_revoked' or type(value['allow_genesis']) is not bool:
+        raise WireError('explicit profile-consent revocation required')
+    try:
+        header = Header(canonical_uuid(value['operation_id']), canonical_uuid(value['user_id']),
+            decimal(value['model_operation_version'], 1), decimal(value['previous_model_operation_version']),
+            decimal(value['accepted_at_ms']), digest(value['source_envelope_sha256']))
+    except ModelError as exc:
+        raise WireError('invalid original operation identity') from exc
+    return WireWithdrawal(header, value['policy_sha256'], canonical_uuid(value['profile_job_id']),
+        decimal(value['profile_version'], 1), value['allow_genesis'], decimal(value['revoked_at_ms']),
+        digest(value['revocation_witness_sha256']), hashlib.sha256(text.encode('utf-8')).hexdigest(), text)

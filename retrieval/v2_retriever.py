@@ -116,6 +116,7 @@ _USER_RETRIEVAL_PAYLOAD_FIELDS = [
     "embedding_dim",
     "embedding_model",
     "embedding_model_revision",
+    "model_policy_sha256",
 ]
 
 _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS = [
@@ -741,6 +742,8 @@ class QdrantV2Retriever:
         if not point:
             return None, {}
         payload = dict(point.payload or {})
+        if payload.get("model_policy_sha256") is not None:
+            raise RetrievalDependencyError("negotiated user state requires an applied session model context")
         try:
             vector = validate_embedding_vector(
                 self._vector(point.vector, TARGET_VECTOR_NAME),

@@ -89,7 +89,7 @@ def derive_snapshots(experiment):
         if h.accepted_ms > as_of_ms:
             raise ValueError('history operation is later than frozen as-of')
         if wire.kind == 'profile':
-            if owner in states or not payload['initial'] or decimal(payload['profile_version'], 1) != profiles[owner].payload['profile_version']:
+            if owner in states or not payload['allow_genesis'] or decimal(payload['profile_version'], 1) != profiles[owner].payload['profile_version']:
                 raise ValueError('each profile requires exactly one explicit frozen genesis')
             if any(profiles[owner].payload.get(key) != value for key, value in payload['original_profile_context'].items()):
                 raise ValueError('original profile context differs from frozen encoded baseline')

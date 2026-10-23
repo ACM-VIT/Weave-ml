@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import PlainTextResponse, Response
 from api.contracts import (
     ModelOperationBatch, ModelOperationResponse, ModelAuthorityRequest, ModelAuthorityResponse,
+    ProfileWithdrawalBatch, ProfileWithdrawalResponse, ModelOperationStatusRequest, ModelOperationStatusResponse,
     RecommendationResponse, RecommendationWireResponse, FeedbackResponse, RepositoryIndexResponse,
     RepositoryRefreshResponse, OnboardingResponse,
     FeedbackBatch,
@@ -1637,7 +1638,7 @@ async def repository_search(request: RepositorySearchRequest, http_request: Requ
         ) from exc
 
 
-@router.post("/model-operations", response_model=ModelOperationResponse, dependencies=[Depends(require_internal_secret)])
+@router.post("/model-operations", response_model=ModelOperationResponse, response_model_exclude_unset=True, dependencies=[Depends(require_internal_secret)])
 async def submit_model_operations(request: ModelOperationBatch):
     from feedback.model_runtime import model_runtime, ModelLaneUnavailable
     from feedback.model_stream import OperationBytesConflict, OperationCapacity
@@ -1686,4 +1687,63 @@ async def read_model_authority(request: ModelAuthorityRequest):
         return await run_service_job("feedback", read)
     except Exception:
         raise HTTPException(status_code=503, detail="Required applied model/profile/session state unavailable; retry.",
+                            headers={"Retry-After": "2"}) from None
+
+
+@router.post("/model-operation-withdrawals", response_model=ProfileWithdrawalResponse, dependencies=[Depends(require_internal_secret)])
+async def submit_profile_withdrawals(request: ProfileWithdrawalBatch):
+    from feedback.model_runtime import model_runtime
+    from feedback.model_stream import OperationBytesConflict
+    from feedback.model_wire import WireError, parse_withdrawal
+    try:
+        runtime = model_runtime()
+        for item in request.withdrawals:
+            parse_withdrawal(item.withdrawal_json, maximum_bytes=runtime.stream.limits.input_bytes,
+                             allowed_policies=runtime.stream.policies)
+        def enqueue():
+            return {"schema_version": 1, "withdrawals": [runtime.stream.admit_withdrawal(item.withdrawal_json)
+                    for item in request.withdrawals]}
+        return await run_service_job("feedback", enqueue)
+    except WireError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except OperationBytesConflict:
+        raise HTTPException(status_code=409, detail="Withdrawal or original operation identity conflict.") from None
+    except Exception:
+        raise HTTPException(status_code=503, detail="Withdrawal acceptance unavailable; retry exact attestation bytes.",
+                            headers={"Retry-After": "2"}) from None
+
+
+@router.post("/model-operation-status", response_model=ModelOperationStatusResponse, response_model_exclude_unset=True,
+             dependencies=[Depends(require_internal_secret)])
+async def read_model_operation_status(request: ModelOperationStatusRequest):
+    from feedback.model_runtime import model_runtime
+    from feedback.model_journal import OriginalIdentityConflict
+    from feedback.long_session import BootstrapState, WithdrawnProfile
+    try:
+        runtime = model_runtime()
+        def read():
+            snapshot = runtime.users.read_optional(str(request.user_id))
+            result = {"schema_version": 1, "user_id": str(request.user_id), "operation_id": str(request.operation_id),
+                "model_operation_version": request.model_operation_version,
+                "source_envelope_sha256": request.source_envelope_sha256, "status": "pending", "basis_status": "missing"}
+            if snapshot is None:
+                return result
+            result.update(basis_status="awaiting_profile" if isinstance(snapshot.state, BootstrapState) else "ready",
+                applied_operation_version=str(snapshot.state.operation_version),
+                applied_feedback_version=str(snapshot.state.feedback_version), current_head=snapshot.head)
+            if not isinstance(snapshot.state, BootstrapState):
+                result['applied_profile_version'] = str(snapshot.state.baseline.content_version)
+            if snapshot.state.operation_version < int(request.model_operation_version):
+                return result
+            proof = runtime.processor.coordinator.status_for_identity(snapshot, operation_id=str(request.operation_id),
+                operation_version=int(request.model_operation_version), source_sha256=request.source_envelope_sha256)
+            result.update(status=proof['status'], operation_head=proof['operation_head'])
+            if isinstance(proof['operation'], WithdrawnProfile):
+                result['withdrawal_sha256'] = proof['operation'].withdrawal_sha256
+            return result
+        return await run_service_job("feedback", read)
+    except OriginalIdentityConflict:
+        raise HTTPException(status_code=409, detail="Original operation status identity conflict.") from None
+    except Exception:
+        raise HTTPException(status_code=503, detail="Required committed operation proof unavailable; retry.",
                             headers={"Retry-After": "2"}) from None

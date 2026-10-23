@@ -3,8 +3,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import uuid
+import re
 
-from feedback.model_wire import parse_operation
+from feedback.model_wire import parse_operation, parse_withdrawal
 
 
 class OperationCapacity(RuntimeError):
@@ -21,15 +22,47 @@ _ADMIT = """
 local old = redis.call('hget', KEYS[2], ARGV[1])
 local old_id = redis.call('hget', KEYS[2], ARGV[2])
 if old or old_id then
-  if old == ARGV[3] and old_id == ARGV[4] then return 0 end
-  return -1
+  if old ~= ARGV[3] or old_id ~= ARGV[4] then return -1 end
+  if redis.call('hget', KEYS[3], ARGV[1]) then return 2 end
+  return 0
 end
+local extra = 2
+local newguard = redis.call('hexists', KEYS[4], ARGV[8]) == 0
+if newguard and redis.call('hlen', KEYS[4]) >= tonumber(ARGV[9]) then return -2 end
 if redis.call('xlen', KEYS[1]) >= tonumber(ARGV[6]) or
-   redis.call('hlen', KEYS[2]) + 2 > tonumber(ARGV[7]) then return -2 end
+   redis.call('hlen', KEYS[2]) + extra > tonumber(ARGV[7]) then return -2 end
 redis.call('xadd', KEYS[1], '*', 'operation_json', ARGV[5])
 redis.call('hset', KEYS[2], ARGV[1], ARGV[3], ARGV[2], ARGV[4])
+redis.call('hsetnx', KEYS[4], ARGV[8], 'pending')
 return 1
 """
+_WITHDRAW = """
+local old = redis.call('hget', KEYS[2], ARGV[1])
+local old_id = redis.call('hget', KEYS[2], ARGV[2])
+if (old and old ~= ARGV[3]) or (old_id and old_id ~= ARGV[4]) then return -1 end
+local withdrawn = redis.call('hget', KEYS[3], ARGV[1])
+if withdrawn then return withdrawn == ARGV[5] and 0 or -1 end
+local extra = old and 0 or 2
+if redis.call('hexists', KEYS[4], ARGV[8]) == 0 and
+   redis.call('hlen', KEYS[4]) >= tonumber(ARGV[9]) then return -2 end
+if redis.call('xlen', KEYS[1]) >= tonumber(ARGV[6]) or
+   redis.call('hlen', KEYS[2]) + extra > tonumber(ARGV[7]) or
+   redis.call('hlen', KEYS[3]) >= tonumber(ARGV[7]) then return -2 end
+redis.call('xadd', KEYS[1], '*', 'withdrawal_json', ARGV[5])
+redis.call('hset', KEYS[2], ARGV[1], ARGV[3], ARGV[2], ARGV[4])
+redis.call('hsetnx', KEYS[4], ARGV[8], 'pending')
+redis.call('hset', KEYS[3], ARGV[1], ARGV[5])
+return 1
+"""
+_GUARD = """
+local old = redis.call('hget', KEYS[1], ARGV[1])
+if old == 'initialized' then return 0 end
+if old and old ~= 'pending' then return -1 end
+if not old and redis.call('hlen', KEYS[1]) >= tonumber(ARGV[2]) then return -2 end
+redis.call('hset', KEYS[1], ARGV[1], 'initialized')
+return 1
+"""
+
 _ACK = """
 redis.call('xack', KEYS[1], ARGV[1], ARGV[2])
 redis.call('xdel', KEYS[1], ARGV[2])
@@ -67,26 +100,87 @@ class StreamLimits:
 
 
 class OperationStream:
-    def __init__(self, redis, limits, policies):
+    def __init__(self, redis, limits, policies, *, initialization_scope, max_guard_users):
+        if type(initialization_scope) is not str or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', initialization_scope):
+            raise ValueError('explicit stable logical deployment initialization scope required')
+        if type(max_guard_users) is not int or not 0 < max_guard_users <= 1000000:
+            raise ValueError('explicit initialization guard user capacity required')
         self.redis, self.limits, self.policies = redis, limits, policies
+        # This stable scope is independent of model policy, transport namespace
+        # and physical Qdrant endpoint. Changing it requires an audited boundary.
+        self.guard_key = 'ml:model:initialization-guard:v1:' + initialization_scope
+        self.max_guard_users = max_guard_users
         self.stream = limits.namespace + ':stream'
         self.identities = limits.namespace + ':identities'
         self.group = limits.namespace + ':workers'
+        self.withdrawals = limits.namespace + ':withdrawals'
+        self.profile_preflight = None
 
     def admit(self, original_json):
         operation = parse_operation(original_json, maximum_bytes=self.limits.input_bytes, allowed_policies=self.policies)
         h = operation.header
+        if operation.kind == 'profile' and self.profile_preflight is not None:
+            from feedback.model_journal import OriginalIdentityConflict
+            try:
+                proven = self.profile_preflight(operation)
+            except OriginalIdentityConflict as exc:
+                raise OperationBytesConflict('original profile identity conflict') from exc
+            if proven is not None:
+                return proven
         version_key = 'version:' + h.user_id + ':' + str(h.operation_version)
         id_key = 'id:' + h.operation_id
-        result = int(self.redis.eval(_ADMIT, 2, self.stream, self.identities, version_key, id_key,
+        result = int(self.redis.eval(_ADMIT, 4, self.stream, self.identities, self.withdrawals, self.guard_key, version_key, id_key,
                                      h.source_envelope_sha256, version_key + ':' + h.source_envelope_sha256,
-                                     original_json, self.limits.max_pending, self.limits.max_identities))
+                                     original_json, self.limits.max_pending, self.limits.max_identities, h.user_id, self.max_guard_users))
         if result == -1:
             raise OperationBytesConflict('operation identity was reused with different original bytes')
         if result == -2:
             raise OperationCapacity('operation stream or durable duplicate-proof capacity exhausted')
+        response = {'operation_id': h.operation_id, 'model_operation_version': str(h.operation_version),
+                'source_envelope_sha256': h.source_envelope_sha256,
+                'status': 'withdrawal_accepted' if result == 2 else 'accepted' if result else 'duplicate'}
+        if result == 2:
+            response['withdrawal_sha256'] = self.lookup_withdrawal(h.user_id, h.operation_version).withdrawal_sha256
+        return response
+
+    def lookup_withdrawal(self, user_id, version):
+        raw = self.redis.hget(self.withdrawals, 'version:' + user_id + ':' + str(version))
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8', errors='strict')
+        return parse_withdrawal(raw, maximum_bytes=self.limits.input_bytes, allowed_policies=self.policies)
+
+    def admit_withdrawal(self, original_json):
+        operation = parse_withdrawal(original_json, maximum_bytes=self.limits.input_bytes, allowed_policies=self.policies)
+        h = operation.header
+        version_key = 'version:' + h.user_id + ':' + str(h.operation_version)
+        result = int(self.redis.eval(_WITHDRAW, 4, self.stream, self.identities, self.withdrawals, self.guard_key,
+            version_key, 'id:' + h.operation_id, h.source_envelope_sha256, version_key + ':' + h.source_envelope_sha256,
+            original_json, self.limits.max_pending, self.limits.max_identities, h.user_id, self.max_guard_users))
+        if result == -1:
+            raise OperationBytesConflict('withdrawal or original operation identity differs')
+        if result == -2:
+            raise OperationCapacity('withdrawal stream or identity capacity exhausted')
         return {'operation_id': h.operation_id, 'model_operation_version': str(h.operation_version),
-                'source_envelope_sha256': h.source_envelope_sha256, 'status': 'accepted' if result else 'duplicate'}
+                'source_envelope_sha256': h.source_envelope_sha256, 'withdrawal_sha256': operation.withdrawal_sha256,
+                'status': 'accepted' if result else 'duplicate'}
+
+    def ensure_initialized(self, user_id):
+        result = int(self.redis.eval(_GUARD, 1, self.guard_key, user_id, self.max_guard_users))
+        if result == -2:
+            raise OperationCapacity('initialization guard capacity exhausted')
+        if result == -1:
+            raise OperationBytesConflict('initialization deny-bootstrap guard is corrupt')
+        if self.redis.hget(self.guard_key, user_id) not in {'initialized', b'initialized'}:
+            raise OperationCapacity('initialization guard was not durably readable')
+
+    def refuse_missing_initialized(self, user_id):
+        value = self.redis.hget(self.guard_key, user_id)
+        if value in {'initialized', b'initialized'}:
+            raise OperationBytesConflict('initialized user model is missing; explicit verified rebuild required')
+        if value not in {None, 'pending', b'pending'}:
+            raise OperationBytesConflict('initialization deny-bootstrap guard is corrupt')
 
     def prepare_dead_letter(self, header, input_sha, prepare_sha, code):
         from feedback.model_wire import canonical_json
@@ -140,11 +234,15 @@ class OperationConsumer:
         self.prefer_new = not self.prefer_new
         messages = first() or second()
         for message_id, fields in messages:
-            raw = fields.get('operation_json', fields.get(b'operation_json'))
+            normal = fields.get('operation_json', fields.get(b'operation_json'))
+            withdrawal = fields.get('withdrawal_json', fields.get(b'withdrawal_json'))
+            if (normal is None) == (withdrawal is None):
+                raise OperationBytesConflict('ambiguous operation stream message')
+            raw = normal if normal is not None else withdrawal
             if isinstance(raw, bytes):
                 raw = raw.decode('utf-8', errors='strict')
-            operation = parse_operation(raw, maximum_bytes=self.stream.limits.input_bytes,
-                                        allowed_policies=self.stream.policies)
+            parser = parse_operation if normal is not None else parse_withdrawal
+            operation = parser(raw, maximum_bytes=self.stream.limits.input_bytes, allowed_policies=self.stream.policies)
             with self.lock_factory(operation.header.user_id) as lock:
                 self.processor(operation, lock.assert_owned)
                 lock.assert_owned()

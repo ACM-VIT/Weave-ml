@@ -11,6 +11,8 @@ PRODUCT_OPERATIONS = {
     '/api/v2/search/repositories': 200,
     '/api/v2/model-operations': 200,
     '/api/v2/model-authority': 200,
+    '/api/v2/model-operation-withdrawals': 200,
+    '/api/v2/model-operation-status': 200,
 }
 
 

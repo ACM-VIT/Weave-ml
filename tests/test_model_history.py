@@ -23,7 +23,7 @@ def experiment():
                 model_operation_version=str(version),previous_model_operation_version=str(version-1),accepted_at_ms=str(origin+at),
                 policy_version=p.version,policy_sha256=p.sha256,kind=kind,operation=payload))
         context={key:profile['payload'][key] for key in ('skills','tech_stack','interests','topics')}
-        operations.append(operation('profile',1,dict(job_id=uid(12000+index),profile_version='1',initial=True,original_profile_context=context),1))
+        operations.append(operation('profile',1,dict(job_id=uid(12000+index),profile_version='1',allow_genesis=True,original_profile_context=context),1))
         operations.append(operation('begin',2,dict(session_id=session,epoch='1',epoch_started_ms=str(origin+2),witness_sha256='b'*64),2))
         for version,kind in [(3,'like'),(4,'like'),(5,'github_open'),(6,'save'),(7,'unsave')]:
             raw=canonical_json(dict(event_id=uid(13000+index*100+version),user_id=owner,repo_id=snapshot['repositories'][(index+1)%len(snapshot['repositories'])]['repo_id'],

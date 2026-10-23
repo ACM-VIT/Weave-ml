@@ -446,3 +446,109 @@ def test_applied_authority_is_exact_and_pending_profile_future_epoch_refused(run
     body=success.json()['model_context'];assert body['applied_operation_version']=='2' and body['applied_feedback_version']=='0'
     for field,value in [('minimum_applied_operation_version','3'),('required_profile_version','2'),('epoch','2'),('as_of_ms','1')]:
         assert post({**context,field:value}).status_code==503
+
+
+from tests.test_model_operations import withdrawal
+from feedback.model_wire import parse_withdrawal
+
+
+def parse_withdraw(raw,p):
+    return parse_withdrawal(raw,maximum_bytes=131072,allowed_policies={p.sha256})
+
+
+def test_withdraw_before_first_profile_keeps_unservable_prefix_then_applies_pending_like(runtime):
+    p=runtime.policy;calls=[];runtime.processor.profile_encoder=lambda context:(calls.append(context) or basis(0))
+    original=wire(p,'profile',1,profile_payload())
+    attestation=withdrawal(p,original,revoked_at=2)
+    runtime.stream.admit_withdrawal(attestation);assert runtime.consumer().run_once()==1
+    prefix=runtime.users.read(uid(1));assert isinstance(prefix.state,model.BootstrapState)
+    point=runtime.qdrant.retrieve(runtime.settings.user_collection,ids=[uid(1)],with_vectors=True,with_payload=True)[0]
+    assert point.vector=={} and point.payload['model_basis_status']=='awaiting_profile'
+    assert not calls
+    with pytest.raises(model.CompatibilityError):model.recommendation_view(prefix.state,p,session_id=None,epoch=None,as_of_ms=2)
+    assert runtime.stream.admit(original)['status']=='withdrawal_accepted'
+    assert runtime.redis.xlen(runtime.stream.stream)==0 and not calls
+    # Product feedback was frozen durably by the backend but not numbered until
+    # the real profile basis became ready. Its original opaque JSON is retained.
+    pending_feedback=feedback_payload()
+    restored=wire(p,'profile',2,profile_payload(True,2),at=3)
+    apply(runtime,restored);ready=runtime.users.read(uid(1));assert not isinstance(ready.state,model.BootstrapState)
+    assert ready.state.baseline.content_version==2 and ready.state.feedback_version==0 and len(calls)==1
+    feedback_raw=wire(p,'feedback',3,pending_feedback,at=1)
+    apply(runtime,feedback_raw)
+    assert runtime.users.read(uid(1)).state.feedback_version==1
+    assert json.loads(feedback_raw)['operation']['original_feedback_json']==pending_feedback['original_feedback_json']
+    assert runtime.processor.coordinator.rebuild(runtime.journal.get(prefix.head,'prepare')['genesis_checkpoint_sha256'],
+        runtime.users.read(uid(1)).head,expected_user_id=uid(1))==runtime.users.read(uid(1))
+
+
+def test_allow_genesis_corrective_profile_updates_existing_basis_and_preserves_feedback(runtime):
+    initialize(runtime);p=runtime.policy
+    apply(runtime,wire(p,'feedback',3,feedback_payload()))
+    before=runtime.users.read(uid(1))
+    apply(runtime,wire(p,'profile',4,profile_payload(True,2)))
+    after=runtime.users.read(uid(1))
+    assert after.state.long_entries==before.state.long_entries and after.state.sessions==before.state.sessions
+    assert after.state.feedback_version==1 and after.state.baseline.content_version==2
+    assert after.state.operation_version==4
+
+
+def test_repeated_withdrawals_late_original_and_exact_rebuild_without_encoder(runtime):
+    p=runtime.policy;calls=[];runtime.processor.profile_encoder=lambda context:(calls.append(context) or basis(0))
+    originals=[wire(p,'profile',n,profile_payload(True,n)) for n in (1,2)]
+    for n,raw in enumerate(originals,1):
+        attestation=withdrawal(p,raw,revoked_at=n)
+        runtime.stream.admit_withdrawal(attestation);assert runtime.consumer().run_once()==1
+        assert runtime.processor(parse_withdraw(attestation,p),lambda:None)=='withdrawn_duplicate'
+    assert not calls
+    checkpoint=runtime.processor.coordinator.checkpoint(uid(1))
+    for raw in originals:
+        assert runtime.stream.admit(raw)['status']=='withdrawal_accepted'
+        assert runtime.journal.records.get('operation:'+uid(1)+':'+json.loads(raw)['model_operation_version']) is None
+    apply(runtime,wire(p,'profile',3,profile_payload(True,3)))
+    final=runtime.users.read(uid(1));assert len(calls)==1 and final.state.baseline.content_version==3
+    assert runtime.processor.coordinator.rebuild(checkpoint,final.head,expected_user_id=uid(1))==final
+    assert runtime.stream.admit(originals[0])['status']=='withdrawal_accepted'
+    assert len(calls)==1 and runtime.redis.xlen(runtime.stream.stream)==0
+
+
+def test_initialized_guard_survives_point_loss_policy_and_transport_namespace_change(runtime):
+    initialize(runtime);original=wire(runtime.policy,'profile',1,profile_payload())
+    assert runtime.redis.hget(runtime.stream.guard_key,uid(1))=='initialized'
+    runtime.qdrant.delete(runtime.settings.user_collection,points_selector=models.PointIdsList(points=[uid(1)]),wait=True)
+    with pytest.raises(OperationBytesConflict):runtime.stream.admit(original)
+    changed=policy(generation_freshness_ms=101);config=runtime_config(changed,namespace='another-transport-policy')
+    other=ModelRuntime(config,redis=runtime.redis,qdrant=runtime.qdrant,settings=replace(runtime.settings,qdrant_url='http://127.0.0.1:9'),encoder=lambda _:basis(1))
+    assert other.stream.guard_key==runtime.stream.guard_key
+    with pytest.raises(OperationBytesConflict):other.stream.admit(wire(changed,'profile',1,profile_payload()))
+    assert runtime.qdrant.retrieve(runtime.settings.user_collection,ids=[uid(1)])==[]
+
+
+def test_registered_withdrawal_and_status_report_only_committed_proof(runtime,monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from api.v2 import router
+    import feedback.model_runtime as provider
+    p=runtime.policy;original=wire(p,'profile',1,profile_payload());attestation=withdrawal(p,original,revoked_at=2)
+    parsed=parse(original,p)
+    monkeypatch.setattr(provider,'model_runtime',lambda:runtime);monkeypatch.setenv('INTERNAL_API_SECRET','fixture-secret')
+    app=FastAPI();app.include_router(router);client=TestClient(app);headers={'x-internal-secret':'fixture-secret'}
+    request={'schema_version':1,'user_id':uid(1),'operation_id':parsed.header.operation_id,
+        'model_operation_version':'1','source_envelope_sha256':parsed.header.source_envelope_sha256}
+    def status():return client.post('/api/v2/model-operation-status',headers=headers,json=request)
+    assert status().json()['basis_status']=='missing'
+    ack=client.post('/api/v2/model-operation-withdrawals',headers=headers,json={'schema_version':1,'withdrawals':[{'withdrawal_json':attestation}]})
+    assert ack.status_code==200,ack.text
+    assert ack.json()['withdrawals'][0]['status']=='accepted'
+    assert status().json()['status']=='pending'
+    assert runtime.consumer().run_once()==1
+    committed=status();assert committed.status_code==200,committed.text
+    value=committed.json();assert value['status']=='withdrawn_profile' and value['basis_status']=='awaiting_profile'
+    assert value['operation_head']==value['current_head'] and 'applied_profile_version' not in value
+    late=client.post('/api/v2/model-operations',headers=headers,json={'schema_version':1,'operations':[{'operation_json':original}]})
+    assert late.status_code==200,late.text
+    assert late.json()['operations'][0]['status']=='withdrawal_accepted'
+    assert runtime.redis.xlen(runtime.stream.stream)==0
+    wrong=client.post('/api/v2/model-operation-status',headers=headers,json={**request,'source_envelope_sha256':'f'*64})
+    assert wrong.status_code==409
+    assert client.post('/api/v2/model-operation-withdrawals',json={'schema_version':1,'withdrawals':[{'withdrawal_json':attestation}]}).status_code==401
