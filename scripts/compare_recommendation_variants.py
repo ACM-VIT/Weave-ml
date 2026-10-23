@@ -10,7 +10,8 @@ from pathlib import Path
 from evaluation.variant_comparison import VariantExperiment,compare_experiment,validate_comparison_result
 from evaluation.stage_runner import MAX_SNAPSHOT_BYTES,require_offline_git,OfflineGitUnavailable
 from evaluation.recommendation_benchmark import digest
-from scripts.evaluate_recommendations import read_json,atomic_json
+from scripts.evaluate_recommendations import atomic_json,MAX_INPUT_BYTES
+from evaluation.embedding_artifacts import read_regular,decode_json
 
 
 def main(argv=None):
@@ -24,7 +25,7 @@ def main(argv=None):
     try:
         inputs=[args.experiment,*(args.artifact_dir/name for name in ('heavy_ranker.pt','feature_scaler.json','model_manifest.json'))]
         if any(p.resolve()==args.output.resolve() for p in inputs):raise ValueError('output overwrites input')
-        experiment=VariantExperiment.model_validate(read_json(args.experiment,max_input_bytes=MAX_SNAPSHOT_BYTES))
+        experiment=VariantExperiment.model_validate(decode_json(read_regular(args.experiment,MAX_SNAPSHOT_BYTES)))
         if args.expected_input_sha is not None and args.expected_input_sha!=digest(experiment):raise ValueError('input drift')
         if not args.worker:
             require_offline_git()
@@ -38,7 +39,7 @@ def main(argv=None):
                     timeout=180,check=False,capture_output=True,text=True)
                 if result.returncode:
                     print(json.dumps({'passed':False,'error':'VariantWorkerFailed'}));return 2
-                comparison=validate_comparison_result(read_json(private_output),experiment)
+                comparison=validate_comparison_result(decode_json(read_regular(private_output,MAX_INPUT_BYTES)),experiment)
             atomic_json(args.output,comparison)
             print(result.stdout.strip());return 0
         import socket,torch

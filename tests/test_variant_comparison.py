@@ -229,3 +229,15 @@ def test_comparison_owns_nested_inputs_during_real_stages(monkeypatch):
     assert calls==['baseline','diversity','social','combined']
     assert all(row['execution']['seed']==original['snapshot']['seed'] for row in comparison['results'].values())
     module.validate_comparison_result(comparison,VariantExperiment.model_validate(original))
+
+
+def test_cli_rejects_fifo_before_worker_deadline(tmp_path):
+    import os,subprocess,sys
+    if not hasattr(os,'mkfifo'):pytest.skip('POSIX FIFO unavailable')
+    source=tmp_path/'experiment.json';os.mkfifo(source)
+    output=tmp_path/'result.json'
+    result=subprocess.run([sys.executable,'-m','scripts.compare_recommendation_variants',
+        '--experiment',str(source),'--output',str(output)],cwd=ROOT,
+        capture_output=True,text=True,timeout=5)
+    assert result.returncode==2 and 'Traceback' not in result.stderr
+    assert not output.exists()
