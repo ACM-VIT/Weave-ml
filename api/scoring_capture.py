@@ -14,7 +14,7 @@ from inference.scoring_runtime import CaptureOptions
 from inference.scoring_provenance import DEFAULT_WIRE_LIMIT, packet_for_frame, seal_scoring_response
 from inference.runtime import RecommendationCapacityError, RecommendationDeadlineExceeded
 from api.contracts import CapturedRecommendationResponse, UnscoredEmptyRecommendationResponse
-from api.metrics import record_recommendation
+from api.metrics import record_recommendation, record_scoring_capture_failure
 from retrieval.social_candidates import SocialCandidate
 from utils.deadline import CooperativeDeadlineExceeded, check_deadline
 
@@ -46,15 +46,18 @@ class CapturedRequest:
 class CapturedJobOutcome:
     wire: bytes | None = field(default=None, repr=False)
     failure_code: str | None = None
+    failure_stage: str | None = None
 
 
-def execute_captured_request(active_retriever, request: CapturedRequest) -> CapturedJobOutcome:
-    """Run and seal inside the actual worker; no private exception crosses it."""
+def _execute_captured_request_private(active_retriever, request: CapturedRequest) -> CapturedJobOutcome:
+    """Private validation/packet failures leave this frame as bounded values only."""
+    stage = "retrieval_scoring"
     try:
         check_deadline()
         batch = active_retriever.recommend_batch(request.user_id, request.limit, list(request.excluded),
             request.generation_id, request.cold_start, list(request.social_ids), list(request.social_candidates),
             scoring_capture=request.options)
+        stage = "output_validation"
         items = batch.items
         if len({item.repo_id for item in items}) != len(items) or any(not math.isfinite(item.score) for item in items):
             raise ValueError("Invalid actual recommendation output")
@@ -71,7 +74,9 @@ def execute_captured_request(active_retriever, request: CapturedRequest) -> Capt
             # Only an existing genuinely successful empty result reaches here.
             # Required-heavy no-eligible behavior still raises in the retriever.
             body["scoring_capture"] = {"schema_version": 1, "status": "not_scored_empty"}
+            stage = "response_validation"
             validated = UnscoredEmptyRecommendationResponse.model_validate_json(json.dumps(body, allow_nan=False), strict=True)
+            stage = "sealing"
             wire = json.dumps(validated.model_dump(mode="json"), ensure_ascii=False, allow_nan=False,
                               sort_keys=True, separators=(",", ":")).encode()
             if len(wire) > DEFAULT_WIRE_LIMIT:
@@ -80,6 +85,7 @@ def execute_captured_request(active_retriever, request: CapturedRequest) -> Capt
             captured = batch.captured_scoring
             if captured is None:
                 raise ValueError("Requested capture did not score actual inputs")
+            stage = "packet_binding"
             by_id = {frame.snapshot.repo_id: frame for frame in captured.frames}
             scores = dict(captured.raw_heavy_scores)
             body["scoring_capture"] = {"schema_version": 1, "status": "captured"}
@@ -88,11 +94,14 @@ def execute_captured_request(active_retriever, request: CapturedRequest) -> Capt
             body["items"] = [{**item, "raw_heavy_score": scores[item["repo_id"]],
                 "scored_input": packet_for_frame(by_id[item["repo_id"]], captured.context).model_dump(mode="json")}
                 for item in body["items"]]
+            stage = "response_validation"
             validated = CapturedRecommendationResponse.model_validate_json(json.dumps(body, allow_nan=False), strict=True)
             normalized = validated.model_dump(mode="json")
             for item in normalized["items"]:
                 item.pop("scored_input")
+            stage = "sealing"
             wire = seal_scoring_response(normalized, captured.context, captured.frames, byte_limit=DEFAULT_WIRE_LIMIT)
+        stage = "completion"
         check_deadline()
         record_recommendation(served_ranker=batch.served_ranker, fallback_code=batch.fallback_code, item_count=len(items))
         return CapturedJobOutcome(wire=wire)
@@ -101,7 +110,24 @@ def execute_captured_request(active_retriever, request: CapturedRequest) -> Capt
     except Exception:
         # No validation object, .errors()[input], response/packet repr, traceback
         # or chained exception leaves this private scope for logging/Sentry.
-        return CapturedJobOutcome(failure_code="SCORING_CAPTURE_UNAVAILABLE")
+        return CapturedJobOutcome(failure_code="SCORING_CAPTURE_UNAVAILABLE", failure_stage=stage)
+
+
+class CaptureWorkerError(RuntimeError):
+    """Safe worker failure with no original exception, private frame or cause."""
+    def __init__(self):
+        super().__init__("SCORING_CAPTURE_UNAVAILABLE")
+
+
+def execute_captured_request(active_retriever, request: CapturedRequest) -> CapturedJobOutcome:
+    outcome = _execute_captured_request_private(active_retriever, request)
+    if outcome.failure_code is not None or outcome.wire is None:
+        record_scoring_capture_failure(outcome.failure_stage or "other")
+        # The private helper has returned and its except scope is gone. Raising
+        # here makes the native Future an error without retaining private input
+        # validation exceptions via __context__, __cause__ or traceback frames.
+        raise CaptureWorkerError()
+    return outcome
 
 
 def authorized_capture_options(request: Request, feed_version: str) -> CaptureOptions:

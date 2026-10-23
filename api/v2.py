@@ -37,7 +37,7 @@ from api.runtime import (
     service_runtime_drain_actions,
     validate_service_runtime,
 )
-from api.scoring_capture import CapturedRequest, authorized_capture_options, execute_captured_request
+from api.scoring_capture import CaptureWorkerError, CapturedRequest, authorized_capture_options, execute_captured_request
 from api.request_budget import run_read_only_request
 from api.health import HealthDiagnostics, HealthSettings
 from api.metrics import record_health_dependency, record_recommendation, render_prometheus
@@ -1227,6 +1227,10 @@ async def generate_recommendations(
             detail="Recommendation generation exceeded its bounded deadline.",
             headers={"Retry-After": "1"},
         ) from exc
+    except CaptureWorkerError:
+        raise V2ServiceHTTPException(status_code=503, error_code="SCORING_CAPTURE_UNAVAILABLE", retryable=True,
+            detail="Requested scoring capture is unavailable; retry after the provider is ready.",
+            headers={"Retry-After": "2"}) from None
     except Exception as exc:
         raise _operation_error(
             "recommendations",
