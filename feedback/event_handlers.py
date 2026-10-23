@@ -252,6 +252,8 @@ class FeedbackHandler:
         if point is None:
             logger.warning("User profile %s is not available yet", user_id)
             return False
+        if isinstance(point.payload, Mapping) and "model_policy_sha256" in point.payload:
+            raise ValueError("negotiated user model requires the ordered model-operation lane")
         search_vector, vector_name = _point_vector(
             point, self.settings.user_vector_name, label="user profile"
         )

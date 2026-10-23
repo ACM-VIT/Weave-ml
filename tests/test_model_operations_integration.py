@@ -799,3 +799,122 @@ def test_dense_qdrant_float_mirrors_keep_canonical_history_exact_and_refuse_corr
     altered=list(actual);altered[0]=math.nextafter(expected[0],math.inf).hex()
     runtime.qdrant.set_payload(runtime.settings.user_collection,payload={'preference_accumulator':altered},points=[uid(1)],wait=True)
     with pytest.raises(JournalConflict):runtime.users.read(uid(1))
+
+
+def test_legacy_exported_handler_and_consumer_refuse_negotiated_point_before_math(runtime,monkeypatch):
+    from feedback.event_handlers import FeedbackHandler
+    import feedback.event_handlers as handlers
+    from feedback.settings import FeedbackSettings
+    from feedback.consumer import FeedbackConsumer
+    from types import SimpleNamespace
+    initialize(runtime);before=runtime.users.read(uid(1))
+    settings=replace(FeedbackSettings.from_env(),user_collection=runtime.settings.user_collection,
+        repository_collection=runtime.settings.repository_collection,vector_dimension=384)
+    handler=FeedbackHandler(qdrant_client=runtime.qdrant,settings=settings)
+    monkeypatch.setattr(handlers,'_point_vector',lambda *a,**kw:pytest.fail('negotiated state reached legacy vector math'))
+    with pytest.raises(ValueError,match='ordered model-operation'):
+        handler.handle_feedback(uid(1),uid(100),'like',event_id=uid(2100))
+    consumer=object.__new__(FeedbackConsumer);consumer.handler=handler
+    with pytest.raises(ValueError,match='ordered model-operation'):
+        consumer._call_handler(SimpleNamespace(user_id=uid(1),repo_id=uid(100),action='like',event_id=uid(2101),dwell_seconds=None))
+    assert runtime.users.read(uid(1))==before
+
+
+def test_rebuild_rejects_alias_target_without_touching_source(runtime):
+    from scripts.rebuild_user_model import verify_and_stage
+    initialize(runtime);before=runtime.users.read(uid(1))
+    checkpoint=runtime.processor.coordinator.checkpoint(uid(1))
+    alias='fixture_alias_to_source'
+    runtime.qdrant.update_collection_aliases(change_aliases_operations=[models.CreateAliasOperation(
+        create_alias=models.CreateAlias(collection_name=runtime.settings.user_collection,alias_name=alias))])
+    with pytest.raises(ValueError,match='physical collection'):
+        verify_and_stage(runtime,user_id=uid(1),checkpoint_sha256=checkpoint,
+            expected_head=before.head,target_collection=alias,stage_copy=True)
+    assert runtime.users.read(uid(1))==before
+
+
+@pytest.mark.parametrize('terminal_first',[False,True])
+def test_withdrawal_at_last_pre_cas_boundary_preserves_honest_terminal_authority(runtime,monkeypatch,terminal_first):
+    import threading
+    from fastapi.testclient import TestClient
+    from api import main
+    import feedback.model_runtime as provider
+    initialize(runtime);p=runtime.policy
+    raw=wire(p,'profile',3,profile_payload(True,2));incoming=parse(raw,p)
+    attestation=withdrawal(p,raw,revoked_at=4)
+    entered=threading.Event();release=threading.Event();errors=[]
+    original=runtime.users.compare_and_set
+    def paused(before,desired):
+        if desired.state.baseline.content_version==2:
+            entered.set();assert release.wait(10)
+        return original(before,desired)
+    monkeypatch.setattr(runtime.users,'compare_and_set',paused)
+    runtime.stream.admit(raw)
+    def consume():
+        try:runtime.consumer().run_once()
+        except Exception as exc:errors.append(exc)
+    thread=threading.Thread(target=consume);thread.start()
+    try:
+        assert entered.wait(10)
+        monkeypatch.setattr(provider,'model_runtime',lambda:runtime)
+        monkeypatch.setenv('INTERNAL_API_SECRET','fixture-secret')
+        result=TestClient(main.app).post('/api/v2/model-operation-withdrawals',
+            headers={'x-internal-secret':'fixture-secret'},json={'schema_version':1,
+                'withdrawals':[{'withdrawal_json':attestation}]})
+        assert result.status_code==200,result.text
+        if terminal_first:
+            # Simulate a lease successor committing withdrawal while an old
+            # writer is paused immediately after its final lock/withdrawal check.
+            assert runtime.processor(parse_withdraw(attestation,p),lambda:None)=='withdrawn_profile'
+            committed=runtime.users.read(uid(1))
+    finally:
+        release.set();thread.join(10)
+    assert not thread.is_alive() and len(errors)==1
+    after=runtime.users.read(uid(1))
+    proof=runtime.processor.coordinator.original_status(after,incoming.header)
+    if terminal_first:
+        assert isinstance(errors[0],CasConflict)
+        assert after==committed and proof['status']=='withdrawn_profile'
+        assert after.state.baseline.content_version==1
+    else:
+        # Admission is not terminal rejection. An already-inflight original
+        # can win CAS, after which status must honestly say applied and require
+        # the backend's later compensating genuine profile to restore authority.
+        assert isinstance(errors[0],JournalConflict)
+        assert proof['status']=='applied' and after.state.baseline.content_version==2
+        assert runtime.processor(parse_withdraw(attestation,p),lambda:None)=='already_applied'
+        point=runtime.qdrant.retrieve(runtime.settings.user_collection,ids=[uid(1)],with_payload=True,with_vectors=True)[0]
+        required=Context(uid(1),uid(50),1,p.sha256,4,3,4)
+        with pytest.raises(model.OperationGap):owned_input(point,runtime.users,p,required)
+        runtime.processor.profile_encoder=lambda _:basis(2)
+        runtime.stream.admit(wire(p,'profile',4,profile_payload(True,3),at=4))
+        for _ in range(10):
+            runtime.consumer().run_once()
+            if runtime.users.read(uid(1)).state.operation_version==4:
+                break
+            time.sleep(.02)
+        restored=runtime.users.read(uid(1))
+        assert restored.state.operation_version==4
+        assert restored.state.baseline.vector==tuple(basis(2))
+        assert restored.state.sessions==after.state.sessions and restored.state.feedback_version==after.state.feedback_version
+
+
+def test_registered_uncaptured_recommendations_report_real_pending_applied_frontier(runtime,trained_ranker,monkeypatch):
+    from fastapi.testclient import TestClient
+    from api import main,v2
+    import feedback.model_runtime as provider
+    from retrieval.v2_retriever import QdrantV2Retriever
+    initialize(runtime);p=runtime.policy
+    engine=QdrantV2Retriever(client=runtime.qdrant,user_collection=runtime.settings.user_collection,
+        repository_collection=runtime.settings.repository_collection,ranker=trained_ranker,
+        heavy_ranker_enabled=True,heavy_ranker_required=True,heavy_ranker_traffic_percent=100.,minimum_eligible_repositories=1)
+    monkeypatch.setattr(provider,'model_runtime',lambda:runtime)
+    monkeypatch.setattr(v2,'retriever',lambda:engine)
+    monkeypatch.setenv('INTERNAL_API_SECRET','fixture-secret')
+    result=TestClient(main.app).post('/api/v2/recommendations/generate',headers={'x-internal-secret':'fixture-secret'},json={
+        'schema_version':2,'user_id':uid(1),'generation_id':uid(4000),'feed_version':'1','limit':1,
+        'exclude_repo_ids':[],'context':{'cold_start':False},'model_context':{
+            'schema_version':1,'session_id':uid(50),'epoch':'1','policy_sha256':p.sha256,
+            'minimum_applied_operation_version':'3','required_profile_version':'2','as_of_ms':'3'}})
+    assert result.status_code==503,result.text
+    assert result.headers['Retry-After']=='2' and result.json()['retryable'] is True

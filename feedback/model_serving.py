@@ -52,6 +52,8 @@ def owned_input(point,users,policy,context):
     if context.policy_sha256!=policy.sha256:raise reducer.CompatibilityError('context policy differs')
     snapshot=users.decode_point(point,context.user_id)
     state=snapshot.state
+    if isinstance(state,reducer.BootstrapState):
+        raise reducer.OperationGap('genuine applied profile basis is pending')
     if state.operation_version<context.minimum_applied_operation_version or state.baseline.content_version!=context.required_profile_version:
         raise reducer.OperationGap('required applied model/profile revision pending')
     if type(snapshot.head) is not str or len(snapshot.head)!=64 or any(c not in '0123456789abcdef' for c in snapshot.head):raise reducer.CompatibilityError('committed model head required')

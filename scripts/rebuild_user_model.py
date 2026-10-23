@@ -23,6 +23,15 @@ def verify_and_stage(runtime, *, user_id, checkpoint_sha256, expected_head, targ
         raise ValueError('staging requires both explicit target collection and stage-copy')
     if target_collection in {runtime.settings.user_collection, runtime.journal.records.records.collection}:
         raise ValueError('staging must use a separate existing user-vector collection')
+    if stage_copy:
+        # Resolve source aliases and refuse any alias target. A verified target
+        # must be a distinct physical collection, never another name for source.
+        aliases={item.alias_name:item.collection_name for item in runtime.qdrant.get_aliases().aliases}
+        sources={aliases.get(name,name) for name in (runtime.settings.user_collection,
+            runtime.journal.records.records.collection)}
+        collections={item.name for item in runtime.qdrant.get_collections().collections}
+        if target_collection in aliases or target_collection in sources or target_collection not in collections:
+            raise ValueError('staging must use a separate existing physical collection; aliases are forbidden')
     from embedding.qdrant_cas import payload_snapshot_filter
     from qdrant_client import models
     with user_vector_lock(runtime.redis, user_id, settings=runtime.settings) as lock:

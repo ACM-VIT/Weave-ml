@@ -286,12 +286,14 @@ def _is_temporary_dependency_error(exc: Exception) -> bool:
     non-retryable 500; treating all exceptions as temporary creates backend
     retry storms and can conceal stored-data corruption.
     """
+    from feedback.long_session import OperationGap
     if isinstance(
         exc,
         (
             ConnectionError,
             TimeoutError,
             RetrievalDependencyError,
+            OperationGap,
             LockAcquisitionError,
             LockLostError,
             EmbeddingCapacityError,
@@ -1645,14 +1647,13 @@ async def submit_model_operations(request: ModelOperationBatch):
     from feedback.model_stream import OperationBytesConflict, OperationCapacity
     from feedback.model_wire import WireError, parse_operation
     try:
-        runtime = model_runtime()
-        # Validate the whole bounded batch before accepting its first element.
-        # A capacity failure may still leave a prefix durably accepted; exact
-        # retries report duplicate and never apply that prefix twice.
-        for item in request.operations:
-            parse_operation(item.operation_json, maximum_bytes=runtime.stream.limits.input_bytes,
-                            allowed_policies=runtime.stream.policies)
         def enqueue():
+            runtime = model_runtime()
+            # Validate the whole batch before accepting its first element.
+            # Partial capacity admission remains exact-retry safe.
+            for item in request.operations:
+                parse_operation(item.operation_json, maximum_bytes=runtime.stream.limits.input_bytes,
+                                allowed_policies=runtime.stream.policies)
             return {"schema_version": 1, "operations": [runtime.stream.admit(item.operation_json) for item in request.operations]}
         return await run_service_job("feedback", enqueue)
     except WireError as exc:
@@ -1674,11 +1675,11 @@ async def read_model_authority(request: ModelAuthorityRequest):
     from feedback.model_runtime import model_runtime
     from feedback.model_serving import Context, owned_input, input_identity
     try:
-        runtime = model_runtime()
         context = request.model_context
         owned_context = Context(str(request.user_id), context.session_id, int(context.epoch), context.policy_sha256,
             int(context.minimum_applied_operation_version), int(context.required_profile_version), int(context.as_of_ms))
         def read():
+            runtime = model_runtime()
             points = runtime.qdrant.retrieve(collection_name=runtime.settings.user_collection, ids=[str(request.user_id)],
                 with_vectors=True, with_payload=True, timeout=max(1, math.ceil(runtime.settings.qdrant_timeout_seconds)))
             if len(points) != 1:
@@ -1697,11 +1698,11 @@ async def submit_profile_withdrawals(request: ProfileWithdrawalBatch):
     from feedback.model_stream import OperationBytesConflict
     from feedback.model_wire import WireError, parse_withdrawal
     try:
-        runtime = model_runtime()
-        for item in request.withdrawals:
-            parse_withdrawal(item.withdrawal_json, maximum_bytes=runtime.stream.limits.input_bytes,
-                             allowed_policies=runtime.stream.policies)
         def enqueue():
+            runtime = model_runtime()
+            for item in request.withdrawals:
+                parse_withdrawal(item.withdrawal_json, maximum_bytes=runtime.stream.limits.input_bytes,
+                                 allowed_policies=runtime.stream.policies)
             return {"schema_version": 1, "withdrawals": [runtime.stream.admit_withdrawal(item.withdrawal_json)
                     for item in request.withdrawals]}
         return await run_service_job("feedback", enqueue)
@@ -1721,8 +1722,8 @@ async def read_model_operation_status(request: ModelOperationStatusRequest):
     from feedback.model_journal import OriginalIdentityConflict
     from feedback.long_session import BootstrapState, WithdrawnProfile
     try:
-        runtime = model_runtime()
         def read():
+            runtime = model_runtime()
             snapshot = runtime.users.read_optional(str(request.user_id))
             result = {"schema_version": 1, "user_id": str(request.user_id), "operation_id": str(request.operation_id),
                 "model_operation_version": request.model_operation_version,
