@@ -222,6 +222,60 @@ def test_actual_trained_artifact_capture_matches_forward_tensor_and_exact_score_
     finally:hook.remove()
 
 
+@pytest.mark.parametrize('version_overlay',[{}, {'feature_version':None}, {'feature_version':0}],
+    ids=['first-index','legacy-null','explicit-zero'])
+def test_capture_accepts_first_index_payload_without_feature_version(actual_capture_ranker,version_overlay):
+    import numpy as np
+    from embedding.qdrant_store import QdrantRepositoryStore
+    from embedding.repository_embedding import build_vector_payload, RepositoryEmbeddingConfig
+    from inference.scoring_provenance import capture_scored_inputs
+    ranker=actual_capture_ranker
+    vector=np.zeros(384,dtype=np.float32);vector[0]=1
+    payload=build_vector_payload({'full_name':'owner/first-index','content_version':1,
+        'content_hash':'first-index-v1','topics':['python']},repo_id=identifier(100),
+        final_embedding=vector.tolist(),readme_chunks=1,source_hash='b'*64,
+        config=RepositoryEmbeddingConfig(version=ranker.embedding_version))
+    assert 'feature_version' not in payload
+    candidate={**payload,'id':payload['repo_id'],'embedding':vector,**version_overlay}
+    # Indexing does not invent a refresh version; the canonical store treats
+    # a first-index payload with no refresh metadata as version zero.
+    assert QdrantRepositoryStore._stored_version(candidate,'feature_version')==0
+    user=np.frombuffer(frame(0).input_bytes[:1536],dtype='<f4').copy()
+    ctx=actual_context(ranker,user=user)
+    baseline=ranker.score_batch_compact(user,['python'],[candidate])
+    with capture_scored_inputs(ctx) as capture:
+        assert ranker.score_batch_compact(user,['python'],[candidate])==baseline
+        captured=capture.frames[0]
+        assert captured.snapshot.content_version=='1'
+        assert captured.snapshot.feature_version=='0'
+        packet=packet_for_frame(captured,ctx)
+        assert decode_owned_packet(packet,ctx,owner_user_id=ctx.user_id,
+            generation_id=ctx.generation_id,repo_id=candidate['id'])==captured.input_bytes
+    assert candidate.get('feature_version')==version_overlay.get('feature_version')
+    assert ('feature_version' in candidate)==('feature_version' in version_overlay)
+
+
+@pytest.mark.parametrize('invalid_version',[False,-1,1.5,'01'])
+def test_capture_does_not_default_malformed_supplied_refresh_versions(actual_capture_ranker,invalid_version):
+    import numpy as np
+    from inference.scoring_provenance import capture_scored_inputs
+    ranker=actual_capture_ranker;user=np.zeros(384,dtype=np.float32)
+    candidate=actual_candidates(ranker,1)[0];candidate['feature_version']=invalid_version
+    with capture_scored_inputs(actual_context(ranker,user=user)) as capture:
+        with pytest.raises(ValueError):ranker.score_batch_compact(user,[],[candidate])
+        assert capture.frames==()
+
+
+def test_capture_keeps_content_version_required(actual_capture_ranker):
+    import numpy as np
+    from inference.scoring_provenance import capture_scored_inputs
+    ranker=actual_capture_ranker;user=np.zeros(384,dtype=np.float32)
+    candidate=actual_candidates(ranker,1)[0];del candidate['content_version']
+    with capture_scored_inputs(actual_context(ranker,user=user)) as capture:
+        with pytest.raises(KeyError,match='content_version'):ranker.score_batch_compact(user,[],[candidate])
+        assert capture.frames==()
+
+
 def test_concurrent_actual_ranker_scopes_remain_owner_isolated(actual_capture_ranker):
     import numpy as np
     from concurrent.futures import ThreadPoolExecutor

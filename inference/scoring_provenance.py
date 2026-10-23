@@ -280,7 +280,10 @@ class ScoredInputCapture:
             if repo_id in self._ids or any(frame.snapshot.repo_id == repo_id for frame in pending):
                 raise ValueError('Duplicate actual scored repository input')
             def exact_version(key):
-                value=candidate[key]
+                # Fresh index payloads have no refresh counter. Match the
+                # repository store's zero version without weakening content IDs.
+                value=candidate.get(key,0) if key=='feature_version' else candidate[key]
+                if key=='feature_version' and value is None: value=0
                 if type(value) is int: return str(value)
                 if isinstance(value,str): return value
                 raise ValueError('Actual repository version must be exact decimal or integer')
