@@ -51,6 +51,9 @@ from retrieval.config import TOTAL_CANDIDATE_POOL
 from retrieval.discovery_cache import DiscoveryRevision, PoolLease, SharedDiscoveryCache
 from retrieval.metrics import record_candidate_read
 from retrieval.runtime import RetrievalWork, validate_retrieval_runtime
+from retrieval.social_candidates import (
+    SocialCandidate, SocialPolicy, lookup_social_ids, select_social_candidates,
+)
 from utils.deadline import CooperativeDeadlineExceeded, check_deadline, current_deadline, qdrant_timeout
 from scripts.user_onboarding import TARGET_VECTOR_NAME, USER_PROFILES_COLLECTION
 
@@ -134,6 +137,7 @@ class RankedRepository:
     repo_id: str
     score: float
     source: str
+    retrieval_scores: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +221,7 @@ class QdrantV2Retriever:
         allow_unqualified_ranker: bool | None = None,
         discovery_revision_provider: Callable[[], DiscoveryRevision | None] | None = None,
         discovery_cache: SharedDiscoveryCache | None = None,
+        social_policy: SocialPolicy | None = None,
     ) -> None:
         validate_retrieval_runtime()
         self.qdrant_timeout_seconds = self._float_env(
@@ -237,6 +242,10 @@ class QdrantV2Retriever:
         self._discovery_cache_scope = uuid.uuid4().hex
         self._discovery_cache = discovery_cache or SharedDiscoveryCache()
         self.max_candidates = max(50, min(max_candidates, 2_000))
+        self.social_policy = social_policy or SocialPolicy(
+            mode=os.getenv("V2_SOCIAL_CANDIDATE_MODE", "disabled").strip().casefold(),
+            traffic_percent=self._float_env("V2_SOCIAL_CANDIDATE_TRAFFIC_PERCENT", default=100., minimum=0., maximum=100.),
+        )
         self.app_env = os.getenv("APP_ENV", "development").strip().casefold()
         if assembler is None:
             assembler = FeedAssemblySystem(
@@ -372,6 +381,9 @@ class QdrantV2Retriever:
             "heavy_selected": 0,
             "heavy_served": 0,
             "hybrid_served": 0,
+            "social_shadow_candidates": 0,
+            "social_injected_candidates": 0,
+            "social_lookup_failures": 0,
             **{f"fallback_{code.casefold()}": 0 for code in _FALLBACK_MESSAGES},
         }
         self.ranker: RankerService | None = None
@@ -745,6 +757,14 @@ class QdrantV2Retriever:
                 _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS + _HEAVY_RANKER_PAYLOAD_FIELDS
             ),
             with_vectors=[QDRANT_VECTOR_NAME],
+            **qdrant_timeout(self.qdrant_timeout_seconds),
+        )
+
+    def _fetch_social_candidates(self, repo_ids: list[str]) -> list[Any]:
+        return self.client.retrieve(
+            collection_name=self.repository_collection, ids=repo_ids,
+            with_payload=_REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS,
+            with_vectors=False,
             **qdrant_timeout(self.qdrant_timeout_seconds),
         )
 
@@ -1470,12 +1490,14 @@ class QdrantV2Retriever:
                 code = "INVALID_HEAVY_OUTPUT"
                 return None, code, _FALLBACK_MESSAGES[code]
             sources = {item.repo_id: item.source for item in ranked}
+            retrieval_scores = {item.repo_id: item.retrieval_scores for item in ranked}
             return (
                 [
                     RankedRepository(
                         repo_id=str(result["repo_id"]),
                         score=float(result["final_score"]),
                         source=sources[str(result["repo_id"])],
+                        retrieval_scores=retrieval_scores[str(result["repo_id"])],
                     )
                     for result in results
                 ],
@@ -1580,6 +1602,7 @@ class QdrantV2Retriever:
                 repo_id=item.repo_id,
                 score=item.score + boost if item.repo_id in boosted_ids else item.score,
                 source=item.source,
+                retrieval_scores=item.retrieval_scores,
             )
             for item in ranked
         ]
@@ -1596,6 +1619,7 @@ class QdrantV2Retriever:
         generation_seed: str | None = None,
         cold_start: bool = False,
         social_repo_ids: list[str] | None = None,
+        social_candidates: list[SocialCandidate] | None = None,
     ) -> RecommendationBatch:
         check_deadline()
         excluded = {str(uuid.UUID(item)) for item in exclude_repo_ids}
@@ -1607,10 +1631,18 @@ class QdrantV2Retriever:
         ] = {}
         budget = self._candidate_read_budget()
         heavy_selected = self._heavy_ranker_selected(user_id)
+        social_policy = self.social_policy.for_user(user_id)
+        social_rows = social_candidates or []
+        social_ids = lookup_social_ids(social_rows, social_policy, excluded)
+        if social_policy.injects and social_ids:
+            social_ids = social_ids[:budget.reserve(len(social_ids))]
+        social_points: dict[str, _EligibleRepositoryPoint] = {}
         discovery_plan = _DiscoveryPlan(budget=budget)
         try:
             with RetrievalWork() as work:
                 profile_future = work.submit("profile", self._fetch_user_profile, user_id)
+                social_future = (work.submit("social", self._fetch_social_candidates, social_ids)
+                                 if social_policy.injects and social_ids else None)
                 self._prepare_discovery(
                     work, discovery_plan, max(limit * 8, 200),
                     # Payload-first retrieval avoids transferring overlapping or
@@ -1661,9 +1693,10 @@ class QdrantV2Retriever:
                     for point, score in semantic:
                         repo_id = point.repo_id
                         if repo_id not in excluded and math.isfinite(score):
-                            candidates[repo_id] = RankedRepository(repo_id, score, "semantic")
+                            candidates[repo_id] = RankedRepository(repo_id, score, "semantic", {"semantic": score})
                             metadata[repo_id] = point.payload
                             vectors[repo_id] = point.vector
+
 
                 discovery: list[tuple[str, float, str, dict[str, Any], list[float] | None]] = []
                 try:
@@ -1673,9 +1706,44 @@ class QdrantV2Retriever:
                         minimum_candidates=limit, existing_repo_ids=set(candidates),
                     )
                 except RetrievalDependencyError:
-                    if not candidates:
+                    if not candidates and not (social_policy.injects and social_future is not None):
                         raise
                     discovery_points = []
+                # Shadow evaluation cannot reserve reads needed by serving
+                # retrieval/refills. It may inspect only the remaining budget.
+                if social_policy.mode == 'shadow' and social_ids:
+                    social_ids = social_ids[:budget.reserve(len(social_ids))]
+                    if social_ids:
+                        social_future = work.submit("social", self._fetch_social_candidates, social_ids)
+                if social_future is not None:
+                    try:
+                        records = work.result(social_future)
+                    except CooperativeDeadlineExceeded:
+                        raise
+                    except Exception as exc:
+                        logger.warning("Social candidate lookup failed", extra={
+                            "retrieval_context": {"channel": "social", "error_type": type(exc).__name__},
+                        })
+                        with self._counter_lock:
+                            self._ranking_counters["social_lookup_failures"] = min(
+                                _COUNTER_LIMIT, self._ranking_counters["social_lookup_failures"] + 1,
+                            )
+                    else:
+                        requested = set(social_ids)
+                        seen_social = set()
+                        for record in records:
+                            point_id = str(getattr(record, "id", ""))
+                            if point_id not in requested:
+                                continue
+                            if point_id in seen_social:
+                                social_points.pop(point_id, None)
+                                continue
+                            seen_social.add(point_id)
+                            point = self._eligible_repository_point(record, require_vector=False)
+                            if point is not None and point.repo_id not in excluded:
+                                social_points[point.repo_id] = point
+                        record_candidate_read("social", records, len(social_points))
+
         finally:
             self._release_discovery(discovery_plan)
         for point, channel_source in discovery_points:
@@ -1707,15 +1775,56 @@ class QdrantV2Retriever:
                 combined += current.score
             if math.isfinite(combined):
                 candidates[repo_id] = RankedRepository(
-                    repo_id, combined, current.source if current else source
+                    repo_id, combined, current.source if current else source,
+                    {**(current.retrieval_scores if current else {}), source: score},
                 )
                 metadata[repo_id] = payload
                 vectors[repo_id] = vector or vectors.get(repo_id)
 
+        # Do not attach social evidence to a different content/feature snapshot.
+        compatible_social = {
+            repo_id for repo_id, point in social_points.items()
+            if repo_id not in metadata or all(
+                metadata[repo_id].get(key) == point.payload.get(key)
+                for key in _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS
+            )
+        }
+        selected_social = select_social_candidates(
+            social_rows, social_policy, eligible_repo_ids=compatible_social, excluded=excluded,
+        )[:self.max_candidates]
+        reserved_social = set()
+        if selected_social:
+            key = "social_injected_candidates" if social_policy.injects else "social_shadow_candidates"
+            with self._counter_lock:
+                self._ranking_counters[key] = min(_COUNTER_LIMIT, self._ranking_counters[key] + len(selected_social))
+        if social_policy.injects:
+            maximum = max((row.fusion_score for row in selected_social), default=1.)
+            for row in selected_social:
+                current = candidates.get(row.repo_id)
+                if current is None:
+                    candidates[row.repo_id] = RankedRepository(
+                        row.repo_id, .15 * row.fusion_score / maximum,
+                        row.primary_source, row.source_scores,
+                    )
+                    metadata[row.repo_id] = social_points[row.repo_id].payload
+                    vectors[row.repo_id] = None
+                else:
+                    candidates[row.repo_id] = RankedRepository(
+                        current.repo_id, current.score, current.source,
+                        {**current.retrieval_scores, **row.source_scores},
+                    )
+                reserved_social.add(row.repo_id)
+
         check_deadline()
+        ordered_candidates = sorted(candidates.values(), key=lambda item: (-item.score, item.repo_id))
+        # Preserve the overall pool bound while allowing genuinely new social IDs
+        # to reach heavy ranking rather than disappearing behind the ANN prefix.
+        base_quota = max(0, self.max_candidates - len(reserved_social))
         hybrid_ranked = sorted(
-            candidates.values(), key=lambda item: (-item.score, item.repo_id)
-        )[: self.max_candidates]
+            [item for item in ordered_candidates if item.repo_id not in reserved_social][:base_quota]
+            + [item for item in ordered_candidates if item.repo_id in reserved_social],
+            key=lambda item: (-item.score, item.repo_id),
+        )
         heavy_ranked: list[RankedRepository] | None = None
         fallback_code: str | None = None
         fallback_reason: str | None = None
@@ -1773,6 +1882,7 @@ class QdrantV2Retriever:
                 "score": item.score,
                 "final_score": item.score,
                 "source": item.source,
+                "retrieval_scores": item.retrieval_scores,
                 "primary_language": metadata.get(item.repo_id, {}).get(
                     "primary_language"
                 ),
@@ -1794,6 +1904,7 @@ class QdrantV2Retriever:
                 repo_id=str(item["repo_id"]),
                 score=round(float(item["final_score"]), 6),
                 source=str(item["source"]),
+                retrieval_scores=item.get("retrieval_scores", {}),
             )
             for item in shaped
         ]
@@ -1826,6 +1937,7 @@ class QdrantV2Retriever:
         generation_seed: str | None = None,
         cold_start: bool = False,
         social_repo_ids: list[str] | None = None,
+        social_candidates: list[SocialCandidate] | None = None,
     ) -> list[RankedRepository]:
         """Compatibility wrapper returning only the recommendation items."""
         return self.recommend_batch(
@@ -1835,6 +1947,7 @@ class QdrantV2Retriever:
             generation_seed,
             cold_start,
             social_repo_ids,
+            social_candidates,
         ).items
 
     @staticmethod
@@ -1974,6 +2087,8 @@ class QdrantV2Retriever:
             "heavy_ranker_model_version": self.heavy_model_version,
             "hybrid_fallback_model_version": self.hybrid_model_version,
             "ranking_counters": self._ranking_counter_snapshot(),
+            "social_candidate_mode": self.social_policy.mode,
+            "social_candidate_traffic_percent": self.social_policy.traffic_percent,
         }
         if self.ranker_error:
             health["heavy_ranker_error"] = self.ranker_error

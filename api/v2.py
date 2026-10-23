@@ -1047,17 +1047,19 @@ async def generate_recommendations(
     request: RecommendationRequest,
     http_request: Request,
 ):
+    arguments = (
+        str(request.user_id), request.limit,
+        [str(item) for item in request.exclude_repo_ids], str(request.generation_id),
+        request.context.cold_start, [str(item) for item in request.social_repo_ids],
+    )
+    if request.social_candidates:
+        arguments = (*arguments, request.social_candidates)
     try:
         batch = await run_read_only_request(
             http_request, recommendation_timeout_seconds(),
             lambda: run_recommendation_job(
                 retriever().recommend_batch,
-                str(request.user_id),
-                request.limit,
-                [str(item) for item in request.exclude_repo_ids],
-                str(request.generation_id),
-                request.context.cold_start,
-                [str(item) for item in request.social_repo_ids],
+                *arguments,
             ),
         )
     except HTTPException:

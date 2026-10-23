@@ -6,7 +6,7 @@ import threading
 from pydantic_core import to_json
 
 
-_CHANNELS = frozenset({"semantic", "trend", "activity", "popularity", "freshness"})
+_CHANNELS = frozenset({"semantic", "trend", "activity", "popularity", "freshness", "social"})
 _LIMIT = 2**63 - 1
 _lock = threading.Lock()
 _counts: Counter[tuple[str, str]] = Counter()

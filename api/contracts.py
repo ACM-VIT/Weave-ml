@@ -105,6 +105,9 @@ class RecommendationContext(StrictModel):
     )
 
 
+from retrieval.social_candidates import SocialCandidate, validate_social_candidates
+
+
 class RecommendationRequest(StrictModel):
     schema_version: Literal[2]
     generation_id: uuid.UUID
@@ -113,6 +116,12 @@ class RecommendationRequest(StrictModel):
     limit: int = Field(ge=1, le=100)
     exclude_repo_ids: list[uuid.UUID] = Field(default_factory=list, max_length=500)
     social_repo_ids: list[uuid.UUID] = Field(default_factory=list, max_length=500)
+    social_candidates: list[SocialCandidate] = Field(default_factory=list, max_length=100, json_schema_extra={"uniqueItems": True})
+
+    @field_validator("social_candidates")
+    @classmethod
+    def unique_social_evidence(cls, value: list[SocialCandidate]) -> list[SocialCandidate]:
+        return validate_social_candidates(value)
     context: RecommendationContext
 
     @field_validator("exclude_repo_ids", "social_repo_ids")
@@ -421,6 +430,10 @@ class RecommendationItem(StrictModel):
     repo_id: uuid.UUID
     score: float = Field(allow_inf_nan=False)
     source: ShortText
+    retrieval_scores: dict[
+        Annotated[str, StringConstraints(min_length=1, max_length=32, pattern=r"^[a-z_]+$")],
+        Annotated[float, Field(allow_inf_nan=False)],
+    ] = Field(default_factory=dict, max_length=16)
 
 
 class RecommendationContextStatus(StrictModel):
