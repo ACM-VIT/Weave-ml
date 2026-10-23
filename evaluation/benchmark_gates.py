@@ -207,11 +207,11 @@ def assess(report: dict, baseline: Baseline | MetricReference, policy: Policy, *
     if baseline.policy_sha256 != digest(policy):
         failures.append('baseline policy digest mismatch')
     compare_fields = ('snapshot_id', 'k')
-    if policy.embedding_comparison == 'cross_embedding':
+    if policy.embedding_comparison == 'cross_embedding' or isinstance(baseline, MetricReference):
         if (candidate.evaluation_dataset_sha256 is None or previous.evaluation_dataset_sha256 is None
                 or candidate.evaluation_dataset_sha256 != previous.evaluation_dataset_sha256):
-            failures.append('cross-embedding evaluation requires the identical verified raw source/profile/judgment/split dataset')
-    else:
+            failures.append('evaluation requires the identical verified raw source/profile/judgment/split dataset')
+    if policy.embedding_comparison != 'cross_embedding':
         compare_fields += ('bundle_sha256', 'embedding_sha256')
     for field in compare_fields:
         if getattr(candidate, field) != getattr(previous, field):
