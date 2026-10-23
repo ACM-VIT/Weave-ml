@@ -24,6 +24,7 @@ class AcquisitionRunResult:
 
 @dataclass(slots=True)
 class CorpusRunReport:
+    manifest_status: str = "not_requested"
     discovered: int = 0
     skipped_existing: int = 0
     duplicates_removed: int = 0
@@ -37,6 +38,7 @@ class CorpusRunReport:
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "manifest_status": self.manifest_status,
             "discovered": self.discovered,
             "skipped_existing": self.skipped_existing,
             "duplicates_removed": self.duplicates_removed,

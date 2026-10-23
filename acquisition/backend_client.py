@@ -5,11 +5,16 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 import json
+import logging
+import os
+from datetime import datetime, timezone
 import time
 from typing import Any
 import uuid
 
 import requests
+
+from .manifest import ManifestUnavailable, load_manifest, timestamp
 
 
 MAX_RECORDS = 100
@@ -52,6 +57,8 @@ class BackendIngestionClient:
         timeout: float = 30.0,
         max_retries: int = 3,
         session: requests.Session | None = None,
+        refresh_after_seconds: int | None = None,
+        manifest_transport: Any | None = None,
     ) -> None:
         self.base_url = str(base_url).strip().rstrip("/")
         self.internal_secret = str(internal_secret).strip()
@@ -64,7 +71,17 @@ class BackendIngestionClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self.session = session or requests.Session()
+        self.manifest_transport = manifest_transport
+        self._accepted_names: set[str] = set()
         self._accepted_count = 0
+        self.refresh_after_seconds = (
+            int(os.getenv("ACQUISITION_REFRESH_AFTER_SECONDS", "86400"))
+            if refresh_after_seconds is None else refresh_after_seconds
+        )
+        if type(self.refresh_after_seconds) is not int or not 1 <= self.refresh_after_seconds <= 2_592_000:
+            raise ValueError("refresh_after_seconds must be between 1 and 2592000")
+        self._manifest: dict[str, dict[str, Any]] | None = None
+        self.manifest_status = "not_requested"
 
     def verify_connection(self) -> bool:
         # Configuration validation is enough here; the first authenticated write
@@ -79,9 +96,20 @@ class BackendIngestionClient:
         return self._accepted_count
 
     def get_existing_repository_names(self) -> set[str]:
-        # Upsert is idempotent by immutable github_id. The backend contract does
-        # not currently expose a catalog-list endpoint to ingestion workers.
-        return set()
+        if self.manifest_status == "not_requested":
+            try:
+                self._manifest = load_manifest(self)
+                self.manifest_status = "available" if self._manifest else "empty"
+            except ManifestUnavailable:
+                self.manifest_status = "unavailable"
+                logging.getLogger(__name__).warning(
+                    "Backend corpus manifest unavailable; proceeding without inventory deduplication"
+                )
+        now = datetime.now(timezone.utc)
+        return self._accepted_names | {
+            item["full_name"] for item in (self._manifest or {}).values()
+            if 0 <= (now - timestamp(item["content_updated_at"])).total_seconds() < self.refresh_after_seconds
+        }
 
     def upsert_repositories_detailed(
         self, sources: list[Any]
@@ -127,6 +155,7 @@ class BackendIngestionClient:
                         raise ValueError("content_version must be an integer")
                     result.mappings[github_id] = dict(mapping)
                     result.succeeded.append(name)
+                    self._accepted_names.add(name.casefold())
                     mapped_names.add(name)
                 for name in names:
                     if name not in mapped_names:
