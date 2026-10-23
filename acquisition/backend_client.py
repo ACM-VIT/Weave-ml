@@ -284,6 +284,8 @@ def repository_upsert_record(source: Any) -> dict[str, Any]:
         "github_id": github_id,
         "github_node_id": github_node_id,
         "owner_github_id": owner_github_id,
+        **{field: payload[field] for field in ('is_fork', 'fork_parent_github_id',
+            'fork_family_github_id', 'lineage_source', 'lineage_observed_at') if field in payload},
         "full_name": full_name,
         "owner": owner,
         "name": name,

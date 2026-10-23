@@ -1,0 +1,47 @@
+{
+  "models": [
+    {
+      "document_prompt": "",
+      "dtype": "float32",
+      "instruction_aware": false,
+      "max_tokens": 256,
+      "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+      "name": "minilm-384",
+      "native_dimension": 384,
+      "normalize": true,
+      "output_dimension": 384,
+      "pooling": "mean",
+      "query_prompt": "",
+      "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+    },
+    {
+      "document_prompt": "",
+      "dtype": "float32",
+      "instruction_aware": true,
+      "max_tokens": 256,
+      "model_id": "Qwen/Qwen3-Embedding-0.6B",
+      "name": "qwen3-384",
+      "native_dimension": 1024,
+      "normalize": true,
+      "output_dimension": 384,
+      "pooling": "last_token",
+      "query_prompt": "Instruct: Given a developer interest profile, retrieve GitHub repositories relevant to the developer's skills, technologies, and intended project.\nQuery:",
+      "revision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
+    },
+    {
+      "document_prompt": "",
+      "dtype": "float32",
+      "instruction_aware": true,
+      "max_tokens": 256,
+      "model_id": "Qwen/Qwen3-Embedding-0.6B",
+      "name": "qwen3-1024",
+      "native_dimension": 1024,
+      "normalize": true,
+      "output_dimension": 1024,
+      "pooling": "last_token",
+      "query_prompt": "Instruct: Given a developer interest profile, retrieve GitHub repositories relevant to the developer's skills, technologies, and intended project.\nQuery:",
+      "revision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
+    }
+  ],
+  "schema_version": 1
+}
