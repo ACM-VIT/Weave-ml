@@ -23,9 +23,10 @@ def test_all_product_success_responses_have_explicit_wire_models():
         wire = response['content']['application/json']['schema']
         if path == '/api/v2/recommendations/generate':
             references = [choice['$ref'] for choice in wire['anyOf']]
-            assert len(references) == 3
+            assert len(references) == 4
             assert set(references) == {
                 '#/components/schemas/RecommendationResponse',
+                '#/components/schemas/ModelRecommendationResponse',
                 '#/components/schemas/CapturedRecommendationResponse',
                 '#/components/schemas/UnscoredEmptyRecommendationResponse',
             }

@@ -606,7 +606,7 @@ class RecommendationResponse(StrictModel):
     schema_version: Literal[2]
     generation_id: uuid.UUID
     user_id: uuid.UUID
-    feed_version: int = Field(ge=1)
+    feed_version: int = Field(strict=True, ge=1, le=2**53-1)
     model_version: str = Field(min_length=1, max_length=512)
     # Retrieval supports eight compatible 128-character identities plus the
     # mixed-version prefix and seven separating commas.
@@ -619,7 +619,6 @@ class RecommendationResponse(StrictModel):
     fallback_reason: str | None
     retrieval_mode: str
     context_status: RecommendationContextStatus
-    model_context: AppliedModelContext | None = None
     items: list[RecommendationItem] = Field(max_length=150)
 
     @field_validator("items")
@@ -628,6 +627,11 @@ class RecommendationResponse(StrictModel):
         if len({item.repo_id for item in value}) != len(value):
             raise ValueError("recommendation IDs must be unique")
         return value
+
+
+class ModelRecommendationResponse(RecommendationResponse):
+    feed_version: PositiveModelDecimal
+    model_context: AppliedModelContext
 
 
 from inference.scoring_provenance import ScoringContext, ScoredPacket, decode_owned_packet
@@ -661,6 +665,7 @@ class EmptyScoringStatus(StrictModel):
 
 
 class CapturedRecommendationResponse(RecommendationResponse):
+    model_context: AppliedModelContext | None = None
     model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
     feed_version: Annotated[str, StringConstraints(strict=True, pattern=r"^[1-9][0-9]{0,18}$")]
     scoring_capture: CapturedScoringStatus
@@ -694,6 +699,7 @@ class CapturedRecommendationResponse(RecommendationResponse):
 
 
 class UnscoredEmptyRecommendationResponse(RecommendationResponse):
+    model_context: AppliedModelContext | None = None
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     feed_version: Annotated[str, StringConstraints(strict=True, pattern=r"^[1-9][0-9]{0,18}$")]
     scoring_capture: EmptyScoringStatus
@@ -709,7 +715,7 @@ class UnscoredEmptyRecommendationResponse(RecommendationResponse):
         return value
 
 
-RecommendationWireResponse = RecommendationResponse | CapturedRecommendationResponse | UnscoredEmptyRecommendationResponse
+RecommendationWireResponse = RecommendationResponse | ModelRecommendationResponse | CapturedRecommendationResponse | UnscoredEmptyRecommendationResponse
 
 
 class FeedbackResponse(StrictModel):

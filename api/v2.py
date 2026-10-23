@@ -1221,8 +1221,9 @@ async def generate_recommendations(
             http_request, recommendation_timeout_seconds(),
             (lambda: run_recommendation_job(partial(_captured_recommendation_job, capture_job)))
             if capture_job is not None else (lambda: run_recommendation_job(
-                retriever().recommend_batch,
-                *arguments, **({"model_context": model_context} if model_context is not None else {}),
+                partial(retriever().recommend_batch, *arguments, model_context=model_context)
+            )) if model_context is not None else (lambda: run_recommendation_job(
+                retriever().recommend_batch, *arguments,
             )),
         )
     except HTTPException:

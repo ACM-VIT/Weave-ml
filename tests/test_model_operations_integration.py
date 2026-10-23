@@ -208,7 +208,8 @@ def test_two_devices_profile_order_dislike_and_sequential_retirement(runtime):
 from tests.test_scoring_provider import trained_ranker
 
 
-def test_actual_ann_and_captured_trained_tensor_use_identical_one_read_input(runtime,trained_ranker,monkeypatch):
+@pytest.mark.parametrize("capture", [True, False])
+def test_actual_ann_and_captured_trained_tensor_use_identical_one_read_input(runtime,trained_ranker,monkeypatch,capture):
     from fastapi.testclient import TestClient
     from api import main,v2
     import feedback.model_runtime as provider
@@ -253,9 +254,9 @@ def test_actual_ann_and_captured_trained_tensor_use_identical_one_read_input(run
     try:
         response=TestClient(main.app).post('/api/v2/recommendations/generate',headers={
             'x-internal-secret':'fixture-secret','x-scoring-capture-capability':'7'*64},json={
-            'schema_version':2,'user_id':uid(1),'generation_id':uid(3000),'feed_version':'1','limit':5,
+            'schema_version':2,'user_id':uid(1),'generation_id':uid(3000),'feed_version':'9007199254740993','limit':5,
             'exclude_repo_ids':[],'social_repo_ids':[],'context':{'cold_start':False},
-            'scoring_capture':{'schema_version':1,'encoding':'float32-le-v1'},'model_context':{
+            **({'scoring_capture':{'schema_version':1,'encoding':'float32-le-v1'}} if capture else {}),'model_context':{
             'schema_version':1,'session_id':uid(50),'epoch':'1','policy_sha256':p.sha256,
             'minimum_applied_operation_version':'3','required_profile_version':'1','as_of_ms':'3'}})
     finally:hook.remove()
@@ -265,11 +266,17 @@ def test_actual_ann_and_captured_trained_tensor_use_identical_one_read_input(run
     user_bytes=np.asarray(queries[0],dtype='<f4').tobytes()
     assert matrices and all(row[:384].astype('<f4').tobytes()==user_bytes for matrix in matrices for row in matrix)
     assert body['model_context']['effective_vector_sha256']==hashlib.sha256(user_bytes).hexdigest()
-    assert body['scoring_context']['user_vector_sha256']==hashlib.sha256(user_bytes).hexdigest()
+    assert body['feed_version']=='9007199254740993'
     assert body['model_context']['applied_operation_version']=='3'
-    parsed=CapturedRecommendationResponse.model_validate_json(response.content)
-    for item in parsed.items:
-        assert decode_owned_packet(item.scored_input,parsed.scoring_context,owner_user_id=uid(1),generation_id=uid(3000),repo_id=str(item.repo_id))[:1536]==user_bytes
+    if capture:
+        assert body['scoring_context']['user_vector_sha256']==hashlib.sha256(user_bytes).hexdigest()
+        parsed=CapturedRecommendationResponse.model_validate_json(response.content)
+        for item in parsed.items:
+            assert decode_owned_packet(item.scored_input,parsed.scoring_context,owner_user_id=uid(1),generation_id=uid(3000),repo_id=str(item.repo_id))[:1536]==user_bytes
+    else:
+        assert 'scoring_context' not in body and 'scoring_capture' not in body
+        from api.contracts import ModelRecommendationResponse
+        assert ModelRecommendationResponse.model_validate_json(response.content).feed_version=='9007199254740993'
 
 
 @pytest.mark.parametrize('runtime',[{'max_repositories':1}],indirect=True)
