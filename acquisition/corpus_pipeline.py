@@ -262,6 +262,10 @@ class CorpusPipeline:
             ]
             failed_names = list(outcome.failed)
             self.checkpoint.add_pending_persistence(failed_names)
+            # Move acknowledged work to the next retry owner before releasing
+            # persistence ownership. Any interruption/finally-save retains at
+            # least one stage, including callers that index locally.
+            self.checkpoint.add_pending_index([_source_name(source) for source in persisted])
             self.checkpoint.clear_pending_persistence(outcome.succeeded)
             for name, error in outcome.failed.items():
                 report.failures[name] = f"persistence: {error}"
@@ -270,15 +274,12 @@ class CorpusPipeline:
         else:
             persisted = list(sources)
 
-        persisted_names = [_source_name(source) for source in persisted]
         if not self.indexing_enabled:
             if database_ready:
-                self.checkpoint.add_pending_index(persisted_names)
                 self.checkpoint.save()
             return persisted
 
         if database_ready:
-            self.checkpoint.add_pending_index(persisted_names)
             self.checkpoint.save()
         succeeded, failed = self._index_sources(persisted)
         self.checkpoint.clear_pending_index(succeeded)

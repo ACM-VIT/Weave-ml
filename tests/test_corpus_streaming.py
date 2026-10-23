@@ -314,3 +314,28 @@ def test_interrupted_restart_records_current_progress_instead_of_previous_run(tm
     assert saved.pending_persistence == names[1:]
     if not cancel:
         assert names[1] in saved.data['last_run']['failures']
+
+
+@pytest.mark.parametrize('resume', [False, True])
+def test_interrupting_retry_stage_transition_never_loses_local_indexing_work(tmp_path, resume):
+    name = 'owner/accepted'
+    class InterruptedCheckpoint(CorpusCheckpoint):
+        def clear_pending_persistence(self, names):
+            super().clear_pending_persistence(names)
+            raise KeyboardInterrupt('interrupt after persistence retry is cleared')
+    checkpoint = InterruptedCheckpoint(tmp_path / 'state.json')
+    if resume:
+        checkpoint.add_pending_persistence([name])
+        checkpoint.save()
+    def acquire(*, on_batch, on_targets, **_):
+        on_targets([name])
+        on_batch(AcquisitionRunResult(repositories=[source(name)]))
+        return AcquisitionRunResult(discovered_count=1)
+    p = pipeline(tmp_path, acquire, Database(), checkpoint=checkpoint)
+    p.indexing_enabled = True
+    p.acquire_retries = lambda _: AcquisitionRunResult(repositories=[source(name)])
+    p.indexer = lambda _: pytest.fail('interruption must occur before indexing')
+    with pytest.raises(KeyboardInterrupt):
+        p.run(limit=1, batch_size=1, workers=1, min_readme_chars=1)
+    saved = CorpusCheckpoint(tmp_path / 'state.json')
+    assert saved.pending_index == [name], 'acknowledged local indexing work lost its durable retry owner'
