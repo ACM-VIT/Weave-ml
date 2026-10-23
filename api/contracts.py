@@ -50,6 +50,23 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
+class RequestValidationDetail(StrictModel):
+    path: str
+    message: str
+    type: str
+
+
+class RequestValidationResponse(StrictModel):
+    """Safe validation envelope emitted by the integrated application handler."""
+
+    detail: str
+    code: Literal["REQUEST_VALIDATION_FAILED"]
+    message: str
+    retryable: Literal[False]
+    request_id: uuid.UUID
+    details: list[RequestValidationDetail]
+
+
 def _utc(value: datetime, *, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() != timedelta(0):
         raise ValueError(f"{field_name} must be an ISO-8601 UTC timestamp")

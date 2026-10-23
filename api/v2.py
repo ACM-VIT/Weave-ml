@@ -25,6 +25,7 @@ from api.contracts import (
     RepositoryRefreshJob,
     RepositorySearchRequest,
     RepositorySearchResponse,
+    RequestValidationResponse,
 )
 from api.runtime import (
     ServiceCapacityError,
@@ -102,7 +103,9 @@ from utils.runtime_lifecycle import (
     RuntimeRetiringError, resume_runtime_admission, stop_runtime_admission,
 )
 
-router = APIRouter(prefix="/api/v2", tags=["v2"])
+router = APIRouter(prefix="/api/v2", tags=["v2"], responses={
+    422: {"model": RequestValidationResponse, "description": "Request validation failed"},
+})
 logger = logging.getLogger("pipeline.api.v2")
 
 

@@ -1,5 +1,6 @@
 """The documented wire contract must describe actual registered product routes."""
 from api.main import app
+import pytest
 
 PRODUCT_OPERATIONS = {
     '/api/v2/recommendations/generate': 200,
@@ -64,3 +65,21 @@ def test_recommendations_accept_the_full_supported_mixed_embedding_identity(monk
     assert response.status_code == 200, response.text
     assert response.json()['embedding_version'] == identity
     assert response.json()['embedding_versions'] == list(versions)
+
+
+@pytest.mark.parametrize('path', PRODUCT_OPERATIONS)
+def test_validation_contract_matches_integrated_application_errors(monkeypatch, path):
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv('INTERNAL_API_SECRET', 'isolated-validation-secret')
+    response = TestClient(app).post(path,
+        headers={'x-internal-secret': 'isolated-validation-secret'}, json={})
+    assert response.status_code == 422
+    body = response.json()
+    assert isinstance(body['detail'], str)
+    assert body['details'] and all(set(error) == {'path', 'message', 'type'} for error in body['details'])
+    assert response.headers['x-request-id'] == body['request_id']
+    published = app.openapi()['paths'][path]['post']['responses']['422']['content']['application/json']['schema']
+    assert published == {'$ref': '#/components/schemas/RequestValidationResponse'}
+    from api.contracts import RequestValidationResponse
+    assert RequestValidationResponse.model_validate(body).model_dump(mode='json') == body

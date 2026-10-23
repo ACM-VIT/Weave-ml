@@ -11,8 +11,8 @@ os.environ['INTERNAL_API_SECRET'] = 'local-contract-secret'
 os.environ['APP_ENV'] = 'development'
 
 import uvicorn
-from fastapi import FastAPI
 from api import v2
+from api.main import app
 from retrieval.v2_retriever import RankedRepository, RecommendationBatch
 
 
@@ -62,8 +62,6 @@ v2._refresh_repository_job = lambda request: {
 }
 v2._enqueue_feedback = feedback
 v2.retriever = lambda: SimpleNamespace(recommend_batch=recommend)
-app = FastAPI()
-app.include_router(v2.router)
 listener = socket.socket()
 listener.bind(('127.0.0.1', 0))
 listener.listen(128)
