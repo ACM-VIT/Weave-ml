@@ -14,6 +14,7 @@ import struct
 import sys
 import tempfile
 import zipfile
+import zlib
 
 import numpy as np
 
@@ -52,7 +53,7 @@ def decode_json(raw: bytes):
 
 def read_regular(path: Path, limit: int) -> bytes:
     """Read one bounded regular file without following its final symlink."""
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
     try:
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
@@ -79,6 +80,8 @@ def _npy(raw: bytes, *, metadata: bool = False) -> np.ndarray:
     if len(raw) < 10 or raw[:6] != b"\x93NUMPY" or raw[6:8] not in {b"\x01\x00", b"\x02\x00", b"\x03\x00"}:
         raise ValueError("unsupported NPY header")
     start = 10 if raw[6] == 1 else 12
+    if len(raw) < start:
+        raise ValueError("truncated NPY length field")
     header_size = struct.unpack("<H" if start == 10 else "<I", raw[8:start])[0]
     if header_size > 16384 or start + header_size > len(raw):
         raise ValueError("oversized or truncated NPY header")
@@ -146,23 +149,26 @@ def load_artifact(report_path: Path, registry_path: Path, fixture_path: Path) ->
     if type(report["cost"].get("shadow_artifact_bytes")) is not int or report["cost"]["shadow_artifact_bytes"] != len(raw):
         raise ValueError("artifact size differs from encoder report")
     expected = {"documents.npy", "queries.npy", "metadata_json.npy"}
-    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-        members = archive.infolist()
-        if len(members) != 3 or {m.filename for m in members} != expected:
-            raise ValueError("NPZ requires exactly three unique expected members")
-        if sum(m.file_size for m in members) > ARCHIVE_LIMIT:
-            raise ValueError("NPZ decompression budget exceeded")
-        arrays = {}
-        for member in members:
-            if member.flag_bits & 1 or member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
-                raise ValueError("unsupported NPZ compression/encryption")
-            if member.file_size > (METADATA_LIMIT * 4 + 16396 if member.filename == "metadata_json.npy" else ARCHIVE_LIMIT):
-                raise ValueError("NPZ member budget exceeded")
-            with archive.open(member) as source:
-                expanded = source.read(member.file_size + 1)
-            if len(expanded) != member.file_size:
-                raise ValueError("NPZ member expanded size mismatch")
-            arrays[member.filename] = _npy(expanded, metadata=member.filename == "metadata_json.npy")
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            members = archive.infolist()
+            if len(members) != 3 or {m.filename for m in members} != expected:
+                raise ValueError("NPZ requires exactly three unique expected members")
+            if sum(m.file_size for m in members) > ARCHIVE_LIMIT:
+                raise ValueError("NPZ decompression budget exceeded")
+            arrays = {}
+            for member in members:
+                if member.flag_bits & 1 or member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
+                    raise ValueError("unsupported NPZ compression/encryption")
+                if member.file_size > (METADATA_LIMIT * 4 + 16396 if member.filename == "metadata_json.npy" else ARCHIVE_LIMIT):
+                    raise ValueError("NPZ member budget exceeded")
+                with archive.open(member) as source:
+                    expanded = source.read(member.file_size + 1)
+                if len(expanded) != member.file_size:
+                    raise ValueError("NPZ member expanded size mismatch")
+                arrays[member.filename] = _npy(expanded, metadata=member.filename == "metadata_json.npy")
+    except (zlib.error, struct.error, EOFError) as exc:
+        raise ValueError("invalid compressed NPZ member") from exc
     metadata_raw = str(arrays["metadata_json.npy"].item()).encode()
     if len(metadata_raw) > METADATA_LIMIT:
         raise ValueError("metadata JSON budget exceeded")
