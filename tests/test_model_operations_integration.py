@@ -747,3 +747,31 @@ def test_genuine_genesis_process_death_after_cas_has_guard_before_any_ack_and_de
     with pytest.raises(OperationBytesConflict):runtime.consumer().run_once()
     assert runtime.qdrant.retrieve(runtime.settings.user_collection,ids=[uid(1)])==[]
     assert runtime.redis.xpending(runtime.stream.stream,runtime.stream.group)['pending']==1
+
+
+def test_dense_qdrant_float_mirrors_keep_canonical_history_exact_and_refuse_corruption(runtime):
+    import math,base64
+    from feedback.model_journal import _json,_unpack
+    values=[math.sin(index+1) for index in range(384)];length=math.sqrt(sum(x*x for x in values));dense=[x/length for x in values]
+    runtime.processor.profile_encoder=lambda _:dense
+    apply(runtime,wire(runtime.policy,'profile',1,profile_payload()))
+    snapshot=runtime.users.read(uid(1))
+    assert snapshot.state.baseline.vector==tuple(dense)
+    point=runtime.qdrant.retrieve(runtime.settings.user_collection,ids=[uid(1)],with_payload=True,with_vectors=True)[0]
+    assert base64.b64decode(point.payload['model_complete_base64'])==snapshot.complete
+    frozen=_json(snapshot.complete,runtime.users.limit)
+    expected=frozen['legacy']['payload']['preference_accumulator'];actual=point.payload['preference_accumulator']
+    assert expected==dense
+    assert any(a!=b for a,b in zip(actual,expected))  # Real server JSON roundtrip, not a fabricated tolerance test.
+    assert all(a in {b,math.nextafter(b,math.inf),math.nextafter(b,-math.inf)} for a,b in zip(actual,expected))
+    from copy import deepcopy
+    two_ulps=deepcopy(point)
+    two_ulps.payload['preference_accumulator'][0]=math.nextafter(math.nextafter(expected[0],math.inf),math.inf)
+    with pytest.raises(JournalConflict):runtime.users.decode_point(two_ulps,uid(1))
+    for key,value,error in [('profile_version',float(point.payload['profile_version']),JournalConflict),
+                            ('model_operation_version',True,JournalConflict),('model_journal_head','f'*64,JournalMissing)]:
+        altered_point=deepcopy(point);altered_point.payload[key]=value
+        with pytest.raises(error):runtime.users.decode_point(altered_point,uid(1))
+    altered=list(actual);altered[0]+=0.01
+    runtime.qdrant.set_payload(runtime.settings.user_collection,payload={'preference_accumulator':altered},points=[uid(1)],wait=True)
+    with pytest.raises(JournalConflict):runtime.users.read(uid(1))

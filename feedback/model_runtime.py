@@ -177,7 +177,8 @@ def main():
                 # Do not print payloads or acknowledge pending work. One failed
                 # user does not block new delivery/reclaim for another owner.
                 import logging
-                logging.getLogger(__name__).warning('model operation remains pending', extra={'error_type': type(exc).__name__}, exc_info=False)
+                logging.getLogger(__name__).warning('model operation remains pending (%s)', type(exc).__name__,
+                                                    extra={'error_type': type(exc).__name__}, exc_info=False)
                 stop.wait(0.1)
     finally:
         runtime.close()

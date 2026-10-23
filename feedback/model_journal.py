@@ -455,6 +455,35 @@ class QdrantRecords:
         return found
 
 
+def _mirrored_payload_matches(actual, expected, path=()):
+    """Compare the duplicated compatibility projection, not canonical history.
+
+    Qdrant's JSON binary64 roundtrip can return an adjacent representable value.
+    Only identified legacy float-vector leaves allow that one-nextafter change.
+    Model complete/base64/head bytes and every identity/counter stay exact.
+    """
+    if type(actual) is not type(expected):
+        return False
+    if type(expected) is dict:
+        return set(actual) == set(expected) and all(_mirrored_payload_matches(actual[key], value, path + (key,))
+                                                   for key, value in expected.items())
+    if type(expected) is list:
+        return len(actual) == len(expected) and all(_mirrored_payload_matches(a, b, path + (index,))
+                                                    for index, (a, b) in enumerate(zip(actual, expected)))
+    if type(expected) is float:
+        import math
+        if not math.isfinite(actual) or not math.isfinite(expected):
+            return False
+        if actual == expected:
+            return True
+        vector_leaf = (len(path) == 2 and path[0] in {
+            'preference_accumulator', 'profile_baseline_vector', 'feedback_latent_vector'} and type(path[-1]) is int)
+        delta_leaf = (len(path) == 5 and path[0] == 'feedback_adjustments' and path[-2] == 'delta'
+                      and type(path[-1]) is int)
+        return (vector_leaf or delta_leaf) and actual in {math.nextafter(expected, math.inf), math.nextafter(expected, -math.inf)}
+    return actual == expected
+
+
 class QdrantAtomicUsers:
     """One point CAS commits legacy vector/payload and full new state/head.
 
@@ -533,7 +562,8 @@ class QdrantAtomicUsers:
         body=_json(complete,self.limit); state=_unpack(body['state'])
         snapshot=Snapshot(user_id,state,payload.get('model_journal_head'),complete)
         vector,expected=self._point(snapshot)
-        if payload!=expected: raise JournalConflict('stored complete state/payload mismatch')
+        if not _mirrored_payload_matches(payload, expected):
+            raise JournalConflict('stored complete state/payload mismatch')
         actual = point.vector
         if isinstance(state, reducer.BootstrapState):
             if actual != {}:
