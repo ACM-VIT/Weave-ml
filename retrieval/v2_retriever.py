@@ -42,16 +42,25 @@ from embedding.vector_contract import (
     USER_PROFILE_COLLECTION_CONTRACT,
     user_point_id,
     validate_embedding_vector,
+    validate_diversity_metadata,
 )
-from inference.feed_assembly import FeedAssemblySystem
+from inference.feed_assembly import FeedAssemblySystem, DiversityUnavailableError
+from inference.diversity import DiversityPolicy
 from inference.feature_spec import FEATURE_ORDER
 from inference.ranker_service import RankerService
 from inference.runtime import RecommendationDeadlineExceeded, recommendation_timeout_seconds
-from retrieval.config import TOTAL_CANDIDATE_POOL
+from retrieval.candidate_vectors import InlineCandidateSnapshots
+from retrieval.config import DISCOVERY_LIMIT, TOTAL_CANDIDATE_POOL
 from retrieval.discovery_cache import DiscoveryRevision, PoolLease, SharedDiscoveryCache
 from retrieval.metrics import record_candidate_read
 from retrieval.runtime import RetrievalWork, validate_retrieval_runtime
-from utils.deadline import CooperativeDeadlineExceeded, check_deadline, current_deadline, qdrant_timeout
+from retrieval.social_candidates import (
+    SocialCandidate, SocialPolicy, lookup_social_ids, select_social_candidates,
+)
+from utils.deadline import (
+    CooperativeDeadlineExceeded, RequestDeadline, check_deadline, current_deadline,
+    deadline_scope, qdrant_timeout,
+)
 from scripts.user_onboarding import TARGET_VECTOR_NAME, USER_PROFILES_COLLECTION
 
 logger = logging.getLogger("pipeline.v2_retrieval")
@@ -68,6 +77,19 @@ _FALLBACK_MESSAGES = {
     "HEAVY_SCORING_FAILED": "heavy ranker scoring failed",
     "CANDIDATE_VECTORS_UNAVAILABLE": "retained candidate vectors are unavailable",
 }
+
+
+class _DiversityShadowDeadline(RequestDeadline):
+    """Optional CPU work has its own expiry and still observes parent cancellation."""
+
+    def __init__(self, seconds: float, parent: RequestDeadline | None):
+        self.parent = parent
+        super().__init__(seconds, clock=parent.clock if parent is not None else time.monotonic)
+
+    def remaining(self) -> float:
+        if self.parent is not None:
+            self.parent.remaining()
+        return super().remaining()
 
 _DISCOVERY_SOURCES = {
     "trend": "trending",
@@ -120,9 +142,11 @@ _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS = [
     "trend_velocity",
     "delta_7d",
     "primary_language",
+    "github_id", "owner_github_id", "is_fork", "fork_parent_github_id", "fork_family_github_id",
+    "lineage_source", "lineage_observed_at",
     "created_at",
 ]
-_HEAVY_RANKER_PAYLOAD_FIELDS = ["languages", "topics", "tags"]
+_HEAVY_RANKER_PAYLOAD_FIELDS = ["languages", "topics", "tags", "category"]
 
 
 class RetrievalDependencyError(RuntimeError):
@@ -134,6 +158,7 @@ class RankedRepository:
     repo_id: str
     score: float
     source: str
+    retrieval_scores: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +242,8 @@ class QdrantV2Retriever:
         allow_unqualified_ranker: bool | None = None,
         discovery_revision_provider: Callable[[], DiscoveryRevision | None] | None = None,
         discovery_cache: SharedDiscoveryCache | None = None,
+        social_policy: SocialPolicy | None = None,
+        candidate_vector_mode: str | None = None,
     ) -> None:
         validate_retrieval_runtime()
         self.qdrant_timeout_seconds = self._float_env(
@@ -237,6 +264,16 @@ class QdrantV2Retriever:
         self._discovery_cache_scope = uuid.uuid4().hex
         self._discovery_cache = discovery_cache or SharedDiscoveryCache()
         self.max_candidates = max(50, min(max_candidates, 2_000))
+        self.candidate_vector_mode = (
+            candidate_vector_mode if candidate_vector_mode is not None
+            else os.getenv("V2_CANDIDATE_VECTOR_MODE", "deferred")
+        ).strip().casefold()
+        if self.candidate_vector_mode not in {"deferred", "inline"}:
+            raise ValueError("V2_CANDIDATE_VECTOR_MODE must be deferred or inline")
+        self.social_policy = social_policy or SocialPolicy(
+            mode=os.getenv("V2_SOCIAL_CANDIDATE_MODE", "disabled").strip().casefold(),
+            traffic_percent=self._float_env("V2_SOCIAL_CANDIDATE_TRAFFIC_PERCENT", default=100., minimum=0., maximum=100.),
+        )
         self.app_env = os.getenv("APP_ENV", "development").strip().casefold()
         if assembler is None:
             assembler = FeedAssemblySystem(
@@ -360,6 +397,21 @@ class QdrantV2Retriever:
             raise ValueError(
                 "V2_HEAVY_RANKER_TRAFFIC_PERCENT must be 100 when the heavy ranker is required"
             )
+        self.diversity_mode = os.getenv('V2_DIVERSITY_MODE', 'disabled').strip().casefold()
+        if self.diversity_mode not in {'disabled', 'shadow', 'enabled'}:
+            raise ValueError('V2_DIVERSITY_MODE must be disabled, shadow or enabled')
+        self.diversity_traffic_percent = self._float_env('V2_DIVERSITY_TRAFFIC_PERCENT', default=0, minimum=0, maximum=100)
+        self.diversity_policy = DiversityPolicy(
+            relevance_weight=self._float_env('V2_DIVERSITY_RELEVANCE_WEIGHT', default=.7, minimum=0, maximum=1),
+            duplicate_cosine=self._float_env('V2_DIVERSITY_DUPLICATE_COSINE', default=.98, minimum=.01, maximum=1),
+            max_per_owner=self._int_env('V2_DIVERSITY_MAX_PER_OWNER', default=2, minimum=1),
+            max_per_topic=self._int_env('V2_DIVERSITY_MAX_PER_TOPIC', default=5, minimum=1),
+            max_per_category=self._int_env('V2_DIVERSITY_MAX_PER_CATEGORY', default=8, minimum=1),
+            max_per_fork_family=self._int_env('V2_DIVERSITY_MAX_PER_FAMILY', default=1, minimum=1),
+            minimum_exploration=self._int_env('V2_DIVERSITY_MIN_EXPLORATION', default=2, minimum=0),
+        )
+        if self.diversity_mode == 'enabled' and (not self.heavy_ranker_required or self.max_candidates > 150):
+            raise ValueError('Enabled diversity requires strict-heavy ranking with at most150 candidates')
         if allow_unqualified_ranker is None:
             allow_unqualified_ranker = self._boolean_env(
                 "V2_ALLOW_UNQUALIFIED_HEAVY_RANKER", default=True
@@ -375,6 +427,12 @@ class QdrantV2Retriever:
             "heavy_selected": 0,
             "heavy_served": 0,
             "hybrid_served": 0,
+            "social_shadow_candidates": 0,
+            "social_injected_candidates": 0,
+            "social_lookup_failures": 0,
+            "diversity_shadow_requests": 0, "diversity_served_requests": 0,
+            "diversity_unavailable_requests": 0, "diversity_unknown_candidates": 0,
+            "diversity_exploration_shortfall": 0, "diversity_search_exhausted": 0,
             **{f"fallback_{code.casefold()}": 0 for code in _FALLBACK_MESSAGES},
         }
         self.ranker: RankerService | None = None
@@ -577,6 +635,7 @@ class QdrantV2Retriever:
             if repo_id is None:
                 raise ValueError("repository identity is not canonical")
             payload = dict(point.payload or {})
+            validate_diversity_metadata(payload)
             revision = payload.get("embedding_model_revision")
             if (
                 payload.get(REPOSITORY_SERVING_ELIGIBILITY_FIELD)
@@ -749,6 +808,14 @@ class QdrantV2Retriever:
                 _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS + _HEAVY_RANKER_PAYLOAD_FIELDS
             ),
             with_vectors=[QDRANT_VECTOR_NAME],
+            **qdrant_timeout(self.qdrant_timeout_seconds),
+        )
+
+    def _fetch_social_candidates(self, repo_ids: list[str]) -> list[Any]:
+        return self.client.retrieve(
+            collection_name=self.repository_collection, ids=repo_ids,
+            with_payload=_REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS,
+            with_vectors=False,
             **qdrant_timeout(self.qdrant_timeout_seconds),
         )
 
@@ -1474,12 +1541,14 @@ class QdrantV2Retriever:
                 code = "INVALID_HEAVY_OUTPUT"
                 return None, code, _FALLBACK_MESSAGES[code]
             sources = {item.repo_id: item.source for item in ranked}
+            retrieval_scores = {item.repo_id: item.retrieval_scores for item in ranked}
             return (
                 [
                     RankedRepository(
                         repo_id=str(result["repo_id"]),
                         score=float(result["final_score"]),
                         source=sources[str(result["repo_id"])],
+                        retrieval_scores=retrieval_scores[str(result["repo_id"])],
                     )
                     for result in results
                 ],
@@ -1584,6 +1653,7 @@ class QdrantV2Retriever:
                 repo_id=item.repo_id,
                 score=item.score + boost if item.repo_id in boosted_ids else item.score,
                 source=item.source,
+                retrieval_scores=item.retrieval_scores,
             )
             for item in ranked
         ]
@@ -1600,6 +1670,7 @@ class QdrantV2Retriever:
         generation_seed: str | None = None,
         cold_start: bool = False,
         social_repo_ids: list[str] | None = None,
+        social_candidates: list[SocialCandidate] | None = None,
     ) -> RecommendationBatch:
         check_deadline()
         excluded = {str(uuid.UUID(item)) for item in exclude_repo_ids}
@@ -1611,20 +1682,58 @@ class QdrantV2Retriever:
         ] = {}
         budget = self._candidate_read_budget()
         heavy_selected = self._heavy_ranker_selected(user_id)
+        social_policy = self.social_policy.for_user(user_id)
+        diversity_cohort = int.from_bytes(hashlib.sha256(str(uuid.UUID(user_id)).encode()).digest()[:8], 'big') % 10000
+        diversity_selected = self.diversity_mode != 'disabled' and diversity_cohort < self.diversity_traffic_percent * 100
+        social_rows = social_candidates or []
+        social_ids = lookup_social_ids(social_rows, social_policy, excluded)
+        if social_policy.injects and social_ids:
+            social_ids = social_ids[:budget.reserve(len(social_ids))]
+        social_points: dict[str, _EligibleRepositoryPoint] = {}
+        # Inline is an explicit high-RTT alternative only for required-heavy.
+        # It never uses the shared discovery pool or a previous request's pair.
+        inline_vectors = bool(
+            self.candidate_vector_mode == "inline" and self.heavy_ranker_required
+            and heavy_selected and self.ranker is not None
+        )
+        snapshots = InlineCandidateSnapshots(
+            core_fields=_REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS,
+            extra_fields=_HEAVY_RANKER_PAYLOAD_FIELDS,
+            # Social reads were already reserved but are observed by the same
+            # request-local proof. Include them without increasing the RPC cap.
+            max_entries=max(1, min(20_000, budget.remaining + (len(social_ids) if social_policy.injects else 0))),
+        ) if inline_vectors else None
+        if snapshots is not None:
+            eligibility_cache = snapshots
         discovery_plan = _DiscoveryPlan(budget=budget)
         try:
             with RetrievalWork() as work:
                 profile_future = work.submit("profile", self._fetch_user_profile, user_id)
+                social_future = (work.submit("social", self._fetch_social_candidates, social_ids)
+                                 if social_policy.injects and social_ids else None)
+                # Validate the required profile before any vector-bearing
+                # repository RPC. Deferred mode retains its parallel overlap.
+                if inline_vectors:
+                    user_vector, user_profile = self._profile_from_points(
+                        user_id, work.result(profile_future),
+                    )
+                    if user_vector is None:
+                        self._record_ranking_result(
+                            heavy_selected=heavy_selected, ranker_applied=False,
+                            fallback_code="USER_VECTOR_UNAVAILABLE", served=False,
+                        )
+                        raise RetrievalDependencyError(
+                            "the required V2 heavy ranker needs a compatible user vector"
+                        )
                 self._prepare_discovery(
                     work, discovery_plan, max(limit * 8, 200),
-                    # Payload-first retrieval avoids transferring overlapping or
-                    # ultimately dropped repository vectors on every channel.
-                    include_vectors=False,
+                    include_vectors=inline_vectors,
                     exclude_repo_ids=excluded,
                 )
-                user_vector, user_profile = self._profile_from_points(
-                    user_id, work.result(profile_future),
-                )
+                if not inline_vectors:
+                    user_vector, user_profile = self._profile_from_points(
+                        user_id, work.result(profile_future),
+                    )
                 if self.heavy_ranker_required and not heavy_selected:
                     raise RetrievalDependencyError(
                         "the required V2 heavy ranker was not selected"
@@ -1645,7 +1754,7 @@ class QdrantV2Retriever:
                     try:
                         semantic = self._semantic(
                             user_vector, max(limit * 5, 100), eligibility_cache,
-                            include_vectors=False, exclude_repo_ids=excluded,
+                            include_vectors=inline_vectors, exclude_repo_ids=excluded,
                             minimum_candidates=limit, budget=budget,
                             work=work,
                         )
@@ -1665,21 +1774,59 @@ class QdrantV2Retriever:
                     for point, score in semantic:
                         repo_id = point.repo_id
                         if repo_id not in excluded and math.isfinite(score):
-                            candidates[repo_id] = RankedRepository(repo_id, score, "semantic")
+                            candidates[repo_id] = RankedRepository(repo_id, score, "semantic", {"semantic": score})
                             metadata[repo_id] = point.payload
                             vectors[repo_id] = point.vector
+
 
                 discovery: list[tuple[str, float, str, dict[str, Any], list[float] | None]] = []
                 try:
                     discovery_points = self._complete_discovery(
                         work, discovery_plan, max(limit * 8, 200), eligibility_cache,
-                        include_vectors=False, exclude_repo_ids=excluded,
+                        include_vectors=inline_vectors, exclude_repo_ids=excluded,
                         minimum_candidates=limit, existing_repo_ids=set(candidates),
                     )
                 except RetrievalDependencyError:
-                    if not candidates:
+                    if not candidates and not (social_policy.injects and social_future is not None):
                         raise
                     discovery_points = []
+                # Shadow evaluation cannot reserve reads needed by serving
+                # retrieval/refills. It may inspect only the remaining budget.
+                if social_policy.mode == 'shadow' and social_ids:
+                    social_ids = social_ids[:budget.reserve(len(social_ids))]
+                    if social_ids:
+                        social_future = work.submit("social", self._fetch_social_candidates, social_ids)
+                if social_future is not None:
+                    try:
+                        records = work.result(social_future)
+                    except CooperativeDeadlineExceeded:
+                        raise
+                    except Exception as exc:
+                        logger.warning("Social candidate lookup failed", extra={
+                            "retrieval_context": {"channel": "social", "error_type": type(exc).__name__},
+                        })
+                        with self._counter_lock:
+                            self._ranking_counters["social_lookup_failures"] = min(
+                                _COUNTER_LIMIT, self._ranking_counters["social_lookup_failures"] + 1,
+                            )
+                    else:
+                        requested = set(social_ids)
+                        seen_social = set()
+                        for record in records:
+                            point_id = str(getattr(record, "id", ""))
+                            if point_id not in requested:
+                                continue
+                            if point_id in seen_social:
+                                social_points.pop(point_id, None)
+                                continue
+                            seen_social.add(point_id)
+                            point = self._eligible_repository_point(
+                                record, snapshots if social_policy.injects else None, require_vector=False,
+                            )
+                            if point is not None and point.repo_id not in excluded:
+                                social_points[point.repo_id] = point
+                        record_candidate_read("social", records, len(social_points))
+
         finally:
             self._release_discovery(discovery_plan)
         for point, channel_source in discovery_points:
@@ -1711,19 +1858,104 @@ class QdrantV2Retriever:
                 combined += current.score
             if math.isfinite(combined):
                 candidates[repo_id] = RankedRepository(
-                    repo_id, combined, current.source if current else source
+                    repo_id, combined, current.source if current else source,
+                    {**(current.retrieval_scores if current else {}), source: score},
                 )
                 metadata[repo_id] = payload
                 vectors[repo_id] = vector or vectors.get(repo_id)
 
+        # Do not attach social evidence to a different content/feature snapshot.
+        compatible_social = {
+            repo_id for repo_id, point in social_points.items()
+            if repo_id not in metadata or all(
+                metadata[repo_id].get(key) == point.payload.get(key)
+                for key in _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS
+            )
+        }
+        selected_social = select_social_candidates(
+            social_rows, social_policy, eligible_repo_ids=compatible_social, excluded=excluded,
+        )[:self.max_candidates]
+        reserved_social = set()
+        if selected_social:
+            key = "social_injected_candidates" if social_policy.injects else "social_shadow_candidates"
+            with self._counter_lock:
+                self._ranking_counters[key] = min(_COUNTER_LIMIT, self._ranking_counters[key] + len(selected_social))
+        if social_policy.injects:
+            maximum = max((row.fusion_score for row in selected_social), default=1.)
+            for row in selected_social:
+                current = candidates.get(row.repo_id)
+                if current is None:
+                    candidates[row.repo_id] = RankedRepository(
+                        row.repo_id, .15 * row.fusion_score / maximum,
+                        row.primary_source, row.source_scores,
+                    )
+                    metadata[row.repo_id] = social_points[row.repo_id].payload
+                    vectors[row.repo_id] = None
+                else:
+                    candidates[row.repo_id] = RankedRepository(
+                        current.repo_id, current.score, current.source,
+                        {**current.retrieval_scores, **row.source_scores},
+                    )
+                reserved_social.add(row.repo_id)
+
+        if snapshots is not None:
+            if snapshots.overflowed:
+                raise RetrievalDependencyError("inline candidate snapshot bound exceeded")
+            # A later conflicting or invalid observation invalidates every
+            # contribution from that canonical ID, regardless of channel order.
+            for repo_id in snapshots.conflicts:
+                candidates.pop(repo_id, None)
+                metadata.pop(repo_id, None)
+                vectors.pop(repo_id, None)
+                reserved_social.discard(repo_id)
         check_deadline()
+        ordered_candidates = sorted(candidates.values(), key=lambda item: (-item.score, item.repo_id))
+        # Preserve the overall pool bound while allowing genuinely new social IDs
+        # to reach heavy ranking rather than disappearing behind the ANN prefix.
+        reserved_pool = set(reserved_social)
+        if diversity_selected and self.diversity_mode == 'enabled':
+            # Reserve bounded discovery breadth, not exactly the minimum:
+            # those first few choices can conflict by family or cosine once
+            # fresh vectors arrive. Reuse the existing 20 discovery allowance.
+            # No extra vector reads or larger ranker pool are authorized here.
+            required = max(0, min(limit, self.diversity_policy.minimum_exploration))
+            semantic = next((item for item in ordered_candidates if item.source == 'semantic'), None)
+            capacity = self.max_candidates - int(semantic is not None)
+            if required > capacity:
+                raise RetrievalDependencyError(
+                    'Configured diversity exploration quota is incompatible with the personalized candidate floor'
+                )
+            independent = [item for item in ordered_candidates if item.source != 'semantic']
+            # Already reserved social IDs cannot consume the discovery breadth;
+            # overlapping identities are counted once by the reservation set.
+            independent = ([item for item in independent if item.repo_id not in reserved_social]
+                           + [item for item in independent if item.repo_id in reserved_social])
+            breadth = min(max(DISCOVERY_LIMIT, required), capacity)
+            reserved_pool = {semantic.repo_id} if semantic is not None else set()
+            reserved_pool.update(item.repo_id for item in independent[:breadth])
+            # Preserve existing social reservations wherever the common cap
+            # permits. Enabled diversity gives discovery breadth and a present
+            # personalized candidate precedence in tiny/full-social pools.
+            for item in ordered_candidates:
+                if item.repo_id in reserved_social and len(reserved_pool) < self.max_candidates:
+                    reserved_pool.add(item.repo_id)
+        base_quota = max(0, self.max_candidates - len(reserved_pool))
         hybrid_ranked = sorted(
-            candidates.values(), key=lambda item: (-item.score, item.repo_id)
-        )[: self.max_candidates]
+            [item for item in ordered_candidates if item.repo_id not in reserved_pool][:base_quota]
+            + [item for item in ordered_candidates if item.repo_id in reserved_pool],
+            key=lambda item: (-item.score, item.repo_id),
+        )
         heavy_ranked: list[RankedRepository] | None = None
         fallback_code: str | None = None
         fallback_reason: str | None = None
-        if include_candidate_vectors:
+        if include_candidate_vectors and not (
+            snapshots is not None and all(
+                snapshots.has_pair(item.repo_id) and vectors.get(item.repo_id) is not None
+                for item in hybrid_ranked
+            )
+        ):
+            # Metadata-only social IDs and any missing pair retain the full
+            # fresh hydration path rather than borrowing a vector by identity.
             try:
                 hybrid_ranked, vectors = self._hydrate_retained_candidates(
                     hybrid_ranked, metadata,
@@ -1777,9 +2009,17 @@ class QdrantV2Retriever:
                 "score": item.score,
                 "final_score": item.score,
                 "source": item.source,
+                "retrieval_scores": item.retrieval_scores,
                 "primary_language": metadata.get(item.repo_id, {}).get(
                     "primary_language"
                 ),
+                "owner_github_id": metadata.get(item.repo_id, {}).get('owner_github_id'),
+                "fork_family_github_id": metadata.get(item.repo_id, {}).get('fork_family_github_id'),
+                "topics": metadata.get(item.repo_id, {}).get('topics') or [],
+                "category": metadata.get(item.repo_id, {}).get('category'),
+                "candidate_bucket": ('personalized' if item.source == 'semantic' else
+                    'adjacent' if 'adjacent_interest' in item.retrieval_scores else
+                    'trending' if item.source == 'trending' else 'exploration'),
                 "created_at": metadata.get(item.repo_id, {}).get("created_at"),
             }
             for item in ranked
@@ -1793,11 +2033,55 @@ class QdrantV2Retriever:
             target_size=limit,
             input_is_unique=True,
         )
+        if diversity_selected:
+            def count(name, amount=1):
+                with self._counter_lock:
+                    self._ranking_counters[name] = min(_COUNTER_LIMIT, self._ranking_counters[name] + amount)
+            def report(result):
+                count('diversity_unknown_candidates', result.unknown_identity)
+                count('diversity_exploration_shortfall', result.exploration_shortfall)
+                count('diversity_search_exhausted', int(result.quota_search_exhausted))
+            if self.diversity_mode == 'shadow':
+                count('diversity_shadow_requests')
+            if not ranker_applied or len(assembly_input) > 150:
+                count('diversity_unavailable_requests')
+                if self.diversity_mode == 'enabled':
+                    raise RetrievalDependencyError('Configured diversity requires qualified vector candidates')
+            else:
+                parent = current_deadline()
+                shadow_seconds = min(.01, parent.remaining() - .05) if parent is not None else .01
+                if self.diversity_mode == 'shadow' and shadow_seconds <= 0:
+                    # Preserve a return margin instead of spending the final
+                    # request budget on diagnostics after the baseline is ready.
+                    count('diversity_unavailable_requests')
+                else:
+                    optional = _DiversityShadowDeadline(shadow_seconds, parent) if self.diversity_mode == 'shadow' else None
+                    try:
+                        with deadline_scope(optional) if optional is not None else nullcontext():
+                            diverse = self.assembler.shape_batch(
+                                assembly_input, seen_repo_ids=excluded, generation_id=generation_seed,
+                                target_size=limit, input_is_unique=True, diversity_policy=self.diversity_policy,
+                                diversity_vectors=vectors, diversity_seed=generation_seed or user_id,
+                                diversity_report=report,
+                            )
+                        if self.diversity_mode == 'enabled':
+                            shaped = diverse
+                            count('diversity_served_requests')
+                    except (CooperativeDeadlineExceeded, ValueError, DiversityUnavailableError) as exc:
+                        count('diversity_unavailable_requests')
+                        if self.diversity_mode == 'enabled':
+                            if isinstance(exc, CooperativeDeadlineExceeded):
+                                raise
+                            raise RetrievalDependencyError('Configured diversity metadata or exploration is unavailable') from exc
+                    # Child expiry never cancels the parent; real request
+                    # cancellation/expiry must nevertheless remain authoritative.
+                    check_deadline()
         items = [
             RankedRepository(
                 repo_id=str(item["repo_id"]),
                 score=round(float(item["final_score"]), 6),
                 source=str(item["source"]),
+                retrieval_scores=item.get("retrieval_scores", {}),
             )
             for item in shaped
         ]
@@ -1830,6 +2114,7 @@ class QdrantV2Retriever:
         generation_seed: str | None = None,
         cold_start: bool = False,
         social_repo_ids: list[str] | None = None,
+        social_candidates: list[SocialCandidate] | None = None,
     ) -> list[RankedRepository]:
         """Compatibility wrapper returning only the recommendation items."""
         return self.recommend_batch(
@@ -1839,6 +2124,7 @@ class QdrantV2Retriever:
             generation_seed,
             cold_start,
             social_repo_ids,
+            social_candidates,
         ).items
 
     @staticmethod
@@ -1971,6 +2257,8 @@ class QdrantV2Retriever:
             "allow_missing_embedding_revision": self.allow_missing_embedding_revision,
             "minimum_eligible_repository_points": self.minimum_eligible_repositories,
             "heavy_ranker_enabled": self.heavy_ranker_enabled,
+            "diversity_mode": self.diversity_mode,
+            "diversity_traffic_percent": self.diversity_traffic_percent,
             "heavy_ranker_required": self.heavy_ranker_required,
             "heavy_ranker_ready": self.ranker is not None,
             "heavy_ranker_production_qualified": self.heavy_ranker_production_qualified,
@@ -1978,6 +2266,8 @@ class QdrantV2Retriever:
             "heavy_ranker_model_version": self.heavy_model_version,
             "hybrid_fallback_model_version": self.hybrid_model_version,
             "ranking_counters": self._ranking_counter_snapshot(),
+            "social_candidate_mode": self.social_policy.mode,
+            "social_candidate_traffic_percent": self.social_policy.traffic_percent,
         }
         if self.ranker_error:
             health["heavy_ranker_error"] = self.ranker_error

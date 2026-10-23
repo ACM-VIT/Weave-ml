@@ -52,7 +52,7 @@ query SearchRepositories($query: String!, $first: Int!, $after: String) {
 """
 
 
-def build_batch_metadata_query(repos: list[tuple[str, str]], *, projection: str = "legacy") -> str:
+def build_batch_metadata_query(repos: list[tuple[str, str]], *, projection: str = "legacy", include_lineage: bool = False) -> str:
     """Ultra-lean batch query — metadata + topics + languages only.
     NO readme fields: readme text can be 30KB+ per repo and causes 502 in batches.
     READMEs are fetched separately via individual queries."""
@@ -63,6 +63,7 @@ def build_batch_metadata_query(repos: list[tuple[str, str]], *, projection: str 
     # Local SQL persistence consumes pullRequests; raw legacy callers retain
     # homepageUrl too. Neither field is sent by repository_upsert_record.
     legacy_fields = "homepageUrl\n    pullRequests(states: OPEN) { totalCount }" if projection == "legacy" else ""
+    lineage_fields = FORK_LINEAGE_FIELDS if include_lineage else ""
     parts = ["query GetBatchMetadata {"]
     for i, (owner, name) in enumerate(repos):
         alias = f"repo_{i}"
@@ -82,6 +83,7 @@ def build_batch_metadata_query(repos: list[tuple[str, str]], *, projection: str 
     pushedAt
     stargazerCount
     forkCount
+    {lineage_fields}
     owner {{
       login
       __typename
@@ -337,3 +339,12 @@ def build_readme_manifest_query(commit_oid: str) -> str:
         f"{fields}\n"
         "  }\n  rateLimit { cost remaining resetAt }\n}"
     )
+
+
+# Bounded observed ancestry only; a truncated chain is explicitly unknown.
+FORK_LINEAGE_FIELDS = "isFork"
+for _depth in range(4):
+    FORK_LINEAGE_FIELDS = "isFork parent { databaseId " + FORK_LINEAGE_FIELDS + " }"
+
+def repository_metadata_query(*, include_lineage: bool = False) -> str:
+    return GET_REPOSITORY_QUERY.replace('    forkCount', '    forkCount\n    ' + FORK_LINEAGE_FIELDS, 1) if include_lineage else GET_REPOSITORY_QUERY
