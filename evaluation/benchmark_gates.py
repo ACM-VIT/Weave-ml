@@ -23,6 +23,20 @@ SAFETY = {'repeat_rate', 'excluded_rate', 'archived_rate'}
 COUNTS = {'profiles', 'quality_profiles', 'returned', 'unjudged_returned', 'similarity_pairs', 'latency_samples'}
 
 
+def _validate_metric_values(metrics):
+    for name, value in metrics.items():
+        if value is None:
+            continue
+        if name == 'intra_list_similarity':
+            if not -1 <= value <= 1:
+                raise ValueError('invalid cosine metric')
+        elif name in {'novelty_bits', 'latency_p50_ms', 'latency_p95_ms'}:
+            if value < 0:
+                raise ValueError('invalid negative metric')
+        elif not 0 <= value <= 1:
+            raise ValueError('ratio metric must be between zero and one')
+
+
 class StageReport(StrictModel):
     metrics: dict[str, Number | None]
     counts: dict[str, Annotated[int, Field(ge=0)]]
@@ -36,17 +50,7 @@ class StageReport(StrictModel):
             raise ValueError('report has inconsistent profile/latency counts')
         if self.counts['quality_profiles'] > self.counts['profiles'] or self.counts['unjudged_returned'] > self.counts['returned']:
             raise ValueError('report has inconsistent quality/judgment counts')
-        for name, value in self.metrics.items():
-            if value is None:
-                continue
-            if name == 'intra_list_similarity':
-                if not -1 <= value <= 1:
-                    raise ValueError('invalid cosine metric')
-            elif name in {'novelty_bits', 'latency_p50_ms', 'latency_p95_ms'}:
-                if value < 0:
-                    raise ValueError('invalid negative metric')
-            elif not 0 <= value <= 1:
-                raise ValueError('ratio metric must be between zero and one')
+        _validate_metric_values(self.metrics)
         return self
 
 
@@ -105,6 +109,59 @@ class Baseline(StrictModel):
         return self
 
 
+class ExpectedMetricStage(StrictModel):
+    """Curated scalar expectations only, without a generated execution report."""
+    metrics: dict[str, Number | None]
+
+    @model_validator(mode='after')
+    def complete(self):
+        if set(self.metrics) != set(DIRECTIONS):
+            raise ValueError('metric reference requires every metric, including explicit unknowns')
+        _validate_metric_values(self.metrics)
+        return self
+
+
+class ReferenceArtifact(StrictModel):
+    model_sha256: Digest
+    scaler_sha256: Digest
+    feature_schema: Text
+    timing_kind: Literal['measured']
+    accepted_artifact_commit: Commit
+    measurement_runner_commit: Commit
+    measurement_source_manifest_sha256: Digest
+    measurement_source_dirty: bool
+
+
+class MetricReference(StrictModel):
+    """Reviewed diagnostic test input; it can never be a promoted baseline."""
+    format: Literal['curated-metric-reference-v1']
+    schema_version: Literal[1]
+    status: Literal['diagnostic']
+    reference: Text
+    policy_sha256: Digest
+    snapshot_id: Text
+    k: Annotated[int, Field(ge=1, le=1000)]
+    bundle_sha256: Digest
+    evaluation_dataset_sha256: Digest
+    embedding_sha256: Digest
+    provenance: Provenance
+    artifact: ReferenceArtifact
+    reference_run_sha256: Digest
+    stages: dict[Literal['retrieval', 'ranking', 'assembly'], ExpectedMetricStage]
+
+    @model_validator(mode='after')
+    def complete(self):
+        if set(self.stages) != set(STAGES):
+            raise ValueError('metric reference requires all stages')
+        return self
+
+
+def load_baseline(value) -> Baseline | MetricReference:
+    if isinstance(value, dict) and value.get('format') == 'curated-metric-reference-v1':
+        return MetricReference.model_validate(value)
+    return Baseline.model_validate(value)
+
+
 class Rule(StrictModel):
     stage: Literal['retrieval', 'ranking', 'assembly']
     metric: str
@@ -142,10 +199,10 @@ class Policy(StrictModel):
         return self
 
 
-def assess(report: dict, baseline: Baseline, policy: Policy, *, qualify: bool = False) -> dict:
+def assess(report: dict, baseline: Baseline | MetricReference, policy: Policy, *, qualify: bool = False) -> dict:
     """Check evidence against an explicitly selected baseline; never promote it."""
     candidate = Report.model_validate(report)
-    previous = baseline.report
+    previous = baseline.report if isinstance(baseline, Baseline) else baseline
     failures = []
     if baseline.policy_sha256 != digest(policy):
         failures.append('baseline policy digest mismatch')
@@ -186,6 +243,8 @@ def assess(report: dict, baseline: Baseline, policy: Policy, *, qualify: bool = 
         failures.extend(f'{name}: {reason}' for reason in reasons)
         checks.append({'gate': name, 'value': value, 'baseline': old, 'passed': not reasons})
     if qualify:
+        if isinstance(baseline, MetricReference):
+            failures.append('summary-only diagnostic metric references cannot qualify a production model')
         if policy.embedding_comparison == 'cross_embedding' and candidate.artifact.manifest_sha256 is None:
             failures.append('cross-embedding qualification requires the exact candidate compatibility manifest')
         if candidate.provenance.kind == 'synthetic' or previous.provenance.kind == 'synthetic':
@@ -220,7 +279,7 @@ def assess(report: dict, baseline: Baseline, policy: Policy, *, qualify: bool = 
             'report_sha256': digest(candidate), 'baseline_sha256': digest(baseline), 'policy_sha256': digest(policy)}
 
 
-def qualification_manifest(report: dict, baseline: Baseline, policy: Policy) -> dict:
+def qualification_manifest(report: dict, baseline: Baseline | MetricReference, policy: Policy) -> dict:
     """Bind passing evidence for human review, without changing serving artifacts."""
     parsed = Report.model_validate(report)
     assessment = assess(report, baseline, policy, qualify=True)

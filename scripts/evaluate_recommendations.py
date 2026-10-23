@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 import tempfile
 
-from evaluation.benchmark_gates import Baseline, Policy, assess, qualification_manifest
+from evaluation.benchmark_gates import Baseline, Policy, assess, qualification_manifest, load_baseline
 from evaluation.embedding_artifacts import read_regular, decode_json
 from evaluation.recommendation_benchmark import Bundle, Run, evaluate
 
@@ -89,7 +89,7 @@ def main(argv=None):
             local_stage_replay = True
         else:
             run = Run.model_validate(raw_run)
-        baseline = Baseline.model_validate(read_json(args.baseline))
+        baseline = load_baseline(read_json(args.baseline))
         policy = Policy.model_validate(read_json(args.policy))
         report = evaluate(bundle, run, k=policy.k)
         assessment = assess(report, baseline, policy, qualify=args.qualify)
