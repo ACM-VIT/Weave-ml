@@ -3,6 +3,9 @@
 import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+from database.schema_readiness import (
+    LEGACY_TRENDING_COLUMNS, LEGACY_TRENDING_METADATA_COLUMNS, SchemaCompatibilityError,
+)
 import pytest
 
 from trending.config import DATABASE_URL
@@ -88,8 +91,8 @@ class TestInitSchema:
         # Should not raise error, just log warning
         storage.init_schema()
 
-    def test_init_schema_creates_tables(self, mock_database_connector):
-        """Test that schema initialization creates tables."""
+    def test_init_schema_validates_tables_without_ddl(self, mock_database_connector):
+        """Legacy initialization reads metadata and leaves migrations to owners."""
         storage = TrendingStorage()
         storage.connector = mock_database_connector
         storage.enabled = True
@@ -98,15 +101,19 @@ class TestInitSchema:
         mock_cursor = MagicMock()
         mock_database_connector.connect.return_value = mock_conn
         mock_conn.cursor.return_value = mock_cursor
+        mock_cursor.fetchall.side_effect = [
+            [(name, expected.replace('varchar', 'character varying')) for name, expected in columns.items()]
+            for columns in (LEGACY_TRENDING_COLUMNS, LEGACY_TRENDING_METADATA_COLUMNS)
+        ]
         
         storage.init_schema()
         
-        # Verify table creation queries were executed
-        assert mock_cursor.execute.call_count >= 2
-        assert mock_conn.commit.call_count >= 2
+        assert mock_cursor.execute.call_count == 2
+        assert all(call.args[0].startswith('SELECT ') for call in mock_cursor.execute.call_args_list)
+        mock_conn.commit.assert_called_once()
 
-    def test_init_schema_handles_index_creation_failure(self, mock_database_connector):
-        """Test that index creation failures don't break schema init."""
+    def test_init_schema_fails_readiness_instead_of_repairing_missing_tables(self, mock_database_connector):
+        """A missing owner-managed schema fails before any write can proceed."""
         storage = TrendingStorage()
         storage.connector = mock_database_connector
         storage.enabled = True
@@ -116,16 +123,12 @@ class TestInitSchema:
         mock_database_connector.connect.return_value = mock_conn
         mock_conn.cursor.return_value = mock_cursor
         
-        # Make index creation fail
-        execute_call_count = [0]
-        def execute_side_effect(query, params=None):
-            execute_call_count[0] += 1
-            if execute_call_count[0] > 2:  # After table creation
-                raise Exception("Index creation failed")
-        mock_cursor.execute.side_effect = execute_side_effect
-        
-        # Should not raise error
-        storage.init_schema()
+        mock_cursor.fetchall.return_value = []
+        with pytest.raises(SchemaCompatibilityError, match='owner-managed migrations'):
+            storage.init_schema()
+        assert mock_cursor.execute.call_count == 1
+        mock_conn.rollback.assert_called_once()
+        mock_conn.commit.assert_not_called()
 
 
 @pytest.mark.unit

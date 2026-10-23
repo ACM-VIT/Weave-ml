@@ -13,6 +13,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from database.connector import PostgreSQLConnector
+from database.schema_readiness import (
+    LEGACY_TRENDING_COLUMNS, LEGACY_TRENDING_METADATA_COLUMNS, validate_table_schema,
+)
 
 import trending.config as config
 from .logger import get_logger
@@ -44,84 +47,19 @@ class TrendingStorage:
             )
 
     def init_schema(self) -> None:
-        """Initialize database schema for trending repositories.
-
-        Creates two tables:
-        1. trending_repositories - Stores trending repository data
-        2. trending_metadata - Stores metadata like last refresh timestamp
-        """
+        """Retained legacy API: validate owner-provisioned tables without DDL."""
         if not self.enabled:
-            logger.warning("Skipping schema initialization: database not enabled.")
+            logger.warning("Skipping schema readiness: database not enabled.")
             return
-
-        logger.info("Initializing trending repository schema...")
         conn = None
         try:
             conn = self.connector.connect()
             cursor = conn.cursor()
-
-            # Create trending_repositories table
-            create_repos_table = f"""
-            CREATE TABLE IF NOT EXISTS {config.TRENDING_TABLE_NAME} (
-                repo_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                full_name VARCHAR(255) NOT NULL UNIQUE,
-                name VARCHAR(200) NOT NULL,
-                owner VARCHAR(100) NOT NULL,
-                url VARCHAR(500) NOT NULL,
-                description TEXT,
-                star_count INT DEFAULT 0,
-                daily_stars INT DEFAULT 0,
-                fork_count INT DEFAULT 0,
-                created_at TIMESTAMP,
-                pushed_at TIMESTAMP,
-                primary_language VARCHAR(50),
-                topics JSONB DEFAULT '[]'::jsonb,
-                readme TEXT,
-                default_branch VARCHAR(100),
-                first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                trending_rank INT
-            );
-            """
-            cursor.execute(create_repos_table)
+            validate_table_schema(cursor, config.TRENDING_TABLE_NAME, LEGACY_TRENDING_COLUMNS)
+            validate_table_schema(cursor, config.TRENDING_METADATA_TABLE_NAME, LEGACY_TRENDING_METADATA_COLUMNS)
             conn.commit()
-            logger.info(f"Table '{config.TRENDING_TABLE_NAME}' created or verified.")
-            logger.info("Note: star_count represents Total Lifetime Stars, daily_stars represents stars gained today.")
-
-            # Create trending_metadata table
-            create_metadata_table = f"""
-            CREATE TABLE IF NOT EXISTS {config.TRENDING_METADATA_TABLE_NAME} (
-                key VARCHAR(100) PRIMARY KEY,
-                value TEXT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-            cursor.execute(create_metadata_table)
-            conn.commit()
-            logger.info(f"Table '{config.TRENDING_METADATA_TABLE_NAME}' created or verified.")
-
-            # Create indexes for better query performance
-            indexes = [
-                f"CREATE INDEX IF NOT EXISTS idx_{config.TRENDING_TABLE_NAME}_star_count "
-                f"ON {config.TRENDING_TABLE_NAME}(star_count DESC);",
-                f"CREATE INDEX IF NOT EXISTS idx_{config.TRENDING_TABLE_NAME}_last_seen_at "
-                f"ON {config.TRENDING_TABLE_NAME}(last_seen_at DESC);",
-                f"CREATE INDEX IF NOT EXISTS idx_{config.TRENDING_TABLE_NAME}_primary_language "
-                f"ON {config.TRENDING_TABLE_NAME}(primary_language);",
-            ]
-
-            for index_query in indexes:
-                try:
-                    cursor.execute(index_query)
-                    conn.commit()
-                except Exception as exc:
-                    logger.warning(f"Failed to create index: {exc}")
-                    conn.rollback()
-
-            logger.info("Trending repository schema initialized successfully.")
-
-        except Exception as exc:
-            logger.error(f"Failed to initialize trending schema: {exc}")
+            logger.info("Legacy trending schema is compatible; no schema changes performed.")
+        except Exception:
             if conn:
                 conn.rollback()
             raise
