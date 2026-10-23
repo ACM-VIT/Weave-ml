@@ -165,6 +165,11 @@ class CorpusPipeline:
 
                 def consume(acquired: AcquisitionRunResult) -> None:
                     nonlocal enriched_count, persisted_count
+                    self.checkpoint.add_pending_persistence([
+                        *[_source_name(source) for source in acquired.repositories],
+                        *[failure.repository for failure in acquired.failures],
+                    ])
+                    self.checkpoint.save()
                     self._pause_on_configuration_failure(acquired)
                     enriched_count += len(acquired.repositories)
                     report.enriched += len(acquired.repositories)

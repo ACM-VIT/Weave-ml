@@ -154,3 +154,30 @@ def test_unchanged_save_does_not_rewrite_or_fsync_checkpoint(tmp_path, monkeypat
     monkeypatch.setattr("acquisition.checkpoint.os.fsync", lambda *_: pytest.fail("redundant fsync"))
     checkpoint.save()
     assert checkpoint.path.read_bytes() == original
+
+
+@pytest.mark.parametrize('partial', [b'', b'{"version":'])
+def test_partial_old_migration_backup_is_repaired_from_valid_original(tmp_path, partial):
+    import hashlib
+    path = tmp_path / 'checkpoint.json'
+    raw = _v1(path)
+    backup = path.with_name(f'{path.name}.v1.{hashlib.sha256(raw).hexdigest()}.bak')
+    backup.write_bytes(partial)
+    CorpusCheckpoint(path).save()
+    assert backup.read_bytes() == raw
+    assert CorpusCheckpoint(path).legacy_pending_index == ['Owner/Index']
+
+
+def test_backup_fsync_failure_leaves_no_partial_final_backup(tmp_path, monkeypatch):
+    path = tmp_path / 'checkpoint.json'
+    raw = _v1(path)
+    with monkeypatch.context() as patch:
+        def fail(_):
+            raise OSError('disk full during backup')
+        patch.setattr('acquisition.checkpoint.os.fsync', fail)
+        with pytest.raises(OSError, match='disk full'):
+            CorpusCheckpoint(path).save()
+    assert path.read_bytes() == raw
+    assert not list(tmp_path.glob('*.bak'))
+    CorpusCheckpoint(path).save()
+    assert next(tmp_path.glob('*.bak')).read_bytes() == raw

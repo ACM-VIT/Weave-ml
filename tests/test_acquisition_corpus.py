@@ -597,3 +597,26 @@ def test_full_name_takes_precedence_over_backend_uuid_for_recovery_identity(tmp_
             {"id": "00000000-0000-0000-0000-000000000001", "full_name": "owner/repo"},
         ], database_ready=True, report=CorpusRunReport())
     assert CorpusCheckpoint(path).pending_persistence == []
+
+
+@pytest.mark.parametrize('streaming', [False, True])
+def test_rejection_overflow_retains_every_received_batch_identity(tmp_path, streaming):
+    from acquisition.checkpoint_policy import CheckpointPolicy
+    path = tmp_path / 'checkpoint.json'
+    checkpoint = CorpusCheckpoint(path, policy=CheckpointPolicy(max_history_entries=1))
+    checkpoint.record_rejection('owner/previous', ['no README'])
+    checkpoint.save()
+    values = [_source('owner/approved'), _source('owner/rejected'), _source('owner/remaining')]
+    def acquire(**kwargs):
+        result = AcquisitionRunResult(repositories=values)
+        if streaming:
+            kwargs['on_batch'](result)
+            return AcquisitionRunResult()
+        return result
+    pipeline = _ownership_pipeline(
+        path, checkpoint=checkpoint, streaming=streaming, acquire=acquire,
+        quality_filter=lambda values, **_: (values[:1], [(value, ['no README']) for value in values[1:]]),
+    )
+    with pytest.raises(RuntimeError, match='rejection history capacity'):
+        _run_pipeline(pipeline)
+    assert set(CorpusCheckpoint(path).pending_persistence) == {value.repo_id for value in values}

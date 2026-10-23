@@ -360,16 +360,26 @@ class CorpusCheckpoint:
             # and repeated migration safe without overwriting another backup.
             digest = hashlib.sha256(current).hexdigest()
             backup = self.path.with_name(f"{self.path.name}.v1.{digest}.bak")
-            try:
-                fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:
-                if backup.read_bytes() != current:
-                    raise ValueError("Acquisition checkpoint migration backup is corrupt")
-            else:
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(current)
-                    handle.flush()
-                    os.fsync(handle.fileno())
+            if not backup.exists() or backup.read_bytes() != current:
+                # Install only complete, synced backup bytes. The untouched v1
+                # original also lets us repair partial backups from older code.
+                fd, temporary_backup = tempfile.mkstemp(
+                    prefix=f".{backup.name}.", suffix=".tmp", dir=self.path.parent,
+                )
+                try:
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(current)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary_backup, backup)
+                    backup_directory = os.open(self.path.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(backup_directory)
+                    finally:
+                        os.close(backup_directory)
+                finally:
+                    if os.path.exists(temporary_backup):
+                        os.unlink(temporary_backup)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary_name = tempfile.mkstemp(
             prefix=f".{self.path.name}.",

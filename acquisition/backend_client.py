@@ -46,8 +46,11 @@ class _EncodedRepositoryBatch:
 
 
 class BackendIngestionError(RuntimeError):
-    def __init__(self, *, disposition: str = "retryable"):
-        super().__init__("backend ingestion failed")
+    def __init__(self, *, disposition: str = "retryable", status: int | None = None, reason: str = "transport"):
+        reason = reason if reason in {"transport", "http", "invalid_response", "observation_expired"} else "transport"
+        self.status = status if type(status) is int and 100 <= status <= 599 else None
+        self.reason = reason
+        super().__init__(f"backend ingestion failed (status={self.status or 'unknown'}, reason={reason})")
         self.disposition = disposition
 
 
@@ -192,17 +195,20 @@ class BackendIngestionClient:
         return result
 
     def publish_trending_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        observed = timestamp(payload.get("computed_at"))
+        remaining = observed.timestamp() + 30 * 60 - time.time()
         return self._post(
-            "/api/internal/v2/ingestion/trending/snapshots", payload
+            "/api/internal/v2/ingestion/trending/snapshots", payload,
+            deadline=time.monotonic() + remaining,
         )
 
-    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post(self, path: str, payload: dict[str, Any], *, deadline: float | None = None) -> dict[str, Any]:
         encoded = json.dumps(
             payload, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
-        return self._post_encoded(path, encoded)
+        return self._post_encoded(path, encoded, deadline=deadline)
 
-    def _post_encoded(self, path: str, encoded: bytes) -> dict[str, Any]:
+    def _post_encoded(self, path: str, encoded: bytes, *, deadline: float | None = None) -> dict[str, Any]:
         if len(encoded) > MAX_BODY_BYTES:
             raise ValueError("backend request exceeds the 8 MiB body limit")
         headers = {
@@ -212,7 +218,11 @@ class BackendIngestionClient:
         }
         last_error: Exception | None = None
         disposition = "retryable"
+        status = None
+        reason = "transport"
         for attempt in range(self.max_retries):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise BackendIngestionError(reason="observation_expired")
             try:
                 response = self.session.post(
                     f"{self.base_url}{path}",
@@ -233,6 +243,7 @@ class BackendIngestionClient:
             except (requests.RequestException, ValueError) as exc:
                 last_error = exc
                 status = getattr(getattr(exc, "response", None), "status_code", None)
+                reason = "http" if status is not None else "invalid_response" if isinstance(exc, ValueError) else "transport"
                 if status in (401, 403, 404, 405):
                     raise BackendConfigurationError(
                         "backend ingestion authorization or endpoint configuration failed"
@@ -241,8 +252,11 @@ class BackendIngestionClient:
                     disposition = "permanent" if status in (400, 413, 422) else "retryable"
                     break
                 if attempt + 1 < self.max_retries:
-                    time.sleep(min(2**attempt, 4))
-        raise BackendIngestionError(disposition=disposition) from last_error
+                    delay = min(2**attempt, 4)
+                    if deadline is not None:
+                        delay = min(delay, max(0, deadline - time.monotonic()))
+                    time.sleep(delay)
+        raise BackendIngestionError(disposition=disposition, status=status, reason=reason) from last_error
 
 
 def repository_upsert_record(source: Any) -> dict[str, Any]:
