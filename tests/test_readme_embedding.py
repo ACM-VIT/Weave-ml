@@ -514,3 +514,10 @@ def test_complete_reference_before_underline_does_not_create_empty_heading(under
 ])
 def test_setext_lines_are_not_reference_labels_titles_or_destinations(markdown, visible):
     assert visible in " ".join(text for _, text in _sections(markdown))
+
+
+@pytest.mark.parametrize('marker', ['===', '--'])
+@pytest.mark.parametrize('space', ['\u00a0', '\u2003', '\u202f'])
+def test_unicode_whitespace_does_not_interrupt_a_reference_title(marker, space):
+    markdown = '[ref]: /url "Title\n' + marker + space + '\ncontinued"\n\nVisible overview.'
+    assert _sections(markdown) == [('neutral', 'Visible overview.')]

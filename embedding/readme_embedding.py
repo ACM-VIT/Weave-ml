@@ -23,7 +23,7 @@ SECTION_CHUNK_LIMITS = {"purpose": 32, "neutral": 24, "setup": 8}
 # Match only the prefix: overlapping trailing whitespace/hash expressions can
 # otherwise backtrack for seconds on a single bounded but adversarial line.
 _ATX_PREFIX = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+|$)")
-_SETEXT = re.compile(r"^ {0,3}(=+|-+)\s*$")
+_SETEXT = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _BLOCK_START = re.compile(r"^ {0,3}(?:>|[-+*][ \t]|[0-9]{1,9}[.)][ \t]|\|)")
 # GFM HTML block starts 1-6 can interrupt paragraphs/reference candidates.
