@@ -156,6 +156,7 @@ def measure_requests(*, workers, requests, clients, delay, fail_stage=None):
                 if error:
                     errors.append(error)
         elapsed = time.perf_counter() - began
+        until(lambda: io.retrieval_runtime_status()['outstanding'] == 0)
         snapshot = io.retrieval_runtime_status()
     return {'request_duration': summary(durations), 'elapsed_seconds': elapsed,
         'requests_per_second': requests / elapsed, 'request_errors': errors,
@@ -202,6 +203,7 @@ async def measure_abandonment(kind):
             await asyncio.sleep(.05)
             release.set()
             await asyncio.to_thread(until, lambda: recommendation.recommendation_runtime_status()['outstanding'] == 0)
+            await asyncio.to_thread(until, lambda: io.retrieval_runtime_status()['outstanding'] == 0)
             ended = time.perf_counter()
             return {'kind': kind, 'caller_duration_ms': (returned - began) * 1000,
                 'caller_return_to_worker_exit_ms': (ended - returned) * 1000,
@@ -217,6 +219,16 @@ async def measure_abandonment(kind):
             await asyncio.to_thread(until, lambda: recommendation.recommendation_runtime_status()['outstanding'] == 0)
 
 
+def validate_control(result, expected_repo_ids):
+    """Equal failures/incomplete batches cannot qualify an equivalence control."""
+    assert not result['request_errors'], 'control requests failed'
+    outputs = result['outputs']
+    assert len(outputs) == result['request_duration']['count'] and outputs, 'control samples missing'
+    expected = set(expected_repo_ids)
+    assert all(len(batch) == len(expected) and {row[0] for row in batch} == expected
+               for batch in outputs), 'control lost or duplicated fixture repository IDs'
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--requests', type=int, default=24)
@@ -229,6 +241,9 @@ def main():
     serial = measure_requests(workers=1, **common)
     fanout = measure_requests(workers=4, **common)
     partial = measure_requests(workers=4, fail_stage='trend', **common)
+    expected_repo_ids = FixtureQdrant().repo_ids
+    validate_control(serial, expected_repo_ids)
+    validate_control(fanout, expected_repo_ids)
     assert serial.pop('outputs') == fanout.pop('outputs'), 'worker-budget controls changed ranking'
     assert all(partial.pop('outputs')), 'one failed channel lost supported partial results'
     report = {'scope': __doc__, 'workload': vars(args),

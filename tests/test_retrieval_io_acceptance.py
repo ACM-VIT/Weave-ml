@@ -7,7 +7,7 @@ import pytest
 from retrieval import runtime as io
 from scripts.benchmark_retrieval_io import (
     FixtureQdrant, VECTOR, isolated_runtimes, measure_abandonment,
-    measure_requests, retriever, until,
+    measure_requests, retriever, until, validate_control,
 )
 from utils.deadline import CooperativeDeadlineExceeded, RequestDeadline, deadline_scope
 
@@ -25,10 +25,12 @@ def test_concurrent_recommendations_share_one_aggregate_rpc_budget():
                 until(lambda: io.retrieval_runtime_status()['running'] == 2
                       and io.retrieval_runtime_status()['outstanding'] == 3
                       and io.retrieval_runtime_status()['waiting_submitters'] > 0)
+                until(lambda: len(client.calls) == client.active == 2)
                 assert len(client.calls) == client.active == client.peak == 2
                 release.set()
                 for future in futures:
                     assert {item.repo_id for item in future.result(timeout=3).items} == set(client.repo_ids)
+                until(lambda: io.retrieval_runtime_status()['outstanding'] == 0)
                 state = io.retrieval_runtime_status()
                 assert state['peak_running'] == client.peak == 2
                 assert state['outstanding'] == state['running'] == 0
@@ -109,6 +111,7 @@ def test_expiry_between_channels_bounds_timeout_and_starts_no_more_rpcs():
         assert timeouts == [2]  # floor(remaining2.5), never rounded beyond budget
         assert [call['stage'] for call in client.calls] == ['semantic']
         assert not any(call['after_stop'] for call in client.calls)
+        until(lambda: io.retrieval_runtime_status()['outstanding'] == 0)
         assert io.retrieval_runtime_status()['outstanding'] == 0
 
 
@@ -166,3 +169,24 @@ async def test_relative_request_budget_can_reduce_but_never_extend_local_bound(m
         return current_deadline().expires_at
     request = SimpleNamespace(headers={'X-Request-Timeout-Ms': milliseconds}, is_disconnected=connected)
     assert await request_budget.run_read_only_request(request, 5, job) == expected_expiry
+
+
+
+@pytest.mark.parametrize('failure', ['request_error', 'missing_id', 'duplicate_id', 'missing_sample'])
+def test_equivalence_control_rejects_matching_failed_or_incomplete_outputs(failure):
+    client = FixtureQdrant()
+    result = {'request_errors': [], 'request_duration': {'count': 1},
+              'outputs': [tuple((repo_id, .5, 'semantic') for repo_id in client.repo_ids)]}
+    validate_control(result, client.repo_ids)
+    if failure == 'request_error':
+        result['request_errors'] = ['TimeoutError']
+    elif failure == 'missing_id':
+        result['outputs'] = [result['outputs'][0][:-1]]
+    elif failure == 'duplicate_id':
+        batch = list(result['outputs'][0])
+        batch[-1] = batch[0]
+        result['outputs'] = [tuple(batch)]
+    else:
+        result['outputs'] = []
+    with pytest.raises(AssertionError):
+        validate_control(result, client.repo_ids)
