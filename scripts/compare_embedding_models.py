@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 import numpy as np
 
 from evaluation.embedding_registry import Registry, compatible_scores, encode_role
-from scripts.evaluate_readme_aggregation import retrieval_metrics
+from evaluation.retrieval_metrics import retrieval_metrics
 
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY = ROOT / 'tests/fixtures/embedding_models.json'
@@ -38,6 +38,8 @@ def read_json(path):
 
 
 def validate_fixture(fixture):
+    if not isinstance(fixture.get('fixture_version'), str) or not fixture['fixture_version'].strip():
+        raise ValueError('fixture requires an explicit version')
     repos, queries = fixture['repositories'], fixture['queries']
     if not 1 <= len(repos) <= 2000 or not 1 <= len(queries) <= 1000:
         raise ValueError('fixture counts exceed offline evaluation bounds')
@@ -45,6 +47,8 @@ def validate_fixture(fixture):
     for repo in repos:
         if not isinstance(repo['repo_id'], str) or str(uuid.UUID(repo['repo_id'])) != repo['repo_id']:
             raise ValueError('fixture requires canonical repository UUIDs')
+        if not isinstance(repo.get('full_name'), str) or not repo['full_name'].strip():
+            raise ValueError('repository full_name is required')
         for field in ('full_name', 'description', 'readme'):
             if not isinstance(repo.get(field, ''), str):
                 raise ValueError('repository text fields must contain strings')
@@ -132,7 +136,8 @@ def run_worker(args):
     queries_batch = VectorBatch.create(np.asarray(query_rows), config, role='query')
     scores = compatible_scores(queries_batch, documents_batch)
     metrics = retrieval_metrics(scores, queries, [repo['repo_id'] for repo in repos], k=args.k)
-    shadow = Path(args.output).with_suffix('.vectors.npz')
+    output_path = Path(args.output)
+    shadow = output_path.with_name(f'{output_path.stem}-{uuid.uuid4().hex}.vectors.npz')
     metadata = {'schema_version': 1, 'embedding_version': config.version, 'configuration': config.model_dump(),
                 'fixture_sha256': fixture_hash, 'repository_ids': [r['repo_id'] for r in repos],
                 'queries': query_texts, 'roles': ['query', 'document']}
@@ -142,7 +147,7 @@ def run_worker(args):
     peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1024 if sys.platform != 'darwin' else 1)
     mean_documents = sum(document_samples) / len(document_samples)
     source_hashes = {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
-                     for path in (Path(__file__), ROOT / 'evaluation/embedding_registry.py')}
+                     for path in (Path(__file__), ROOT / 'evaluation/embedding_registry.py', ROOT / 'evaluation/retrieval_metrics.py')}
     return {'schema_version': 1, 'configuration': config.model_dump(), 'embedding_version': config.version,
         'registry_sha256': registry_hash, 'fixture_sha256': fixture_hash, 'fixture_version': fixture['fixture_version'],
         'label_provenance': fixture['provenance'], 'quality_scope': 'supplied diagnostic labels; no production qualification',
@@ -180,19 +185,22 @@ def main(argv=None):
     try:
         if not 1 <= args.threads <= 8 or not 1 <= args.batch_size <= 32 or not 1 <= args.repeats <= 10 or not 1 <= args.k <= 100:
             raise ValueError('worker budget out of bounds')
-        registry = Registry.model_validate(read_json(args.registry)[0])
+        registry_payload, registry_hash = read_json(args.registry)
+        registry = Registry.model_validate(registry_payload)
         for name in args.models: registry.get(name)
         if len(set(args.models)) != len(args.models): raise ValueError('model selection must be unique')
         if {args.output.resolve(), args.output.with_suffix('.vectors.npz').resolve()} & {args.registry.resolve(), args.fixture.resolve()}:
             raise ValueError('output cannot replace input evidence')
-        validate_fixture(read_json(args.fixture)[0])
+        fixture_payload, fixture_hash = read_json(args.fixture)
+        validate_fixture(fixture_payload)
         if args.worker:
             if len(args.models) != 1: raise ValueError('each fresh worker loads exactly one model')
             atomic_json(args.output, run_worker(args))
         else:
             reports = []
+            run_id = uuid.uuid4().hex
             for index, name in enumerate(args.models):
-                child_output = args.output.with_name(f'{args.output.stem}-{index}.json')
+                child_output = args.output.with_name(f'{args.output.stem}-{run_id}-{index}.json')
                 command = [sys.executable, '-m', 'scripts.compare_embedding_models', '--worker', '--registry', str(args.registry),
                     '--fixture', str(args.fixture), '--models', name, '--output', str(child_output),
                     '--threads', str(args.threads), '--batch-size', str(args.batch_size), '--repeats', str(args.repeats), '--k', str(args.k)]
@@ -200,7 +208,10 @@ def main(argv=None):
                 result = subprocess.run(command, timeout=600, capture_output=True, text=True)
                 if result.returncode:
                     raise RuntimeError(f'{name}: worker failed; inspect isolated stderr: {result.stderr[-3000:]}')
-                reports.append(read_json(child_output)[0])
+                report = read_json(child_output)[0]
+                if report.get('registry_sha256') != registry_hash or report.get('fixture_sha256') != fixture_hash:
+                    raise ValueError('worker input hashes differ from validated parent inputs')
+                reports.append(report)
                 print(f'{name}: measured CPU worker complete', flush=True)
             atomic_json(args.output, {'schema_version': 1, 'execution': 'serial fresh CPU processes', 'models': reports,
                 'promotion_decision': 'none; offline comparison cannot activate serving models'})
