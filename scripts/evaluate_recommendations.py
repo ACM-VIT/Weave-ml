@@ -20,11 +20,13 @@ from evaluation.recommendation_benchmark import Bundle, Run, evaluate
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 
 
-def read_json(path: Path):
+def read_json(path: Path, *, max_input_bytes: int | None = None):
+    if max_input_bytes is None:
+        max_input_bytes = MAX_INPUT_BYTES
     # Read at most the budget, including when a file grows after stat().
     with path.open('rb') as source:
-        raw = source.read(MAX_INPUT_BYTES + 1)
-    if len(raw) > MAX_INPUT_BYTES:
+        raw = source.read(max_input_bytes + 1)
+    if len(raw) > max_input_bytes:
         raise ValueError(f'{path.name}: input exceeds byte budget')
     def reject_constant(value):
         raise ValueError(f'nonfinite JSON constant: {value}')
@@ -73,12 +75,25 @@ def main(argv=None):
         if any(path is not None and path.resolve() == args.output.resolve() for path in inputs):
             raise ValueError('output must not overwrite an input artifact')
         bundle = Bundle.model_validate(read_json(args.bundle))
-        run = Run.model_validate(read_json(args.run))
+        raw_run = read_json(args.run)
+        local_stage_replay = False
+        if isinstance(raw_run, dict) and raw_run.get('format') == 'frozen-model-stages-v1':
+            from evaluation.stage_runner import StageRunExport
+            from evaluation.recommendation_benchmark import digest
+            exported = StageRunExport.model_validate(raw_run)
+            if exported.bundle_sha256 != digest(bundle):
+                raise ValueError('stage export belongs to another frozen bundle')
+            run = exported.run
+            local_stage_replay = True
+        else:
+            run = Run.model_validate(raw_run)
         baseline = Baseline.model_validate(read_json(args.baseline))
         policy = Policy.model_validate(read_json(args.policy))
         report = evaluate(bundle, run, k=policy.k)
         assessment = assess(report, baseline, policy, qualify=args.qualify)
         if args.qualify:
+            if local_stage_replay:
+                assessment['failures'].append('local exact-search stage replay is diagnostic, not production qualification evidence')
             if args.model_artifact is None or args.scaler_artifact is None:
                 assessment['failures'].append('qualification requires actual model and scaler artifacts')
             else:
