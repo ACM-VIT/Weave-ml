@@ -155,10 +155,17 @@ class RankerService:
         expected_embedding_model=None,
         expected_embedding_model_revision=None,
         require_production_manifest=False,
+        device="auto",
     ):
         self._warmup_lock = threading.Lock()
         self._warmup_status = {"state": "not_started", "duration_seconds": None}
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if not isinstance(device, str) or device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("Ranker device must be auto, cpu or cuda")
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        elif device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was explicitly requested but is unavailable")
+        self.device = torch.device(device)
         self.emb_dim = EMBEDDING_DIM
         self.model_version = RANKER_MODEL_VERSION
         self.embedding_version = REPOSITORY_EMBEDDING_VERSION
