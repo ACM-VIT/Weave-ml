@@ -303,8 +303,8 @@ Useful focused commands:
 
 ```bash
 pytest -m unit
-pytest tests/test_feedback.py
-pytest tests/test_production_config.py tests/test_production_smoke.py
+pytest tests/test_v2_feedback.py tests/test_v2_feedback_hardening.py
+pytest tests/test_production_config.py tests/test_v2_api_hardening.py
 pytest --cov=. --cov-report=term-missing
 ```
 
