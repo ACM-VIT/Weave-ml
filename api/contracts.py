@@ -848,7 +848,7 @@ class ModelOperationStatusResponse(StrictModel):
     operation_id: uuid.UUID
     model_operation_version: PositiveModelDecimal
     source_envelope_sha256: str
-    status: Literal["pending", "applied", "withdrawn_profile", "rejected_capacity"]
+    status: Literal["pending", "applied", "withdrawn_profile", "rejected_capacity", "rejected_session_dependency"]
     basis_status: Literal["missing", "awaiting_profile", "ready"]
     applied_operation_version: PositiveModelDecimal | None = None
     applied_profile_version: PositiveModelDecimal | None = None

@@ -316,7 +316,8 @@ class Coordinator:
                         or (expected_header is not None and operation.header != expected_header)):
                     raise OriginalIdentityConflict('committed original UUID/version/source bytes differ')
                 return {'status': 'withdrawn_profile' if row['disposition'] == 'withdrawn_profile' else
-                    'rejected_capacity' if row['disposition'] == 'rejected' else 'applied',
+                    ('rejected_capacity' if row.get('error_code') == 'MODEL_STATE_CAPACITY' else 'rejected_session_dependency')
+                    if row['disposition'] == 'rejected' else 'applied',
                     'operation_head': head, 'operation': operation, 'row': row}
             if version < operation_version:
                 raise reducer.OperationGap('requested original operation is not applied')
@@ -334,6 +335,8 @@ class Coordinator:
             committed=self._prove_committed(before,input_sha,header.operation_version)
             return 'rejected_duplicate' if committed.get('disposition')=='rejected' else 'duplicate'
         disposition = 'applied'
+        error_code = None
+        causal_head = None
         try:
             after_state = reducer.reduce_operation(before.state, operation, self.policy)
             complete = self._complete_for(after_state, legacy_prepare(before.complete, operation))
@@ -345,25 +348,85 @@ class Coordinator:
             # byte bound. If it cannot fit, no prepare/DLQ/CAS/ACK is authorized.
             complete = self._complete_for(after_state, self.legacy_reject(before.complete, operation))
             disposition = 'rejected'
+            error_code = 'MODEL_STATE_CAPACITY'
+        except reducer.EpochConflict:
+            if not self.reject_capacity:
+                raise
+            # A missing/gapped/corrupt session remains retryable. Only committed
+            # rejected ancestry for this exact epoch may terminalize a dependent.
+            causal_head, control = self._rejected_session_control(before, operation)
+            after_state = reducer.reject_session_dependency(before.state, operation, self.policy, control)
+            complete = self._complete_for(after_state, self.legacy_reject(before.complete, operation))
+            disposition = 'rejected'
+            error_code = 'MODEL_SESSION_DEPENDENCY_REJECTED'
         complete_sha=self.journal.put('complete',json.loads(complete))
         prepared={'user_id':header.user_id,'previous_head':before.head,
                   'previous_state_sha256':reducer.state_sha256(before.state),
                   'operation_version':header.operation_version,'input_sha256':input_sha,
-                  'disposition':disposition,'error_code':'MODEL_STATE_CAPACITY' if disposition=='rejected' else None,
+                  'disposition':disposition,'error_code':error_code,
                   'state_sha256':reducer.state_sha256(after_state),'complete_sha256':complete_sha}
+        if causal_head is not None:
+            prepared['causal_prepare_sha256'] = causal_head
         head=self.journal.put('prepare',prepared)
         desired=Snapshot(header.user_id,after_state,head,complete)
         if disposition=='rejected':
             # This is explicitly a prepared rejection, not an applied outcome.
             # A crash leaves an orphan named by immutable prepare SHA. Only the
             # committed user head proves that its cursor/disposition took effect.
-            self.dead_letter_prepare(header,input_sha,head,'MODEL_STATE_CAPACITY')
+            self.dead_letter_prepare(header,input_sha,head,error_code)
         assert_lock()
         if not self.users.compare_and_set(before,desired): raise CasConflict('complete user state changed; retry pinned input')
         # No separate applied marker is written. The atomic point's head is
         # the proof. Caller ACKs only after this return and its lock check.
         assert_lock()
         return disposition
+
+    def _rejected_session_control(self, snapshot, operation):
+        if isinstance(operation, reducer.Feedback):
+            session_id = operation.session.session_id if operation.session is not None else None
+        elif isinstance(operation, (reducer.Reset, reducer.End)):
+            session_id = operation.session_id
+        else:
+            session_id = None
+        if session_id is None:
+            raise reducer.EpochConflict('no provable rejected session dependency')
+        head, expected, version = snapshot.head, reducer.state_sha256(snapshot.state), snapshot.state.operation_version
+        controls = []
+        for _ in range(self.journal.limits.history_operations):
+            if head is None:
+                raise JournalMissing('rejected Begin is outside committed proof horizon')
+            row = self.journal.get(head, 'prepare')
+            if (row.get('user_id') != snapshot.user_id or row.get('state_sha256') != expected or
+                    row.get('operation_version') != version):
+                raise JournalConflict('rejected session committed ancestry differs')
+            frozen = self.journal.get(row['input_sha256'], 'input')
+            control = _unpack(frozen['operation'])
+            if control.header.user_id != snapshot.user_id or control.header.operation_version != version:
+                raise JournalConflict('rejected session input owner/version differs')
+            if isinstance(control, (reducer.Begin, reducer.Reset, reducer.End)) and control.session_id == session_id:
+                if isinstance(control, reducer.Begin):
+                    if row.get('disposition') != 'rejected' or row.get('error_code') != 'MODEL_STATE_CAPACITY':
+                        raise reducer.EpochConflict('session Begin was not a committed capacity rejection')
+                    proof_head, proof = head, control
+                    for next_head, next_row, next_control in reversed(controls):
+                        if (next_row.get('disposition') != 'rejected' or
+                                next_row.get('error_code') != 'MODEL_SESSION_DEPENDENCY_REJECTED' or
+                                next_row.get('causal_prepare_sha256') != proof_head):
+                            raise reducer.EpochConflict('session control is not causally rejected')
+                        epoch = 1 if isinstance(proof, reducer.Begin) else proof.new_epoch
+                        started = proof.epoch_started_ms if isinstance(proof, reducer.Begin) else proof.header.accepted_ms
+                        if isinstance(next_control, reducer.Reset):
+                            if next_control.old_epoch != epoch or next_control.new_epoch != epoch + 1:
+                                raise JournalConflict('rejected Reset ancestry differs')
+                            proof_head, proof = next_head, next_control
+                        else:
+                            if next_control.epoch != epoch or next_control.epoch_started_ms != started:
+                                raise JournalConflict('rejected End ancestry differs')
+                            raise reducer.EpochConflict('rejected session was already retired')
+                    return proof_head, proof
+                controls.append((head, row, control))
+            head, expected, version = row['previous_head'], row['previous_state_sha256'], version - 1
+        raise HistoryBudget('bounded rejected session proof exhausted')
     def _prove_committed(self,snapshot,input_sha,version):
         head=snapshot.head; expected=reducer.state_sha256(snapshot.state); expected_version=snapshot.state.operation_version
         for _ in range(self.journal.limits.history_operations):
@@ -408,8 +471,16 @@ class Coordinator:
             if reducer.state_sha256(state)!=row['previous_state_sha256']: raise JournalConflict('replay predecessor differs')
             frozen=self.journal.get(row['input_sha256'],'input'); operation=_unpack(frozen['operation'])
             if row.get('disposition','applied')=='rejected':
-                if row.get('error_code')!='MODEL_STATE_CAPACITY':raise JournalConflict('unknown recorded rejection')
-                state=reducer.reject_capacity(state,operation,self.policy)
+                if row.get('error_code') == 'MODEL_STATE_CAPACITY':
+                    state=reducer.reject_capacity(state,operation,self.policy)
+                elif row.get('error_code') == 'MODEL_SESSION_DEPENDENCY_REJECTED':
+                    proof_head, control = self._rejected_session_control(
+                        Snapshot(expected_user_id, state, row['previous_head'], complete), operation)
+                    if row.get('causal_prepare_sha256') != proof_head:
+                        raise JournalConflict('replayed rejection causal proof differs')
+                    state = reducer.reject_session_dependency(state, operation, self.policy, control)
+                else:
+                    raise JournalConflict('unknown recorded rejection')
             else:
                 state=reducer.reduce_operation(state,operation,self.policy)
             if reducer.state_sha256(state)!=row['state_sha256']: raise JournalConflict('replayed state differs')

@@ -951,6 +951,116 @@ def test_full_legacy_future_queue_admits_only_ready_recovery_one_at_a_time(runti
     assert runtime.stream.admit(future)['status']=='duplicate'
 
 
+@pytest.mark.parametrize('runtime',[{'max_sessions':1}],indirect=True)
+def test_rejected_begin_causally_terminalizes_feedback_reset_and_end(runtime,monkeypatch):
+    initialize(runtime);p=runtime.policy
+    checkpoint=runtime.processor.coordinator.checkpoint(uid(1))
+    session=uid(51)
+    payload=feedback_payload(session=session)
+    payload['canonical_attribution']['epoch_started_ms']='3'
+    entries=[wire(p,'begin',3,begin_payload(3,session)),wire(p,'feedback',4,payload),
+        wire(p,'reset',5,dict(session_id=session,old_epoch='1',new_epoch='2',new_epoch_started_ms='5',witness_sha256='c'*64))]
+    later=feedback_payload(2,session=session)
+    later['canonical_attribution'].update(epoch='2',epoch_started_ms='5',witness_sha256='c'*64)
+    entries.extend([wire(p,'feedback',6,later),wire(p,'end',7,dict(session_id=session,epoch='2',epoch_started_ms='5',retired=True,witness_sha256='d'*64))])
+    # All accepted while the Begin still had no terminal outcome.
+    for raw in entries:runtime.stream.admit(raw)
+    consumer=runtime.consumer()
+    for _ in entries:assert consumer.run_once()==1
+    final=runtime.users.read(uid(1))
+    assert final.state.operation_version==7 and final.state.feedback_version==2
+    assert tuple(row.session_id for row in final.state.sessions)==(uid(50),)
+    assert not final.state.long_entries
+    assert json.loads(final.complete)['legacy']['payload']['last_feedback_version']==2
+    assert runtime.processor.coordinator.rebuild(checkpoint,final.head,expected_user_id=uid(1))==final
+    for raw in entries:
+        assert runtime.processor(parse(raw,p),lambda:None)=='rejected_duplicate'
+    assert runtime.redis.xlen(runtime.stream.stream)==0
+    assert runtime.redis.xlen(runtime.stream.limits.namespace+':dlq')==5
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from api.v2 import router
+    import feedback.model_runtime as provider
+    monkeypatch.setattr(provider,'model_runtime',lambda:runtime)
+    monkeypatch.setenv('INTERNAL_API_SECRET','fixture-secret')
+    app=FastAPI();app.include_router(router)
+    incoming=parse(entries[1],p)
+    response=TestClient(app).post('/api/v2/model-operation-status',headers={'x-internal-secret':'fixture-secret'},json={
+        'schema_version':1,'user_id':uid(1),'operation_id':incoming.header.operation_id,
+        'model_operation_version':'4','source_envelope_sha256':incoming.header.source_envelope_sha256})
+    assert response.status_code==200,response.text
+    assert response.json()['status']=='rejected_session_dependency'
+    assert response.json()['applied_feedback_version']=='2'
+    apply(runtime,wire(p,'profile',8,profile_payload(False,2)))
+
+
+@pytest.mark.parametrize('change',[{'session_id':uid(52)},{'epoch':'2'},{'epoch_started_ms':'2'},{'witness_sha256':'a'*64}])
+@pytest.mark.parametrize('runtime',[{'max_sessions':1}],indirect=True)
+def test_rejected_begin_never_authorizes_mismatched_feedback(runtime,change):
+    initialize(runtime);p=runtime.policy
+    apply(runtime,wire(p,'begin',3,begin_payload(3,uid(51))))
+    before=runtime.users.read(uid(1))
+    payload=feedback_payload(session=uid(51));payload['canonical_attribution']['epoch_started_ms']='3'
+    payload['canonical_attribution'].update(change)
+    with pytest.raises((model.EpochConflict,JournalMissing)):
+        runtime.processor(parse(wire(p,'feedback',4,payload),p),lambda:None)
+    assert runtime.users.read(uid(1))==before
+    assert runtime.redis.xlen(runtime.stream.limits.namespace+':dlq')==1
+
+
+@pytest.mark.parametrize('runtime',[{'max_sessions':1}],indirect=True)
+def test_causal_rejection_requires_dlq_capacity_then_fenced_commit(runtime,monkeypatch):
+    initialize(runtime);p=runtime.policy
+    apply(runtime,wire(p,'begin',3,begin_payload(3,uid(51))))
+    before=runtime.users.read(uid(1))
+    payload=feedback_payload(session=uid(51));payload['canonical_attribution']['epoch_started_ms']='3'
+    raw=wire(p,'feedback',4,payload);incoming=parse(raw,p)
+    runtime.stream.limits=replace(runtime.stream.limits,max_dead_letters=1)
+    with pytest.raises(OperationCapacity):runtime.processor(incoming,lambda:None)
+    assert runtime.users.read(uid(1))==before
+    runtime.stream.limits=replace(runtime.stream.limits,max_dead_letters=10)
+    original=runtime.users.compare_and_set
+    monkeypatch.setattr(runtime.users,'compare_and_set',lambda *args:False)
+    with pytest.raises(CasConflict):runtime.processor(incoming,lambda:None)
+    assert runtime.users.read(uid(1))==before
+    fields=runtime.redis.xrevrange(runtime.stream.limits.namespace+':dlq',count=1)[0][1]
+    prepared=json.loads(fields['prepared_json']);head=prepared['prepare_sha256']
+    assert prepared['error_code']=='MODEL_SESSION_DEPENDENCY_REJECTED'
+    assert runtime.processor.coordinator.rejection_status(head)=='prepared_not_committed'
+    row=runtime.journal.get(head,'prepare');frozen=runtime.journal.get(row['input_sha256'],'input')
+    import base64
+    assert base64.b64decode(frozen['identity']['source_base64'])==raw.encode()
+    monkeypatch.setattr(runtime.users,'compare_and_set',original)
+    assert runtime.processor(incoming,lambda:None)=='rejected'
+    assert runtime.processor.coordinator.rejection_status(head)=='committed_rejection'
+    assert runtime.processor(incoming,lambda:None)=='rejected_duplicate'
+
+
+@pytest.mark.parametrize('runtime',[{'max_sessions':1}],indirect=True)
+def test_causal_rejection_outside_history_or_missing_record_stays_pending(runtime,monkeypatch):
+    from feedback.model_journal import HistoryBudget
+    initialize(runtime);p=runtime.policy
+    apply(runtime,wire(p,'begin',3,begin_payload(3,uid(51))))
+    rejected_head=runtime.users.read(uid(1)).head
+    apply(runtime,wire(p,'profile',4,profile_payload(False,2)))
+    before=runtime.users.read(uid(1))
+    payload=feedback_payload(session=uid(51));payload['canonical_attribution']['epoch_started_ms']='3'
+    incoming=parse(wire(p,'feedback',5,payload),p)
+    limits=runtime.journal.limits
+    runtime.journal.limits=replace(limits,history_operations=1)
+    with pytest.raises(HistoryBudget):runtime.processor(incoming,lambda:None)
+    assert runtime.users.read(uid(1))==before
+    runtime.journal.limits=limits
+    get=runtime.journal.get
+    def unavailable(digest,kind):
+        if digest==rejected_head:raise JournalMissing('fixture rejected Begin record unavailable')
+        return get(digest,kind)
+    monkeypatch.setattr(runtime.journal,'get',unavailable)
+    with pytest.raises(JournalMissing):runtime.processor(incoming,lambda:None)
+    assert runtime.users.read(uid(1))==before
+    assert runtime.redis.xlen(runtime.stream.limits.namespace+':dlq')==1
+
+
 def test_recovery_slot_is_global_and_atomic_across_ready_users(runtime):
     from concurrent.futures import ThreadPoolExecutor
     initialize(runtime);p=runtime.policy

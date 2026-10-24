@@ -665,6 +665,43 @@ def reject_capacity(state,operation,policy):
     return _check_state(result,policy)
 
 
+def reject_session_dependency(state, operation, policy, rejected_control):
+    """Reject only an exact dependent of a journal-proven rejected epoch.
+
+    The coordinator supplies a reachable committed Begin/Reset, never a client
+    claim or an orphan prepare. This does not create session authority.
+    """
+    if isinstance(rejected_control, Begin):
+        epoch, started = 1, rejected_control.epoch_started_ms
+    elif isinstance(rejected_control, Reset):
+        epoch, started = rejected_control.new_epoch, rejected_control.header.accepted_ms
+    else:
+        raise EpochConflict('rejected session control proof required')
+    session_id = rejected_control.session_id
+    if (rejected_control.header.user_id != state.user_id or
+            rejected_control.header.operation_version > state.operation_version or
+            any(row.session_id == session_id for row in state.sessions)):
+        raise EpochConflict('rejected control is not an absent committed session')
+    if isinstance(operation, Feedback):
+        binding = operation.session
+        if (binding is None or binding.user_id != state.user_id or binding.session_id != session_id or
+                binding.epoch != epoch or binding.epoch_started_ms != started or
+                binding.source_witness_sha256 != rejected_control.source_witness_sha256 or
+                not binding.active_at_acceptance):
+            raise EpochConflict('feedback differs from rejected session witness')
+    elif isinstance(operation, Reset):
+        if (operation.session_id != session_id or operation.old_epoch != epoch or
+                operation.new_epoch != epoch + 1):
+            raise EpochConflict('reset differs from rejected session epoch')
+    elif isinstance(operation, End):
+        if (operation.session_id != session_id or operation.epoch != epoch or
+                operation.epoch_started_ms != started):
+            raise EpochConflict('end differs from rejected session epoch')
+    else:
+        raise EpochConflict('operation has no rejected session dependency')
+    return reject_capacity(state, operation, policy)
+
+
 @dataclass(frozen=True)
 class View:
     long_term: tuple[float,...]
