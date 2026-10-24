@@ -19,6 +19,7 @@ from pydantic import (
     model_validator,
 )
 
+from ingestion.lifecycle import RepositoryLifecycleObservation
 from feedback.v2_settings import V2FeedbackSettings
 from embedding.vector_contract import validate_diversity_metadata
 from summarization.contracts import CardSummaryArtifact
@@ -303,6 +304,7 @@ class FeedbackBatch(StrictModel):
 
 
 class RepositorySource(StrictModel):
+    lifecycle: RepositoryLifecycleObservation | None = None
     # These identity/source fields are supplied by the canonical Node v2
     # ingestion outbox. ``repo_id`` is checked against the job envelope below;
     # owner/name/node ID remain source metadata and are not used as Qdrant IDs.
@@ -446,6 +448,7 @@ class RepositoryFeaturePatch(StrictModel):
     source observations changes.
     """
 
+    lifecycle: RepositoryLifecycleObservation | None = None
     star_count: NonNegativeCount | None = None
     fork_count: NonNegativeCount | None = None
     open_issues_count: NonNegativeCount | None = None

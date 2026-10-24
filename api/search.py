@@ -33,9 +33,12 @@ def search_repositories(request: RepositorySearchRequest, retriever: Any, embedd
         if values:
             must.append(models.FieldCondition(key=field, match=models.MatchAny(any=values)))
     exclusions = {str(value) for value in request.exclude_repo_ids}
+    must_not = list(eligibility.must_not or [])
+    if exclusions:
+        must_not.append(models.HasIdCondition(has_id=sorted(exclusions)))
     query_filter = models.Filter(
         must=must,
-        must_not=[models.HasIdCondition(has_id=sorted(exclusions))] if exclusions else None,
+        must_not=must_not or None,
     )
     @span_scope("search", stage="qdrant")
     def query_points():
