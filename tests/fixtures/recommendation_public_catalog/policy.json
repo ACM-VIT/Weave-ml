@@ -1,0 +1,387 @@
+{
+  "k": 5,
+  "min_profiles": 10,
+  "policy_id": "public-catalog32-intents10-diagnostic-v1",
+  "reference": "Fixed synthetic task diagnostic over32 real public-source snapshots and initial manually accepted artifact. Quality compares with immutable curated reference;1000ms is a local diagnostic timing bound, not a production SLA. Unknown fork-repeat metrics are not gated; separate synthetic mechanics fixture covers fork controls.",
+  "rules": [
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "judged_recall_at_k",
+      "minimum": 0.0,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "judged_ndcg_at_k",
+      "minimum": 0.0,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "judged_mrr_at_k",
+      "minimum": 0.0,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "judgment_coverage",
+      "minimum": 0.0,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "catalogue_coverage",
+      "minimum": 0.0,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 1.0,
+      "metric": "intra_list_similarity",
+      "minimum": null,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "novelty_bits",
+      "minimum": 0.0,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 1.0,
+      "metric": "owner_concentration",
+      "minimum": null,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 1.0,
+      "metric": "topic_concentration",
+      "minimum": null,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "fork_metadata_coverage",
+      "minimum": 0.0,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "owner_metadata_coverage",
+      "minimum": 0.0,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "topic_metadata_coverage",
+      "minimum": 0.0,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 0.0,
+      "metric": "repeat_rate",
+      "minimum": null,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 0.0,
+      "metric": "excluded_rate",
+      "minimum": null,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 0.0,
+      "metric": "archived_rate",
+      "minimum": null,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 1.0,
+      "metric": "fork_repeat_rate",
+      "minimum": null,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1000.0,
+      "maximum": 1000.0,
+      "metric": "latency_p50_ms",
+      "minimum": null,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1000.0,
+      "maximum": 1000.0,
+      "metric": "latency_p95_ms",
+      "minimum": null,
+      "stage": "retrieval"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "judged_recall_at_k",
+      "minimum": 0.0,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "judged_ndcg_at_k",
+      "minimum": 0.0,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "judged_mrr_at_k",
+      "minimum": 0.0,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "judgment_coverage",
+      "minimum": 0.0,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "catalogue_coverage",
+      "minimum": 0.0,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 1.0,
+      "metric": "intra_list_similarity",
+      "minimum": null,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "novelty_bits",
+      "minimum": 0.0,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 1.0,
+      "metric": "owner_concentration",
+      "minimum": null,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 1.0,
+      "metric": "topic_concentration",
+      "minimum": null,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "fork_metadata_coverage",
+      "minimum": 0.0,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "owner_metadata_coverage",
+      "minimum": 0.0,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "topic_metadata_coverage",
+      "minimum": 0.0,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 0.0,
+      "metric": "repeat_rate",
+      "minimum": null,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 0.0,
+      "metric": "excluded_rate",
+      "minimum": null,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 0.0,
+      "metric": "archived_rate",
+      "minimum": null,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 1.0,
+      "metric": "fork_repeat_rate",
+      "minimum": null,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1000.0,
+      "maximum": 1000.0,
+      "metric": "latency_p50_ms",
+      "minimum": null,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1000.0,
+      "maximum": 1000.0,
+      "metric": "latency_p95_ms",
+      "minimum": null,
+      "stage": "ranking"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "judged_recall_at_k",
+      "minimum": 0.0,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "judged_ndcg_at_k",
+      "minimum": 0.0,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "judged_mrr_at_k",
+      "minimum": 0.0,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "judgment_coverage",
+      "minimum": 0.0,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "catalogue_coverage",
+      "minimum": 0.0,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 1.0,
+      "metric": "intra_list_similarity",
+      "minimum": null,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "novelty_bits",
+      "minimum": 0.0,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 1.0,
+      "metric": "owner_concentration",
+      "minimum": null,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 1.0,
+      "metric": "topic_concentration",
+      "minimum": null,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "fork_metadata_coverage",
+      "minimum": 0.0,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "owner_metadata_coverage",
+      "minimum": 0.0,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": null,
+      "metric": "topic_metadata_coverage",
+      "minimum": 0.0,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 0.0,
+      "metric": "repeat_rate",
+      "minimum": null,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 0.0,
+      "metric": "excluded_rate",
+      "minimum": null,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 0.0,
+      "metric": "archived_rate",
+      "minimum": null,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1e-12,
+      "maximum": 1.0,
+      "metric": "fork_repeat_rate",
+      "minimum": null,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1000.0,
+      "maximum": 1000.0,
+      "metric": "latency_p50_ms",
+      "minimum": null,
+      "stage": "assembly"
+    },
+    {
+      "max_regression": 1000.0,
+      "maximum": 1000.0,
+      "metric": "latency_p95_ms",
+      "minimum": null,
+      "stage": "assembly"
+    }
+  ],
+  "schema_version": 1
+}

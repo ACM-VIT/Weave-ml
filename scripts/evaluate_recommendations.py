@@ -14,7 +14,8 @@ import os
 from pathlib import Path
 import tempfile
 
-from evaluation.benchmark_gates import Baseline, Policy, assess, qualification_manifest
+from evaluation.benchmark_gates import Baseline, Policy, assess, qualification_manifest, load_baseline
+from evaluation.embedding_artifacts import read_regular, decode_json
 from evaluation.recommendation_benchmark import Bundle, Run, evaluate
 
 MAX_INPUT_BYTES = 64 * 1024 * 1024
@@ -69,9 +70,10 @@ def main(argv=None):
     parser.add_argument('--qualify', action='store_true', help='Check evidence for a later authorized promotion review')
     parser.add_argument('--model-artifact', type=Path)
     parser.add_argument('--scaler-artifact', type=Path)
+    parser.add_argument('--manifest-artifact', type=Path)
     args = parser.parse_args(argv)
     try:
-        inputs = [args.bundle, args.run, args.baseline, args.policy, args.model_artifact, args.scaler_artifact]
+        inputs = [args.bundle, args.run, args.baseline, args.policy, args.model_artifact, args.scaler_artifact, args.manifest_artifact]
         if any(path is not None and path.resolve() == args.output.resolve() for path in inputs):
             raise ValueError('output must not overwrite an input artifact')
         bundle = Bundle.model_validate(read_json(args.bundle))
@@ -87,7 +89,7 @@ def main(argv=None):
             local_stage_replay = True
         else:
             run = Run.model_validate(raw_run)
-        baseline = Baseline.model_validate(read_json(args.baseline))
+        baseline = load_baseline(read_json(args.baseline))
         policy = Policy.model_validate(read_json(args.policy))
         report = evaluate(bundle, run, k=policy.k)
         assessment = assess(report, baseline, policy, qualify=args.qualify)
@@ -101,6 +103,39 @@ def main(argv=None):
                     assessment['failures'].append('actual model artifact digest mismatch')
                 if file_sha256(args.scaler_artifact) != run.scaler_sha256:
                     assessment['failures'].append('actual scaler artifact digest mismatch')
+            if policy.embedding_comparison == 'cross_embedding':
+                if args.manifest_artifact is None or run.manifest_sha256 is None:
+                    assessment['failures'].append('cross-embedding qualification requires the actual candidate manifest artifact')
+                else:
+                    # Own bounded bytes once: the parsed contract must be the
+                    # exact artifact whose digest is bound into this Run.
+                    raw_manifest = read_regular(args.manifest_artifact, 2 * 1024 * 1024)
+                    if hashlib.sha256(raw_manifest).hexdigest() != run.manifest_sha256:
+                        assessment['failures'].append('actual candidate manifest digest mismatch')
+                    else:
+                        manifest = decode_json(raw_manifest)
+                        if not isinstance(manifest, dict):
+                            raise ValueError('candidate manifest must be an object')
+                        from inference.feature_spec import EMBEDDING_DIM, FEATURE_COUNT, FEATURE_SPEC_VERSION, INPUT_DIM
+                        expected_embedding = run.embedding.model_dump(mode='json')
+                        if (manifest.get('embedding_identity') != expected_embedding
+                                or manifest.get('embedding_model') != run.embedding.model
+                                or manifest.get('embedding_model_revision') != run.embedding.revision
+                                or manifest.get('embedding_version') != run.embedding.recipe
+                                or not isinstance(manifest.get('compatible_embedding_versions'), list)
+                                or not manifest.get('compatible_embedding_versions')
+                                or any(not isinstance(version, str) or not version.strip() for version in manifest.get('compatible_embedding_versions', []))
+                                or run.embedding.recipe not in manifest.get('compatible_embedding_versions', [])
+                                or manifest.get('model_sha256') != run.model_sha256
+                                or manifest.get('scaler_sha256') != run.scaler_sha256
+                                or manifest.get('feature_spec_version') != run.feature_schema
+                                or run.feature_schema != FEATURE_SPEC_VERSION
+                                or type(manifest.get('feature_count')) is not int
+                                or manifest.get('feature_count') != FEATURE_COUNT
+                                or manifest.get('input_dim') != INPUT_DIM
+                                or manifest.get('embedding_dim') != EMBEDDING_DIM
+                                or run.embedding.dimension != EMBEDDING_DIM):
+                            assessment['failures'].append('candidate manifest embedding/feature/model compatibility mismatch')
             assessment['passed'] = not assessment['failures']
         payload = {'report': report, 'assessment': assessment, 'qualification_manifest': None}
         if args.qualify and assessment['passed']:
