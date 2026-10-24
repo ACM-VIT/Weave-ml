@@ -70,7 +70,13 @@ class IngestionResult:
             self.novelty.explanation
         ]
         
-        if self.topological_metrics and self.topological_metrics.get("measurement_status") == "measured":
+        if self.topological_metrics and self.topological_metrics.get("measurement_status") == "unmeasured":
+            output_blocks += [
+                thin_divider,
+                "  Corpus Cluster Topology: UNMEASURED",
+                f"    Reason: {self.topological_metrics.get('reason')}"
+            ]
+        elif self.topological_metrics and self.topological_metrics.get("measurement_status") == "measured":
             output_blocks += [
                 thin_divider,
                 f"  Corpus Cluster Topology Structural Space Vector:",
