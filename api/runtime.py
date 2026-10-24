@@ -170,8 +170,9 @@ class _BoundedExecutor:
         return future
 
     async def run(self, function: Callable[..., T], *args: Any) -> T:
-        # Durable feedback/refresh jobs deliberately keep their existing semantics.
-        deadline = (current_deadline() or RequestDeadline(self.timeout)) if self.operation == "search" else None
+        # Explicit read-only scopes can share the feedback executor for status.
+        # Durable feedback/refresh jobs without a scope retain their semantics.
+        deadline = current_deadline() or (RequestDeadline(self.timeout) if self.operation == "search" else None)
         if deadline is not None:
             try:
                 deadline.remaining()

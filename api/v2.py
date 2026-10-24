@@ -1791,7 +1791,7 @@ async def submit_profile_withdrawals(request: ProfileWithdrawalBatch):
 
 @router.post("/model-operation-status", response_model=ModelOperationStatusResponse, response_model_exclude_unset=True,
              dependencies=[Depends(require_internal_secret)])
-async def read_model_operation_status(request: ModelOperationStatusRequest):
+async def read_model_operation_status(request: ModelOperationStatusRequest, http_request: Request):
     from feedback.model_runtime import model_runtime
     from feedback.model_journal import OriginalIdentityConflict
     from feedback.long_session import BootstrapState, WithdrawnProfile
@@ -1817,7 +1817,10 @@ async def read_model_operation_status(request: ModelOperationStatusRequest):
             if isinstance(proof['operation'], WithdrawnProfile):
                 result['withdrawal_sha256'] = proof['operation'].withdrawal_sha256
             return result
-        return await run_service_job("feedback", read)
+        return await run_read_only_request(http_request, service_timeout_seconds("feedback"),
+            lambda: run_service_job("feedback", read))
+    except HTTPException:
+        raise
     except OriginalIdentityConflict:
         raise HTTPException(status_code=409, detail="Original operation status identity conflict.") from None
     except Exception:

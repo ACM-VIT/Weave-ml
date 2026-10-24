@@ -12,6 +12,7 @@ import uuid
 from typing import Callable, Protocol
 
 from feedback import long_session as reducer
+from utils.deadline import check_deadline
 
 
 class JournalError(RuntimeError): pass
@@ -92,13 +93,14 @@ class Limits:
 class Journal:
     def __init__(self,records:ImmutableRecords,limits:Limits): self.records,self.limits=records,limits
     def put(self,kind,value):
-        if kind not in {'input','prepare','complete','checkpoint'}: raise JournalError('unknown record kind')
+        if kind not in {'input','prepare','complete','checkpoint','status_index'}: raise JournalError('unknown record kind')
         raw=_canonical({'schema_version':1,'kind':kind,'value':value})
         _json(raw,self.limits.record_bytes)
         digest=_sha(raw); key='blob:'+digest
         if self.records.put_once(key,raw)!=raw: raise JournalConflict('content-addressed record differs')
         return digest
     def get(self,digest,kind):
+        check_deadline()
         if type(digest) is not str or len(digest)!=64 or any(c not in '0123456789abcdef' for c in digest):
             raise JournalError('invalid content address')
         raw=self.records.get('blob:'+digest)
@@ -161,6 +163,85 @@ class Snapshot:
         if self.state.user_id!=self.user_id: raise JournalConflict('snapshot owner differs')
 
 
+class _StatusIndex:
+    """Immutable 16-operation blocks and a binary merge frontier.
+
+    The frontier belongs to a committed prepare, never a mutable operation
+    alias. Leaves name existing prepare hashes; branches authenticate children.
+    A new block costs one record per 16 ancestors, plus amortized merge records.
+    """
+    BLOCK=16
+    def __init__(self,journal,user_id,policy_sha256):
+        self.journal,self.user_id,self.policy=journal,user_id,policy_sha256
+    @staticmethod
+    def _digest(value):
+        if type(value) is not str or len(value)!=64 or any(c not in '0123456789abcdef' for c in value):
+            raise JournalConflict('status index digest differs')
+        return value
+    def empty(self,first=1):
+        return {'schema_version':1,'first_version':first,'last_version':first-1,'peaks':[],'tail':[]}
+    def validate(self,value,last):
+        if (type(value) is not dict or set(value)!={'schema_version','first_version','last_version','peaks','tail'}
+                or type(value['schema_version']) is not int or value['schema_version']!=1
+                or type(value['first_version']) is not int or type(value['last_version']) is not int
+                or not 1<=value['first_version']<=last+1 or value['last_version']!=last
+                or type(value['peaks']) is not list or len(value['peaks'])>63
+                or type(value['tail']) is not list or len(value['tail'])>=self.BLOCK):
+            raise JournalConflict('status index frontier differs')
+        cursor=value['first_version'];previous_height=63
+        for peak in value['peaks']:
+            if (type(peak) is not dict or set(peak)!={'first_version','height','head'}
+                    or type(peak['height']) is not int or not 0<=peak['height']<previous_height
+                    or type(peak['first_version']) is not int or peak['first_version']!=cursor):
+                raise JournalConflict('status index peak differs')
+            self._digest(peak['head']);previous_height=peak['height']
+            cursor+=self.BLOCK*(1<<peak['height'])
+            if cursor>last+1:raise JournalConflict('status index range differs')
+        for head in value['tail']:self._digest(head)
+        if cursor+len(value['tail'])!=last+1:raise JournalConflict('status index coverage differs')
+        return value
+    def _put(self,value,assert_lock):
+        assert_lock();check_deadline()
+        return self.journal.put('status_index',{'schema_version':1,'user_id':self.user_id,'policy_sha256':self.policy,**value})
+    def append(self,value,version,head,assert_lock):
+        self.validate(value,version-1);self._digest(head)
+        result={**value,'last_version':version,'peaks':[dict(p) for p in value['peaks']],'tail':[*value['tail'],head]}
+        if len(result['tail'])<self.BLOCK:return result
+        first=version-self.BLOCK+1
+        digest=self._put({'first_version':first,'height':0,'heads':result['tail']},assert_lock)
+        result['tail']=[];result['peaks'].append({'first_version':first,'height':0,'head':digest})
+        while len(result['peaks'])>1 and result['peaks'][-1]['height']==result['peaks'][-2]['height']:
+            right=result['peaks'].pop();left=result['peaks'].pop();height=left['height']+1
+            digest=self._put({'first_version':left['first_version'],'height':height,'left':left['head'],'right':right['head']},assert_lock)
+            result['peaks'].append({'first_version':left['first_version'],'height':height,'head':digest})
+        return self.validate(result,version)
+    def lookup(self,value,last,version):
+        self.validate(value,last)
+        if version<value['first_version']:raise JournalMissing('operation predates indexed committed horizon')
+        for peak in value['peaks']:
+            first,height,head=peak['first_version'],peak['height'],peak['head']
+            if not first<=version<first+self.BLOCK*(1<<height):continue
+            while True:
+                check_deadline();node=self.journal.get(head,'status_index')
+                expected={'schema_version','user_id','policy_sha256','first_version','height'}|({'heads'} if height==0 else {'left','right'})
+                if (type(node) is not dict or set(node)!=expected or type(node['schema_version']) is not int or node['schema_version']!=1
+                        or node['user_id']!=self.user_id or node['policy_sha256']!=self.policy
+                        or type(node['first_version']) is not int or node['first_version']!=first
+                        or type(node['height']) is not int or node['height']!=height):
+                    raise JournalConflict('status index node identity differs')
+                if height==0:
+                    if type(node['heads']) is not list or len(node['heads'])!=self.BLOCK:raise JournalConflict('status index block differs')
+                    for digest in node['heads']:self._digest(digest)
+                    return node['heads'][version-first]
+                self._digest(node['left']);self._digest(node['right'])
+                height-=1;middle=first+self.BLOCK*(1<<height)
+                if version<middle:head=node['left']
+                else:head=node['right'];first=middle
+        tail_first=last-len(value['tail'])+1
+        if not tail_first<=version<=last:raise JournalConflict('status index target differs')
+        return value['tail'][version-tail_first]
+
+
 def validate_committed_head(snapshot, journal):
     if snapshot.state.operation_version == 0:
         if snapshot.head is not None:
@@ -172,6 +253,7 @@ def validate_committed_head(snapshot, journal):
             or row.get('state_sha256') != reducer.state_sha256(snapshot.state)
             or row.get('complete_sha256') != complete_digest):
         raise JournalConflict('committed head does not bind the complete user point')
+    return row
 
 
 class AtomicUserStore(Protocol):
@@ -193,7 +275,31 @@ class Coordinator:
             reducer.check_bootstrap(snapshot.state, self.policy)
         else:
             reducer.recommendation_view(snapshot.state,self.policy,session_id=None,epoch=None,as_of_ms=snapshot.state.effective_ms)
-        validate_committed_head(snapshot, self.journal)
+        return validate_committed_head(snapshot, self.journal)
+    def _index_before(self,snapshot,assert_lock):
+        index=_StatusIndex(self.journal,snapshot.user_id,self.policy.sha256)
+        version=snapshot.state.operation_version
+        if version==0:return index.empty()
+        row=self.journal.get(snapshot.head,'prepare')
+        expected=reducer.state_sha256(snapshot.state)
+        if row.get('user_id')!=snapshot.user_id or row.get('operation_version')!=version or row.get('state_sha256')!=expected:
+            raise JournalConflict('index predecessor differs from committed head')
+        if 'status_index' in row:
+            return index.append(row['status_index'],version,snapshot.head,assert_lock)
+        # One legacy conversion, confined to the existing proof horizon. It runs
+        # in the renewed-lock worker before CAS; old read-only heads still work.
+        entries=[];head=snapshot.head
+        for _ in range(self.journal.limits.history_operations):
+            assert_lock();check_deadline()
+            if head is None:break
+            if row.get('user_id')!=snapshot.user_id or row.get('operation_version')!=version or row.get('state_sha256')!=expected:
+                raise JournalConflict('legacy index ancestry differs')
+            entries.append((version,head));head,expected,version=row['previous_head'],row['previous_state_sha256'],version-1
+            if head is None or len(entries)==self.journal.limits.history_operations:break
+            row=self.journal.get(head,'prepare')
+        result=index.empty(entries[-1][0])
+        for version,head in reversed(entries):result=index.append(result,version,head,assert_lock)
+        return result
     def _empty_prefix(self, header):
         if header.previous_operation_version != 0:
             raise reducer.OperationGap('missing prefix cannot be inferred from a cursor')
@@ -236,6 +342,7 @@ class Coordinator:
             'state_sha256': reducer.state_sha256(after), 'complete_sha256': complete_sha}
         if insert:
             row['genesis_checkpoint_sha256'] = self._checkpoint_snapshot(before)
+        row['status_index']=self._index_before(before,assert_lock)
         head = self.journal.put('prepare', row)
         if disposition == 'withdrawn_profile':
             self.dead_letter_prepare(operation.header, input_sha, head, 'PROFILE_CONSENT_WITHDRAWN')
@@ -298,30 +405,38 @@ class Coordinator:
             operation_version=header.operation_version, source_sha256=header.source_envelope_sha256, expected_header=header)
 
     def status_for_identity(self, snapshot, *, operation_id, operation_version, source_sha256, expected_header=None):
-        self._validate_snapshot(snapshot)
-        head = snapshot.head
-        expected = reducer.state_sha256(snapshot.state)
-        version = snapshot.state.operation_version
+        current=self._validate_snapshot(snapshot)
+        if snapshot.state.operation_version-operation_version>=self.journal.limits.history_operations:
+            raise HistoryBudget('bounded original-operation proof exhausted')
+        def result(head,row):
+            frozen=self.journal.get(row['input_sha256'],'input');operation=_unpack(frozen['operation'])
+            if (operation.header.operation_id!=operation_id or operation.header.user_id!=snapshot.user_id
+                    or operation.header.operation_version!=operation_version or operation.header.source_envelope_sha256!=source_sha256
+                    or (expected_header is not None and operation.header!=expected_header)):
+                raise OriginalIdentityConflict('committed original UUID/version/source bytes differ')
+            if row.get('disposition') not in {'applied','withdrawn_profile','rejected'}:
+                raise JournalConflict('committed disposition differs')
+            check_deadline()
+            return {'status':'withdrawn_profile' if row['disposition']=='withdrawn_profile' else
+                ('rejected_capacity' if row.get('error_code')=='MODEL_STATE_CAPACITY' else 'rejected_session_dependency')
+                if row['disposition']=='rejected' else 'applied','operation_head':head,'operation':operation,'row':row}
+        head=snapshot.head;expected=reducer.state_sha256(snapshot.state);version=snapshot.state.operation_version
         for _ in range(self.journal.limits.history_operations):
-            if head is None:
-                raise JournalMissing('original operation predates committed proof horizon')
-            row = self.journal.get(head, 'prepare')
-            if row.get('user_id') != snapshot.user_id or row.get('state_sha256') != expected or row.get('operation_version') != version:
+            check_deadline()
+            if head is None:raise JournalMissing('original operation predates committed proof horizon')
+            row=current if head==snapshot.head else self.journal.get(head,'prepare')
+            if row.get('user_id')!=snapshot.user_id or row.get('state_sha256')!=expected or row.get('operation_version')!=version:
                 raise JournalConflict('committed original-operation chain differs')
-            if version == operation_version:
-                frozen = self.journal.get(row['input_sha256'], 'input')
-                operation = _unpack(frozen['operation'])
-                if (operation.header.operation_id != operation_id or operation.header.user_id != snapshot.user_id
-                        or operation.header.source_envelope_sha256 != source_sha256
-                        or (expected_header is not None and operation.header != expected_header)):
-                    raise OriginalIdentityConflict('committed original UUID/version/source bytes differ')
-                return {'status': 'withdrawn_profile' if row['disposition'] == 'withdrawn_profile' else
-                    ('rejected_capacity' if row.get('error_code') == 'MODEL_STATE_CAPACITY' else 'rejected_session_dependency')
-                    if row['disposition'] == 'rejected' else 'applied',
-                    'operation_head': head, 'operation': operation, 'row': row}
-            if version < operation_version:
-                raise reducer.OperationGap('requested original operation is not applied')
-            head, expected, version = row['previous_head'], row['previous_state_sha256'], version - 1
+            if version==operation_version:return result(head,row)
+            if version<operation_version:raise reducer.OperationGap('requested original operation is not applied')
+            if head==snapshot.head and 'status_index' in row:
+                index=_StatusIndex(self.journal,snapshot.user_id,self.policy.sha256)
+                indexed_head=index.lookup(row['status_index'],version-1,operation_version)
+                indexed=self.journal.get(indexed_head,'prepare')
+                if indexed.get('user_id')!=snapshot.user_id or indexed.get('operation_version')!=operation_version:
+                    raise JournalConflict('indexed committed operation differs')
+                return result(indexed_head,indexed)
+            head,expected,version=row['previous_head'],row['previous_state_sha256'],version-1
         raise HistoryBudget('bounded original-operation proof exhausted')
 
     def apply(self,header,kind,source_envelope,resolve,legacy_prepare,assert_lock):
@@ -367,6 +482,7 @@ class Coordinator:
                   'state_sha256':reducer.state_sha256(after_state),'complete_sha256':complete_sha}
         if causal_head is not None:
             prepared['causal_prepare_sha256'] = causal_head
+        prepared['status_index']=self._index_before(before,assert_lock)
         head=self.journal.put('prepare',prepared)
         desired=Snapshot(header.user_id,after_state,head,complete)
         if disposition=='rejected':
@@ -506,6 +622,7 @@ class QdrantRecords:
         self.client,self.models,self.collection,self.limit=client,models,collection,record_bytes
     def _id(self,key): return str(uuid.uuid5(uuid.UUID('f9013b12-7bbc-4f1a-b63e-26a0190a13d0'),key))
     def get(self,key):
+        check_deadline()
         rows=self.client.retrieve(collection_name=self.collection,ids=[self._id(key)],with_payload=True,with_vectors=False)
         if not rows: return None
         if len(rows)!=1: raise JournalConflict('ambiguous journal locator')
@@ -516,6 +633,7 @@ class QdrantRecords:
         if not 0<len(raw)<=self.limit or _sha(raw)!=payload['sha256']: raise JournalConflict('journal bytes/hash mismatch')
         return raw
     def put_once(self,key,raw):
+        check_deadline()
         if type(key) is not str or len(key)>160 or type(raw) is not bytes or not 0<len(raw)<=self.limit:
             raise JournalError('immutable record budget')
         self.client.upsert(collection_name=self.collection,points=[self.models.PointStruct(
@@ -639,6 +757,7 @@ class QdrantAtomicUsers:
         self._point(snapshot)
 
     def read_optional(self, user_id):
+        check_deadline()
         rows = self.client.retrieve(collection_name=self.collection, ids=[_uuid(user_id)], with_payload=True, with_vectors=True)
         if not rows:
             if self.refuse_missing is not None:

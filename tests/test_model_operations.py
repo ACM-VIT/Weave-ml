@@ -76,6 +76,193 @@ def feedback_payload(version=1, kind='like', session=None):
 def parse(text, p):
     return parse_operation(text, maximum_bytes=131072, allowed_policies={p.sha256})
 
+
+def status_history(length,legacy_until=0,coordinator_type=None,**policy_changes):
+    from feedback.model_journal import Coordinator, JournalMissing, _canonical
+    class Records:
+        def __init__(self):self.rows={};self.reads=0;self.writes=0
+        def get(self,key):self.reads+=1;return self.rows.get(key)
+        def put_once(self,key,raw):
+            if key not in self.rows:self.writes+=1
+            return self.rows.setdefault(key,raw)
+    class HistoryJournal(Journal):
+        legacy=False
+        def put(self,kind,value):
+            # An older writer's actual prepare format; the bytes are still
+            # canonical/content-addressed and every chain validation is real.
+            if self.legacy and kind=='prepare':value={k:v for k,v in value.items() if k!='status_index'}
+            return super().put(kind,value)
+    class Users:
+        snapshot=None;fail_cas=False
+        def read_optional(self,user):return self.snapshot
+        def read(self,user):
+            if self.snapshot is None:raise JournalMissing('fixture missing')
+            return self.snapshot
+        def insert_once(self,desired):
+            if self.snapshot is not None:return False
+            self.snapshot=desired;return True
+        def compare_and_set(self,expected,desired):
+            if self.fail_cas:self.fail_cas=False;return False
+            if self.snapshot!=expected:return False
+            self.snapshot=desired;return True
+    p=policy(**policy_changes);records=Records();journal=HistoryJournal(records,Limits(131072,2097152,1048576,1000));users=Users()
+    coordinator=(coordinator_type or Coordinator)(journal,users,p);snapshots={};headers={}
+    def append():
+        version=1 if users.snapshot is None else users.snapshot.state.operation_version+1
+        journal.legacy=version<=legacy_until
+        raw=wire(p,'profile',version,profile_payload(initial=version==1,version=version));operation_wire=parse(raw,p)
+        source=model.PinnedVector.pin('profile',uid(1),version,0,p.baseline_recipe,p.embedding,basis(0))
+        operation=model.Profile(operation_wire.header,source,version==1);headers[version]=operation.header
+        legacy=_canonical({'vector':basis(0),'payload':{'user_id':uid(1),'profile_version':version,
+            'last_feedback_version':0 if users.snapshot is None else users.snapshot.state.feedback_version,'feedback_state_revision':version}})
+        if version==1:coordinator.initialize(operation.header,raw.encode(),lambda:operation,legacy,lambda:None)
+        else:coordinator.apply(operation.header,'profile',raw.encode(),lambda:operation,lambda *_:legacy,lambda:None)
+        snapshots[version]=users.snapshot
+        return users.snapshot
+    for _ in range(length):append()
+    return SimpleNamespace(records=records,journal=journal,users=users,coordinator=coordinator,p=p,snapshots=snapshots,headers=headers,append=append)
+
+
+@pytest.fixture(scope='module')
+def indexed_history():return status_history(1000)
+
+
+def test_historical_status_proofs_have_logarithmic_reads_and_exact_original_heads(indexed_history):
+    import math
+    f=indexed_history
+    for length in (10,100,1000):
+        targets=[1,length//2,length]
+        if length==1000:targets+=[15,16,17,31,32,33,63,64,65,127,128,129,255,256,257,999]
+        for target in targets:
+            h=f.headers[target];f.records.reads=0
+            result=f.coordinator.status_for_identity(f.snapshots[length],operation_id=h.operation_id,
+                operation_version=target,source_sha256=h.source_envelope_sha256)
+            reads=f.records.reads
+            assert result['status']=='applied' and result['operation_head']==f.snapshots[target].head
+            if target in (1,length):print({'history':length,'target':target,'journal_reads':reads})
+            assert reads<=4+math.ceil(math.log2(max(1,length/16)))
+    # Blocks plus binary carry nodes cost less than one new record per 8 ancestors.
+    index_records=[raw for raw in f.records.rows.values() if json.loads(raw).get('kind')=='status_index']
+    assert len(index_records)<1000/8
+
+
+def test_legacy_status_stays_read_only_and_is_indexed_on_its_next_commit():
+    f=status_history(40,legacy_until=40);h=f.headers[1];before=f.records.writes
+    assert f.coordinator.original_status(f.users.snapshot,h)['status']=='applied'
+    assert f.records.writes==before,'status lookup must never backfill or claim a write'
+    f.append();f.records.reads=0
+    assert f.coordinator.original_status(f.users.snapshot,h)['operation_head']==f.snapshots[1].head
+    assert f.records.reads<=6
+    # Rebuild still follows the original chain, including the new metadata.
+    first=f.journal.get(f.snapshots[1].head,'prepare');checkpoint=first['genesis_checkpoint_sha256']
+    assert f.coordinator.rebuild(checkpoint,f.users.snapshot.head,expected_user_id=uid(1))==f.users.snapshot
+
+
+def test_indexed_status_refuses_missing_corrupt_foreign_and_uncommitted_proofs(monkeypatch):
+    from feedback.model_journal import JournalMissing,CasConflict,OriginalIdentityConflict,HistoryBudget
+    from utils.deadline import RequestDeadline,deadline_scope,CooperativeDeadlineExceeded
+    f=status_history(40);h=f.headers[1]
+    with pytest.raises(OriginalIdentityConflict):f.coordinator.status_for_identity(f.users.snapshot,
+        operation_id=uid(9999),operation_version=1,source_sha256=h.source_envelope_sha256)
+    with pytest.raises(OriginalIdentityConflict):f.coordinator.status_for_identity(f.users.snapshot,
+        operation_id=h.operation_id,operation_version=1,source_sha256='f'*64)
+    root=f.journal.get(f.users.snapshot.head,'prepare')['status_index']['peaks'][0]['head'];key='blob:'+root;raw=f.records.rows.pop(key)
+    try:
+        with pytest.raises(JournalMissing):f.coordinator.original_status(f.users.snapshot,h)
+    finally:f.records.rows[key]=raw
+    # A self-consistent but foreign/malformed indexed node is not authority,
+    # even when a faulty stored head points at its valid content address.
+    committed=f.journal.get(f.users.snapshot.head,'prepare');node=f.journal.get(root,'status_index')
+    for wrong in ({**node,'user_id':uid(2)},{**node,'policy_sha256':'f'*64},{**node,'first_version':2}):
+        bad=deepcopy(committed);bad['status_index']['peaks'][0]['head']=f.journal.put('status_index',wrong)
+        damaged=replace(f.users.snapshot,head=f.journal.put('prepare',bad))
+        with pytest.raises(JournalConflict):f.coordinator.original_status(damaged,h)
+    f.records.rows[key]=raw+b' '
+    try:
+        with pytest.raises(JournalConflict):f.coordinator.original_status(f.users.snapshot,h)
+    finally:f.records.rows[key]=raw
+    before=f.users.snapshot;f.users.fail_cas=True
+    with pytest.raises(CasConflict):f.append()
+    assert f.users.snapshot==before
+    with pytest.raises(model.OperationGap):f.coordinator.original_status(f.users.snapshot,f.headers[41])
+    assert f.coordinator.original_status(f.users.snapshot,h)['operation_head']==f.snapshots[1].head
+    # Cancellation during a dependency read prevents the next history/index read.
+    deadline=RequestDeadline(10);original=f.records.get;reads=0
+    def cancelled(key):
+        nonlocal reads
+        result=original(key);reads+=1;deadline.cancel();return result
+    with monkeypatch.context() as patch:
+        patch.setattr(f.records,'get',cancelled)
+        with deadline_scope(deadline),pytest.raises(CooperativeDeadlineExceeded):f.coordinator.original_status(f.users.snapshot,h)
+    assert reads==1
+    # The configured proof horizon remains a logical limit even with an index.
+    old=f.journal.limits;f.journal.limits=replace(old,history_operations=10)
+    try:
+        with pytest.raises(HistoryBudget):f.coordinator.original_status(f.users.snapshot,h)
+    finally:f.journal.limits=old
+
+
+def test_registered_status_propagates_a_read_only_budget_into_the_feedback_executor(monkeypatch):
+    import feedback.model_runtime as provider
+    from utils.deadline import current_deadline
+    f=status_history(20);h=f.headers[1];original_get=f.records.get;calls=[];finished=threading.Event()
+    runtime=SimpleNamespace(users=f.users,processor=SimpleNamespace(coordinator=f.coordinator))
+    monkeypatch.setattr(provider,'model_runtime',lambda:runtime);monkeypatch.setenv('INTERNAL_API_SECRET','fixture-secret')
+    app=FastAPI();app.include_router(v2.router);client=TestClient(app)
+    identity={'schema_version':1,'user_id':uid(1),'operation_id':h.operation_id,'model_operation_version':'1','source_envelope_sha256':h.source_envelope_sha256}
+    headers={'x-internal-secret':'fixture-secret'}
+    response=client.post('/api/v2/model-operation-status',headers=headers,json=identity)
+    assert response.status_code==200 and response.json()['operation_head']==f.snapshots[1].head
+    def cancel_after_read(key):
+        deadline=current_deadline();assert deadline is not None,'the status worker must own the HTTP read budget'
+        result=original_get(key);calls.append(key);deadline.cancel();return result
+    original_status=f.coordinator.status_for_identity
+    def observed(*args,**kwargs):
+        try:return original_status(*args,**kwargs)
+        finally:finished.set()
+    monkeypatch.setattr(f.records,'get',cancel_after_read);monkeypatch.setattr(f.coordinator,'status_for_identity',observed)
+    response=client.post('/api/v2/model-operation-status',headers=headers,json=identity)
+    assert response.status_code==503 and finished.wait(2) and len(calls)==1
+    calls.clear()
+    response=client.post('/api/v2/model-operation-status',headers={**headers,'X-Request-Timeout-Ms':'nan'},json=identity)
+    assert response.status_code==400 and not calls
+
+
+def test_indexed_status_preserves_committed_rejections_withdrawals_and_orphan_boundaries():
+    from feedback.model_journal import Coordinator,CasConflict,_canonical
+    from feedback.model_wire import parse_withdrawal
+    f=status_history(1,max_sessions=1);prepared=[]
+    def compatibility(complete,operation):
+        legacy=json.loads(complete)['legacy'];legacy['payload']['feedback_state_revision']+=1
+        if isinstance(operation,model.Feedback):legacy['payload']['last_feedback_version']=operation.feedback_version
+        return _canonical(legacy)
+    coordinator=Coordinator(f.journal,f.users,f.p,reject_capacity=True,legacy_reject=compatibility,
+        dead_letter_prepare=lambda header,input_sha,head,code:prepared.append((head,code)))
+    def begin(version,session):
+        raw=wire(f.p,'begin',version,begin_payload(version,session));header=parse(raw,f.p).header
+        operation=model.Begin(header,session,version,'b'*64)
+        return header,lambda:coordinator.apply(header,'begin',raw.encode(),lambda:operation,compatibility,lambda:None)
+    _,first=begin(2,uid(50));first()
+    rejected,second=begin(3,uid(51));f.users.fail_cas=True
+    with pytest.raises(CasConflict):second()
+    with pytest.raises(model.OperationGap):coordinator.original_status(f.users.snapshot,rejected)
+    assert second()=='rejected';capacity_head=f.users.snapshot.head
+    payload=feedback_payload(session=uid(51));payload['canonical_attribution']['epoch_started_ms']='3'
+    raw=wire(f.p,'feedback',4,payload);feedback_header=parse(raw,f.p).header
+    source=model.PinnedVector.pin('repository',uid(100),1,0,f.p.repository_recipe,f.p.embedding,basis(1))
+    operation=model.Feedback(feedback_header,uid(2001),1,uid(100),'like',source,
+        model.SessionBinding(uid(1),uid(51),1,3,True,'b'*64),None,None)
+    assert coordinator.apply(feedback_header,'feedback',raw.encode(),lambda:operation,compatibility,lambda:None)=='rejected'
+    dependency_head=f.users.snapshot.head;f.append()
+    original=wire(f.p,'profile',6,profile_payload(initial=False,version=6))
+    attestation=parse_withdrawal(withdrawal(f.p,original),maximum_bytes=131072,allowed_policies={f.p.sha256})
+    assert coordinator.apply_withdrawal(attestation,lambda:None)=='withdrawn_profile'
+    withdrawal_head=f.users.snapshot.head;f.append()
+    for header,status,head in [(rejected,'rejected_capacity',capacity_head),
+            (feedback_header,'rejected_session_dependency',dependency_head),(attestation.header,'withdrawn_profile',withdrawal_head)]:
+        proof=coordinator.original_status(f.users.snapshot,header)
+        assert proof['status']==status and proof['operation_head']==head
+
 @pytest.mark.parametrize('mutate', [
     lambda raw: raw+' ', lambda raw: raw.replace('"schema_version":1', '"schema_version":true'),
     lambda raw: raw.replace('"schema_version":1', '"schema_version":1,"schema_version":1'),
