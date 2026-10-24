@@ -1271,3 +1271,46 @@ def test_refunded_recovery_copy_keeps_permanent_reservation_hash_authoritative(r
     assert records.put_once(key,changed)==changed
     with pytest.raises(ModelLaneUnavailable):budget.get(key)
     assert runtime.redis.hgetall(budget.key)==before
+
+
+def test_explicit_verified_tier_preserves_reversal_withdrawal_and_rebuild(runtime):
+    from feedback.model_runtime import BudgetedRecords
+    from feedback.model_retention import VerifiedJournalTier
+    from feedback.model_journal import QdrantRecords
+    archive_collection = 'fixture_model_archive'
+    runtime.qdrant.create_collection(archive_collection, vectors_config={})
+    old = runtime.journal.records
+    archive = BudgetedRecords(QdrantRecords(runtime.qdrant, models,
+        collection=archive_collection, record_bytes=runtime.journal.limits.record_bytes),
+        runtime.redis, key='fixture-archive-budget', max_records=1000, max_bytes=100000000)
+    tier = VerifiedJournalTier(old.records, runtime.redis, key=old.key,
+        max_records=old.max_records, max_bytes=old.max_bytes, archive=archive,
+        signing_key=b'fixture-only-key-do-not-use-live!!', decision_sha256='a'*64)
+    runtime.journal.records = tier
+    initialize(runtime)
+    checkpoint = runtime.processor.coordinator.checkpoint(uid(1))
+    apply(runtime, wire(runtime.policy, 'feedback', 3, feedback_payload()))
+    apply(runtime, wire(runtime.policy, 'feedback', 4, feedback_payload(2, kind='unlike')))
+    raw = wire(runtime.policy, 'profile', 5, profile_payload(False, 2))
+    attestation = withdrawal(runtime.policy, raw, revoked_at=6)
+    runtime.stream.admit_withdrawal(attestation)
+    assert runtime.consumer().run_once() == 1
+    final = runtime.users.read(uid(1))
+    keys = [key.decode() if isinstance(key, bytes) else key for key in runtime.redis.hkeys(tier.key)]
+    keys = [key for key in keys if not key.startswith('_')]
+    assert keys
+    for key in keys:
+        tier.compact(key)
+    assert tier.metrics()['hot_records'] == tier.metrics()['hot_bytes'] == 0
+    assert runtime.processor.coordinator.rebuild(checkpoint, final.head, expected_user_id=uid(1)) == final
+    assert not final.state.long_entries
+    assert runtime.stream.admit(raw)['status'] == 'withdrawal_accepted'
+    assert runtime.stream.admit_withdrawal(attestation)['status'] == 'duplicate'
+    original = wire(runtime.policy, 'profile', 1, profile_payload())
+    assert runtime.processor(parse(original, runtime.policy), lambda: None) == 'duplicate'
+    changed = json.loads(original)
+    changed['operation']['original_profile_context']['interests'] = ['changed']
+    from feedback.model_wire import canonical_json
+    with pytest.raises(OperationBytesConflict):
+        runtime.stream.admit(canonical_json(changed))
+    assert runtime.redis.hget(runtime.stream.guard_key, uid(1)) in {'initialized', b'initialized'}
