@@ -78,3 +78,29 @@ def test_production_preflight_checks_prefix_policy(policy, valid):
     env = valid_production_env() | {'SUMMARY_SOURCE_OVERFLOW_POLICY': policy}
     issues = validate_production_config(env)
     assert any(issue.name == 'SUMMARY_SOURCE_OVERFLOW_POLICY' for issue in issues) is not valid
+
+
+@pytest.mark.parametrize('policy', ['', '   '])
+def test_production_preflight_rejects_explicit_blank_prefix_policy(policy, monkeypatch):
+    from scripts.validate_production_config import validate_production_config
+    from tests.test_production_config import valid_production_env
+
+    env = valid_production_env() | {'SUMMARY_SOURCE_OVERFLOW_POLICY': policy}
+    assert any(issue.name == 'SUMMARY_SOURCE_OVERFLOW_POLICY'
+               for issue in validate_production_config(env))
+    monkeypatch.setenv('SUMMARY_SOURCE_OVERFLOW_POLICY', policy)
+    with pytest.raises(ValueError, match='SUMMARY_SOURCE_OVERFLOW_POLICY'):
+        SummarySettings.from_env()
+
+
+def test_absent_prefix_policy_uses_reject_default_in_preflight_and_runtime(monkeypatch):
+    from scripts.validate_production_config import validate_production_config
+    from tests.test_production_config import valid_production_env
+
+    env = valid_production_env()
+    env.pop('SUMMARY_SOURCE_OVERFLOW_POLICY', None)
+    assert not any(issue.name == 'SUMMARY_SOURCE_OVERFLOW_POLICY'
+                   for issue in validate_production_config(env))
+    monkeypatch.delenv('SUMMARY_SOURCE_OVERFLOW_POLICY', raising=False)
+    assert SummarySettings.from_env().source_overflow_policy == 'reject'
+
