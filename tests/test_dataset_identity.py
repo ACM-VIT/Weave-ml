@@ -50,6 +50,16 @@ def test_explicit_cross_encoder_policy_keeps_per_run_identity_and_metrics():
 @pytest.mark.parametrize('part',['readme','context','judgments','split','exclusions','intent','disliked'])
 def test_every_raw_source_label_split_and_exclusion_change_is_bound(part):
     old,policy=fixture_report();raw=read('bundle.json')
+    unchanged=Bundle.model_validate(raw)
+    policy=Policy.model_validate({**policy.model_dump(mode='json'),'embedding_comparison':'cross_embedding'})
+    # The dated fixture report retains its v1 hash. Build a v2 comparison basis
+    # from the untouched source first, so a version-domain mismatch cannot make
+    # every mutation look bound even if the mutated field is omitted entirely.
+    reference={**old.report.model_dump(mode='json'),'evaluation_dataset_sha256':unchanged.dataset.sha256,
+               'bundle_sha256':digest(unchanged)}
+    baseline=Baseline.model_validate({**old.model_dump(mode='json'),'policy_sha256':digest(policy),
+        'report_sha256':digest(reference),'report':reference})
+    assert assess(reference,baseline,policy)['passed']
     if part=='readme':raw['dataset']['repositories'][0]['readme']='different frozen source'
     elif part=='context':raw['dataset']['profiles'][0]['context_text']='different original profile context'
     elif part=='judgments':
@@ -64,10 +74,8 @@ def test_every_raw_source_label_split_and_exclusion_change_is_bound(part):
     else:
         raw['dataset']['profiles'][0]['seen']=[];raw['profiles'][0]['seen']=[]
     changed=Bundle.model_validate(raw)
-    assert changed.dataset.sha256!=old.report.evaluation_dataset_sha256
-    policy=Policy.model_validate({**policy.model_dump(mode='json'),'embedding_comparison':'cross_embedding'})
-    baseline=Baseline.model_validate({**old.model_dump(mode='json'),'policy_sha256':digest(policy)})
-    report={**old.report.model_dump(mode='json'),'evaluation_dataset_sha256':changed.dataset.sha256}
+    assert changed.dataset.sha256!=unchanged.dataset.sha256
+    report={**reference,'evaluation_dataset_sha256':changed.dataset.sha256,'bundle_sha256':digest(changed)}
     assert any('identical verified raw' in f for f in assess(report,baseline,policy)['failures'])
 
 
