@@ -533,13 +533,48 @@ a load balancer.
 
 ## Deployment and rollback
 
-A successful `Test Trending Service` push run on `main` starts deployment for
-that exact tested SHA. A stale completion is skipped if `main` has advanced.
+A successful `Test Trending Service` push run on `main` builds and archives
+one release image after its deterministic, integration, benchmark and contract
+checks. Its downstream job calls `deploy.yml` in the same run and deploys that
+exact tested SHA. This replaces the previous `workflow_run` trigger; retry the
+whole failed run to regenerate its artifact, rather than starting `deploy.yml`
+independently. Artifacts include the run attempt in their name and expire after
+three days. Retrying only deployment after expiry fails closed and requires a
+fresh full run. No deployment build or dependency installation is performed.
+The separate `Verify GitSocial ML` pytest check and PR Docker validation remain;
+PR contract breaking-change checks remain unchanged. A stale completion is
+skipped if `main` has advanced.
 One non-cancelling deployment concurrency group prevents two workflow releases
 from racing image aliases on the host. The workflow targets the GitHub
 `production` environment. Repository administrators must configure its required
 reviewers and branch restrictions; declaring the environment in YAML does not
 create those protection rules.
+
+The build context comes from `git archive` of the verified SHA, so untracked
+test outputs cannot enter the release image. Release BuildKit caches use the
+existing Actions cache service, scoped to
+trusted main builds, architecture, Dockerfile (including base image, trust wheel
+hash and model revision), `.dockerignore`, `pyproject.toml` and `uv.lock`.
+`mode=max` retains intermediate dependency/model layers across hosted runners;
+BuildKit's own COPY/RUN input hashes invalidate changed source layers. PRs do
+not import or export this release cache. uv's existing lock-aware Actions cache
+is also enabled in `ci.yml`. Caches are only an optimization: a miss rebuilds
+from pinned inputs; missing or invalid release artifacts stop deployment.
+No registry, new credentials or broader repository permissions are introduced.
+The immutable image digest here is the Docker image config SHA-256, checked
+against archive config bytes and the loaded image ID; no registry manifest or
+registry digest is invented for this Docker-save transport.
+
+Before claiming a performance improvement, retain Actions build records and
+job timing for a cold build and a source-only build on equivalent runners with
+the same lockfile, Dockerfile, base/model revisions and build settings. Clear
+only the scoped release cache for the cold run; change only application source
+for the warm run. Record dependency/model network download bytes from BuildKit
+logs or runner network counters, build elapsed seconds, total job/runner minutes,
+archive bytes and cache-hit stages. Keep the input hashes and immutable image
+IDs with both measurements. The archive must still be transferred on every
+release. No local Docker daemon, representative Actions run, cache-hit ratio,
+download saving or deployment speedup is assumed from static validation.
 
 Configure `AWS_HOST`, `AWS_USER`, `AWS_PRIVATE_KEY`, and
 `AWS_HOST_FINGERPRINT` as production-environment secrets. The fingerprint must
@@ -554,12 +589,16 @@ cutover; the workflow never waits for or supplies a sudo password.
 
 Deployment order is:
 
-1. run the complete test suite, build the immutable SHA-tagged image, and verify
-   that the tested SHA is still `main`;
+1. finish all existing `Test Trending Service` gates, build the SHA-stamped image
+   once and upload it as an immutable same-run Actions artifact; after production
+   approval, download it and verify its archive SHA-256, exact commit/tree,
+   Dockerfile/trust/model and locked-dependency input hashes, image config digest,
+   OCI revision label and both baked release IDs; verify the SHA is still `main`;
 2. upload over fingerprint-pinned SSH, verify the SHA-256 manifest for the
    archive/size metadata/helpers/units, and require free Docker storage of at
    least the larger of the inspected image size or three times the compressed
-   archive, plus 2 GiB, before loading;
+   archive, plus 2 GiB, before loading; check the loaded image config digest,
+   revision label and both baked release IDs before any service mutation;
 3. install SHA-versioned validator and smoke helpers, run both network-free
    configuration modes, and idempotently bootstrap/validate Qdrant;
 4. preserve the prior `current` image under a transaction-only tag and back up
