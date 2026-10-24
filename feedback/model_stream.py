@@ -29,7 +29,7 @@ end
 local extra = 2
 local newguard = redis.call('hexists', KEYS[4], ARGV[8]) == 0
 if newguard and redis.call('hlen', KEYS[4]) >= tonumber(ARGV[9]) then return -2 end
-if redis.call('xlen', KEYS[1]) >= tonumber(ARGV[6]) or
+if redis.call('xlen', KEYS[1]) >= tonumber(ARGV[6]) + tonumber(ARGV[10]) or
    redis.call('hlen', KEYS[2]) + extra > tonumber(ARGV[7]) then return -2 end
 redis.call('xadd', KEYS[1], '*', 'operation_json', ARGV[5])
 redis.call('hset', KEYS[2], ARGV[1], ARGV[3], ARGV[2], ARGV[4])
@@ -45,7 +45,7 @@ if withdrawn then return withdrawn == ARGV[5] and 0 or -1 end
 local extra = old and 0 or 2
 if redis.call('hexists', KEYS[4], ARGV[8]) == 0 and
    redis.call('hlen', KEYS[4]) >= tonumber(ARGV[9]) then return -2 end
-if redis.call('xlen', KEYS[1]) >= tonumber(ARGV[6]) or
+if redis.call('xlen', KEYS[1]) >= tonumber(ARGV[6]) + tonumber(ARGV[10]) or
    redis.call('hlen', KEYS[2]) + extra > tonumber(ARGV[7]) or
    redis.call('hlen', KEYS[3]) >= tonumber(ARGV[7]) then return -2 end
 redis.call('xadd', KEYS[1], '*', 'withdrawal_json', ARGV[5])
@@ -83,6 +83,12 @@ return 1
 
 @dataclass(frozen=True)
 class StreamLimits:
+    """Normal entries plus exactly one global, ready-only recovery entry.
+
+    The absolute stream ceiling is max_pending + 1, independent of the number
+    of users and missing versions. Duplicate/guard/journal/DLQ limits still fail
+    closed; the recovery entry never bypasses any of those durable budgets.
+    """
     namespace: str
     max_pending: int
     max_identities: int
@@ -115,6 +121,20 @@ class OperationStream:
         self.group = limits.namespace + ':workers'
         self.withdrawals = limits.namespace + ':withdrawals'
         self.profile_preflight = None
+        self.ready_predecessor = None
+
+    def _admission(self, script, operation, *args):
+        result = int(self.redis.eval(script, 4, self.stream, self.identities,
+            self.withdrawals, self.guard_key, *args, 0))
+        if result == -2 and self.ready_predecessor is not None and self.ready_predecessor(operation):
+            # Exactly one global recovery slot, never one per user or gap.
+            # A validated committed cursor proves this input can make progress.
+            # The Lua capacity check remains atomic across replicas. After its
+            # terminal CAS/ACK the same slot can admit the next missing prefix,
+            # draining even legacy accepted futures with arbitrarily long gaps.
+            result = int(self.redis.eval(script, 4, self.stream, self.identities,
+                self.withdrawals, self.guard_key, *args, 1))
+        return result
 
     def admit(self, original_json):
         operation = parse_operation(original_json, maximum_bytes=self.limits.input_bytes, allowed_policies=self.policies)
@@ -129,9 +149,9 @@ class OperationStream:
                 return proven
         version_key = 'version:' + h.user_id + ':' + str(h.operation_version)
         id_key = 'id:' + h.operation_id
-        result = int(self.redis.eval(_ADMIT, 4, self.stream, self.identities, self.withdrawals, self.guard_key, version_key, id_key,
+        result = self._admission(_ADMIT, operation, version_key, id_key,
                                      h.source_envelope_sha256, version_key + ':' + h.source_envelope_sha256,
-                                     original_json, self.limits.max_pending, self.limits.max_identities, h.user_id, self.max_guard_users))
+                                     original_json, self.limits.max_pending, self.limits.max_identities, h.user_id, self.max_guard_users)
         if result == -1:
             raise OperationBytesConflict('operation identity was reused with different original bytes')
         if result == -2:
@@ -155,9 +175,9 @@ class OperationStream:
         operation = parse_withdrawal(original_json, maximum_bytes=self.limits.input_bytes, allowed_policies=self.policies)
         h = operation.header
         version_key = 'version:' + h.user_id + ':' + str(h.operation_version)
-        result = int(self.redis.eval(_WITHDRAW, 4, self.stream, self.identities, self.withdrawals, self.guard_key,
+        result = self._admission(_WITHDRAW, operation,
             version_key, 'id:' + h.operation_id, h.source_envelope_sha256, version_key + ':' + h.source_envelope_sha256,
-            original_json, self.limits.max_pending, self.limits.max_identities, h.user_id, self.max_guard_users))
+            original_json, self.limits.max_pending, self.limits.max_identities, h.user_id, self.max_guard_users)
         if result == -1:
             raise OperationBytesConflict('withdrawal or original operation identity differs')
         if result == -2:

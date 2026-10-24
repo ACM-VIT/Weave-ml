@@ -117,6 +117,7 @@ class ModelRuntime:
         self.processor = ModelProcessor(self.journal, self.users, self.policy, self.legacy, encoder,
                                          dead_letter_prepare=self.stream.prepare_dead_letter, withdrawal_lookup=self.stream.lookup_withdrawal)
         self.stream.profile_preflight = self.processor.preflight_original
+        self.stream.ready_predecessor = self.processor.ready_predecessor
 
     def consumer(self):
         from feedback.user_lock import user_vector_lock

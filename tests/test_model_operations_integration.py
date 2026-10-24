@@ -918,3 +918,108 @@ def test_registered_uncaptured_recommendations_report_real_pending_applied_front
             'minimum_applied_operation_version':'3','required_profile_version':'2','as_of_ms':'3'}})
     assert result.status_code==503,result.text
     assert result.headers['Retry-After']=='2' and result.json()['retryable'] is True
+
+
+def test_full_legacy_future_queue_admits_only_ready_recovery_one_at_a_time(runtime):
+    initialize(runtime); p=runtime.policy
+    runtime.stream.limits=replace(runtime.stream.limits,max_pending=1)
+    # Already accepted by the old admission implementation, with many missing
+    # predecessors. Preserve this original entry until its own terminal commit.
+    future=wire(p,'feedback',8,feedback_payload(6,kind='unsave'))
+    runtime.stream.admit(future)
+    consumer=runtime.consumer()
+    with pytest.raises(model.OperationGap):consumer.run_once()
+    for version in range(3,8):
+        raw=wire(p,'feedback',version,feedback_payload(version-2,kind='unsave'))
+        assert runtime.stream.admit(raw)['status']=='accepted'
+        assert runtime.redis.xlen(runtime.stream.stream)==2
+        with pytest.raises(OperationCapacity):
+            runtime.stream.admit(wire(p,'feedback',version+10,feedback_payload(20,kind='unsave')))
+        for _ in range(10):
+            try:consumer.run_once()
+            except model.OperationGap:pass
+            if runtime.users.read(uid(1)).state.operation_version>=version:break
+            time.sleep(.015)
+        assert runtime.users.read(uid(1)).state.operation_version>=version
+        assert runtime.redis.xlen(runtime.stream.stream)<=1
+    for _ in range(10):
+        consumer.run_once()
+        if runtime.redis.xlen(runtime.stream.stream)==0:break
+        time.sleep(.015)
+    assert runtime.users.read(uid(1)).state.operation_version==8
+    assert runtime.redis.xlen(runtime.stream.stream)==0
+    assert runtime.stream.admit(future)['status']=='duplicate'
+
+
+def test_recovery_slot_is_global_and_atomic_across_ready_users(runtime):
+    from concurrent.futures import ThreadPoolExecutor
+    initialize(runtime);p=runtime.policy
+    runtime.stream.limits=replace(runtime.stream.limits,max_pending=1)
+    future=wire(p,'feedback',8,feedback_payload(6,kind='unsave'))
+    runtime.stream.admit(future)
+    ready=wire(p,'feedback',3,feedback_payload(1,kind='unsave'))
+    other=json.loads(wire(p,'profile',1,profile_payload(),user=uid(2)))
+    other['operation_id']=uid(9001)
+    from feedback.model_wire import canonical_json
+    raws=[ready,canonical_json(other)]
+    def admit(raw):
+        try:return runtime.stream.admit(raw)['status']
+        except OperationCapacity:return 'capacity'
+    with ThreadPoolExecutor(max_workers=2) as pool:results=list(pool.map(admit,raws))
+    assert sorted(results)==['accepted','capacity']
+    assert runtime.redis.xlen(runtime.stream.stream)==2
+    winner=raws[results.index('accepted')]
+    assert runtime.stream.admit(winner)['status']=='duplicate'
+    with pytest.raises(OperationCapacity):runtime.stream.admit(raws[results.index('capacity')])
+    assert runtime.stream.admit(future)['status']=='duplicate'
+    assert runtime.redis.xlen(runtime.stream.stream)==2
+
+
+def test_full_future_queue_accepts_ready_authenticated_profile_withdrawal(runtime):
+    from tests.test_model_operations import withdrawal
+    initialize(runtime);p=runtime.policy
+    runtime.stream.limits=replace(runtime.stream.limits,max_pending=1)
+    future=wire(p,'feedback',5,feedback_payload(2,kind='unsave'))
+    runtime.stream.admit(future)
+    raw=wire(p,'profile',3,profile_payload(False,2))
+    from feedback.model_wire import parse_withdrawal
+    withdrawn=withdrawal(p,raw,revoked_at=3)
+    assert runtime.stream.admit_withdrawal(withdrawn)['status']=='accepted'
+    assert runtime.redis.xlen(runtime.stream.stream)==2
+    consumer=runtime.consumer()
+    for _ in range(10):
+        try:consumer.run_once()
+        except model.OperationGap:pass
+        if runtime.users.read(uid(1)).state.operation_version==3:break
+        time.sleep(.015)
+    assert runtime.users.read(uid(1)).state.operation_version==3
+    assert runtime.stream.admit_withdrawal(withdrawn)['status']=='duplicate'
+    assert runtime.redis.xlen(runtime.stream.stream)==1
+    assert runtime.stream.admit(raw)['status']=='withdrawal_accepted'
+
+
+def test_bootstrap_user_cannot_occupy_ready_recovery_slot(runtime):
+    from tests.test_model_operations import withdrawal
+    from feedback.model_wire import canonical_json
+    initialize(runtime);p=runtime.policy
+    original=json.loads(wire(p,'profile',1,profile_payload(),user=uid(2)))
+    original['operation_id']=uid(9001)
+    runtime.stream.admit_withdrawal(withdrawal(p,canonical_json(original),revoked_at=1))
+    assert runtime.consumer().run_once()==1
+    assert isinstance(runtime.users.read(uid(2)).state,model.BootstrapState)
+    initial=json.loads(wire(p,'profile',2,profile_payload(True,2),user=uid(2)))
+    initial['operation_id']=uid(9002)
+    assert runtime.processor.ready_predecessor(parse(canonical_json(initial),p)) is True
+    from feedback.model_wire import parse_withdrawal
+    assert runtime.processor.ready_predecessor(parse_withdrawal(withdrawal(p,canonical_json(initial),revoked_at=2),
+        maximum_bytes=131072,allowed_policies={p.sha256})) is True
+    runtime.stream.limits=replace(runtime.stream.limits,max_pending=1)
+    runtime.stream.admit(wire(p,'feedback',8,feedback_payload(6,kind='unsave')))
+    payload=feedback_payload();event=json.loads(payload['original_feedback_json']);event['user_id']=uid(2)
+    payload['original_feedback_json']=canonical_json(event)
+    for kind,value in [('begin',begin_payload(2,uid(60))),('feedback',payload),('profile',profile_payload(False,2))]:
+        incoming=json.loads(wire(p,kind,2,value,user=uid(2)));incoming['operation_id']=uid(9002)
+        with pytest.raises(OperationCapacity):runtime.stream.admit(canonical_json(incoming))
+    assert runtime.redis.xlen(runtime.stream.stream)==1
+    assert runtime.stream.admit(wire(p,'feedback',3,feedback_payload(1,kind='unsave')))['status']=='accepted'
+    assert runtime.redis.xlen(runtime.stream.stream)==2

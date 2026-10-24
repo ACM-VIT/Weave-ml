@@ -146,6 +146,20 @@ class ModelProcessor:
             raise OriginalIdentityConflict('original profile identity belongs to another operation kind')
         return response
 
+    def ready_predecessor(self, wire):
+        snapshot = self.users.read_optional(wire.header.user_id)
+        if snapshot is None or isinstance(snapshot.state, model.BootstrapState):
+            # Missing initialized users are refused by read_optional. Only a
+            # genuine profile or its authenticated withdrawal can start a lane.
+            genesis = wire.allow_genesis if isinstance(wire, WireWithdrawal) else (
+                wire.kind == 'profile' and wire.payload['allow_genesis'])
+            previous = 0 if snapshot is None else snapshot.state.operation_version
+            if snapshot is not None:
+                self.coordinator._validate_snapshot(snapshot)
+            return wire.header.previous_operation_version == previous and genesis
+        self.coordinator._validate_snapshot(snapshot)
+        return wire.header.previous_operation_version == snapshot.state.operation_version
+
     def __call__(self, wire, assert_lock):
         if wire.policy_sha256 != self.policy.sha256:
             raise JournalConflict('processor policy differs')
