@@ -1,6 +1,9 @@
+import math
 import threading
-import numpy as np
 from collections import Counter
+from numbers import Real
+
+import numpy as np
 
 class CorpusStore:
     def __init__(self):
@@ -8,7 +11,7 @@ class CorpusStore:
         self.history = []
         self.timeline = []
 
-    def add_node(self, node: dict, novelty_score: float):
+    def add_node(self, node: dict, novelty_score: float | None):
         with self.lock:
             self.history.append(node)
             self.timeline.append({
@@ -35,28 +38,112 @@ def dynamic_cluster_discovery(corpus: list[dict]) -> dict:
     Executes real-time mathematical centroid tracking across incoming vector configurations.
     Measures dimensional saturation density distributions and topological boundary distances.
     """
-    if len(corpus) < 4:
-        return {"current_cluster": "System Bootstrapping Node", "nearest_cluster": "None", "distance": 0.0}
-        
-    categories = [node["category"] for node in corpus]
+    vectors = []
+    for node in corpus:
+        vector = node.get("vector")
+        if not isinstance(vector, (list, tuple, np.ndarray)):
+            continue
+        try:
+            if len(vector) == 0:
+                continue
+            if any(isinstance(value, bool) or not isinstance(value, Real) for value in vector):
+                continue
+        except TypeError:
+            continue
+        try:
+            vector_array = np.asarray(vector, dtype=float)
+        except (OverflowError, TypeError, ValueError):
+            continue
+        if vector_array.ndim != 1 or vector_array.size == 0 or not np.isfinite(vector_array).all():
+            continue
+        norm = float(np.linalg.norm(vector_array))
+        if not math.isfinite(norm) or norm == 0:
+            continue
+        vectors.append((node, vector_array / norm))
+
+    if len(vectors) < 4:
+        return {
+            "current_cluster": "Unavailable",
+            "nearest_cluster": "Unavailable",
+            "distance": None,
+            "measurement_status": "unmeasured",
+            "reason": "Fewer than four valid non-zero repository vectors are available.",
+        }
+
+    provenance_fields = (
+        "embedding_model",
+        "embedding_model_revision",
+        "embedding_version",
+        "feature_spec_version",
+    )
+    provenance = [tuple(node.get(field) for field in provenance_fields) for node, _ in vectors]
+    if any(
+        any(not isinstance(value, str) or not value.strip() for value in values)
+        for values in provenance
+    ):
+        return {
+            "current_cluster": "Unavailable",
+            "nearest_cluster": "Unavailable",
+            "distance": None,
+            "measurement_status": "unmeasured",
+            "reason": "Repository vector model and version provenance is incomplete.",
+        }
+    if len(set(provenance)) != 1:
+        return {
+            "current_cluster": "Unavailable",
+            "nearest_cluster": "Unavailable",
+            "distance": None,
+            "measurement_status": "unmeasured",
+            "reason": "Repository vectors use incompatible model or feature versions.",
+        }
+
+    dimensions = {vector.size for _, vector in vectors}
+    if len(dimensions) != 1:
+        return {
+            "current_cluster": "Unavailable",
+            "nearest_cluster": "Unavailable",
+            "distance": None,
+            "measurement_status": "unmeasured",
+            "reason": "Repository vectors use incompatible dimensions.",
+        }
+
+    categories = [node["category"] for node, _ in vectors]
     distribution = Counter(categories)
-    
+
+    if len(distribution) < 2:
+        return {
+            "current_cluster": distribution.most_common(1)[0][0],
+            "nearest_cluster": "Unavailable",
+            "distance": None,
+            "measurement_status": "unmeasured",
+            "reason": "At least two observed categories are required for a centroid comparison.",
+        }
+
     top_cluster = distribution.most_common(1)[0][0]
-    alt_cluster = distribution.most_common(2)[1][0] if len(distribution) > 1 else "External Ecosystem Hub"
-    
+    alt_cluster = distribution.most_common(2)[1][0]
+
     # Calculate dimensional centroid arrays
-    vectors_top = [node["vector"] for node in corpus if node["category"] == top_cluster]
-    vectors_alt = [node["vector"] for node in corpus if node["category"] == alt_cluster] if len(distribution) > 1 else vectors_top
-    
+    vectors_top = [vector for node, vector in vectors if node["category"] == top_cluster]
+    vectors_alt = [vector for node, vector in vectors if node["category"] == alt_cluster] if len(distribution) > 1 else vectors_top
+
     centroid_top = np.mean(vectors_top, axis=0)
     centroid_alt = np.mean(vectors_alt, axis=0)
     
     norm_t = np.linalg.norm(centroid_top)
     norm_a = np.linalg.norm(centroid_alt)
     
-    cosine_distance = 1.0 - float(np.dot(centroid_top, centroid_alt) / (norm_t * norm_a)) if norm_t and norm_a else 1.0
+    if not norm_t or not norm_a:
+        return {
+            "current_cluster": top_cluster,
+            "nearest_cluster": alt_cluster,
+            "distance": None,
+            "measurement_status": "unmeasured",
+            "reason": "A category centroid has no usable direction.",
+        }
+    cosine_distance = 1.0 - float(np.dot(centroid_top, centroid_alt) / (norm_t * norm_a))
     return {
         "current_cluster": top_cluster,
         "nearest_cluster": alt_cluster,
-        "distance": round(cosine_distance, 4)
+        "distance": round(float(np.clip(cosine_distance, 0.0, 2.0)), 4),
+        "measurement_status": "measured",
     }
