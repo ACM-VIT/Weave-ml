@@ -104,3 +104,26 @@ def test_absent_prefix_policy_uses_reject_default_in_preflight_and_runtime(monke
     monkeypatch.delenv('SUMMARY_SOURCE_OVERFLOW_POLICY', raising=False)
     assert SummarySettings.from_env().source_overflow_policy == 'reject'
 
+def test_prefix_mode_bounds_line_overflow_below_character_limit():
+    from summarization.source import MAX_SOURCE_ANALYSIS_LINES
+    from utils.readme_processor import MAX_PREPROCESS_CHARS
+
+    raw = '# Overview\nA collaborative workspace supports software maintainers.\n' + '- x\n' * 5000
+    assert len(raw) < MAX_PREPROCESS_CHARS
+    assert len(raw.splitlines()) > MAX_SOURCE_ANALYSIS_LINES
+    repo = {**REPO, 'readme': raw, 'clean_text': raw,
+            'content_hash': hashlib.sha256(raw.encode()).hexdigest()}
+    original = deepcopy(repo)
+    provider = Provider()
+    pipeline = CardSummaryPipeline(settings=SummarySettings(source_overflow_policy='prefix'), provider=provider)
+    artifact = pipeline.summarize(repo, repo)
+    assert artifact.source == 'generated'
+    assert provider.calls == 1
+    assert pipeline.is_current(artifact, repo=repo)
+    assert repo == original
+    material = pipeline._analysis(repo, repo, pipeline._reuse_key(repo, repo)).material
+    assert material.analysis_limit is None
+    assert len(material.prompt_input) <= pipeline.settings.input_max_chars
+    changed = {**repo, 'readme': raw + 'changed unseen tail',
+               'content_hash': hashlib.sha256((raw + 'changed unseen tail').encode()).hexdigest()}
+    assert not pipeline.is_current(artifact, repo=changed)

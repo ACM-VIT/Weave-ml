@@ -187,10 +187,14 @@ class CardSummaryPipeline:
         raw = repo.get("readme")
         content_hash = repo.get("content_hash")
         if (self.settings.source_overflow_policy != "prefix" or not isinstance(raw, str)
-                or len(raw) <= MAX_PREPROCESS_CHARS or not isinstance(content_hash, str)
+                or not isinstance(content_hash, str)
                 or re.fullmatch(r"[a-f0-9]{64}", content_hash) is None):
             return source, repo
-        prefix = "".join(raw[:MAX_PREPROCESS_CHARS].splitlines(keepends=True)[:MAX_SOURCE_ANALYSIS_LINES])
+        # Bound scanning by characters before checking the independent line cap.
+        lines = raw[:MAX_PREPROCESS_CHARS].splitlines(keepends=True)
+        if len(raw) <= MAX_PREPROCESS_CHARS and len(lines) <= MAX_SOURCE_ANALYSIS_LINES:
+            return source, repo
+        prefix = "".join(lines[:MAX_SOURCE_ANALYSIS_LINES])
         projected = {key: value for key, value in repo.items()
                      if key not in {"clean_text", "readme_md", "extracted_paragraphs"}}
         projected["readme"] = prefix
