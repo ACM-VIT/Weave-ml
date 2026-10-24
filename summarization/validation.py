@@ -95,6 +95,7 @@ class SourceAnalysis:
     joined: str
     eightgrams: frozenset[tuple[str, ...]]
     normalized_prose: str
+    unicode_known: bool
 
 
 def _normalized_prose(value: str) -> str:
@@ -108,23 +109,24 @@ def _normalized_prose(value: str) -> str:
     ).split())
 
 
+def _utf16_units(value: str) -> str:
+    """Represent every JS UTF-16 unit as one Python string position."""
+    if value.isascii():
+        return value
+    encoded = value.encode("utf-16-le", "surrogatepass")
+    return "".join(chr(encoded[index] | encoded[index + 1] << 8)
+                   for index in range(0, len(encoded), 2))
+
+
+def _known_unicode(value: str) -> bool:
+    return value.isascii() or all(unicodedata.category(char) != "Cn" for char in value)
+
+
 def _contains_partial_copy(prose: str, source_prose: str) -> bool:
-    if prose.isascii() and source_prose.isascii():
-        return any(prose[index:index + 80] in source_prose
-                   for index in range(len(prose) - 79))
-    # JavaScript length/slice use UTF-16 units, including windows whose ends
-    # split surrogate pairs. Match its 80-unit gate without matching odd byte
-    # offsets, which cannot represent the backend's string positions.
-    candidate = prose.encode("utf-16-le", "surrogatepass")
-    source = source_prose.encode("utf-16-le", "surrogatepass")
-    for index in range(0, len(candidate) - 159, 2):
-        passage = candidate[index:index + 160]
-        match = source.find(passage)
-        while match >= 0:
-            if match % 2 == 0:
-                return True
-            match = source.find(passage, match + 1)
-    return False
+    # Inputs already represent UTF-16 units; native substring search therefore
+    # cannot match odd byte offsets or repeatedly chase unaligned byte matches.
+    return any(prose[index:index + 80] in source_prose
+               for index in range(len(prose) - 79))
 
 
 def analyze_comparison_texts(texts: Iterable[str]) -> tuple[SourceAnalysis, ...]:
@@ -137,7 +139,8 @@ def analyze_comparison_texts(texts: Iterable[str]) -> tuple[SourceAnalysis, ...]
         analyses.append(SourceAnalysis(
             words, " " + " ".join(words) + " ",
             frozenset(words[index:index + 8] for index in range(len(words) - 7)),
-            _normalized_prose(source),
+            _utf16_units(_normalized_prose(source)),
+            _known_unicode(source),
         ))
     return tuple(analyses)
 
@@ -269,9 +272,16 @@ def validate_generated_summary(
         not isinstance(canonical_readme, str) or len(canonical_readme) > 1_000_000
     ):
         raise SummaryValidationError(("canonical README exceeds the source contract",))
+    # Python/Node may ship different Unicode tables. Unknown source letters
+    # can lowercase to older assigned letters in Node; rejecting only unknown
+    # output would miss that copy. Generated output must fail closed for both.
+    if (any(not source.unicode_known for source in sources)
+            or any(not _known_unicode(text) for text in (content.summary, *content.highlights))
+            or (canonical_readme is not None and not _known_unicode(canonical_readme))):
+        raise SummaryValidationError(("source or output contains unsupported Unicode characters",))
     copy_sources = tuple(source.normalized_prose for source in sources)
     if canonical_readme:
-        copy_sources += (_normalized_prose(canonical_readme),)
+        copy_sources += (_utf16_units(_normalized_prose(canonical_readme)),)
     reasons = _unsafe_text(content.summary)
     normalized = normalize_summary(content.summary)
     if len(normalized) > CARD_SUMMARY_MAX_CHARS:
@@ -287,13 +297,13 @@ def validate_generated_summary(
         normalized_highlight = normalize_summary(highlight)
         normalized_highlights.append(normalized_highlight)
         highlight_words = tuple(_words(normalized_highlight))
-        highlight_prose = _normalized_prose(normalized_highlight)
+        highlight_prose = _utf16_units(_normalized_prose(normalized_highlight))
         if (any(_contains_partial_copy(highlight_prose, source) for source in copy_sources)
                 or any(_near_copy_words(highlight_words, source) for source in sources)):
             reasons.append("highlight copies a long contiguous source passage")
 
     summary_words = tuple(_words(normalized))
-    summary_prose = _normalized_prose(normalized)
+    summary_prose = _utf16_units(_normalized_prose(normalized))
     if (any(_contains_partial_copy(summary_prose, source) for source in copy_sources)
             or any(_near_copy_words(summary_words, source) for source in sources)):
         reasons.append("summary copies a long contiguous source passage")

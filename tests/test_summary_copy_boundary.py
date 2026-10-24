@@ -128,3 +128,42 @@ def test_partial_copy_window_can_start_and_end_inside_surrogate_pairs():
     content = parse_summary_response(json.dumps({'summary': summary}))
     with pytest.raises(SummaryValidationError, match='summary copies'):
         validate_generated_summary(content, comparison_texts=(source,))
+
+
+def test_adversarial_utf16_byte_alignment_finishes_in_a_bounded_process():
+    import subprocess
+    import sys
+
+    # Reversed byte pairs previously produced many odd-offset byte matches,
+    # making a negative copy check repeatedly scan the entire source.
+    script = """
+from summarization.validation import _contains_partial_copy, _normalized_prose
+summary = _normalized_prose('\\u4142' * 360)
+for size in (16_384, 1_000_000):
+    source = _normalized_prose('\\u4241' * size)
+    assert not _contains_partial_copy(summary, source)
+"""
+    subprocess.run([sys.executable, '-c', script], check=True, capture_output=True, text=True, timeout=8)
+
+
+@pytest.mark.parametrize('source_mode', ['comparison', 'canonical'])
+def test_new_unicode_source_cannot_bypass_known_lowercase_copy_check(source_mode):
+    # Unicode 16 adds A7CB and lowercases it to the older assigned U+0264.
+    # Python 3.12 cannot classify the new uppercase source, so fail closed.
+    import unicodedata
+    if unicodedata.category('\ua7cb') != 'Cn':
+        pytest.skip('Runtime Unicode table already classifies the new source letter.')
+    source = '\ua7cb' * 80
+    content = parse_summary_response(json.dumps({'summary': '\u0264' * 80 + '. ' + SAFE_SUMMARY.split('. ')[1]}))
+    arguments = {'comparison_texts': (source,)} if source_mode == 'comparison' else {'canonical_readme': source}
+    with pytest.raises(SummaryValidationError, match='Unicode'):
+        validate_generated_summary(content, **arguments)
+
+
+def test_new_unicode_output_uses_repair_or_fallback_instead_of_dropping_letters():
+    import unicodedata
+    if unicodedata.category('\u1c89') != 'Cn':
+        pytest.skip('Runtime Unicode table already classifies the new output letter.')
+    content = parse_summary_response(json.dumps({'summary': '\u1c89' * 80 + '. ' + SAFE_SUMMARY.split('. ')[1]}))
+    with pytest.raises(SummaryValidationError, match='Unicode'):
+        validate_generated_summary(content, comparison_texts=('An unrelated known source.',))
