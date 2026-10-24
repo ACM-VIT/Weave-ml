@@ -526,6 +526,24 @@ class QdrantRecords:
         return found
 
 
+    def delete_verified(self, key, expected):
+        """Explicit retention-only delete; caller must publish an archive first.
+
+        Runtime never calls this. Immutable INSERT_ONLY ownership is required:
+        no concurrent admin overwrite or collection/Redis restore may run.
+        """
+        found = self.get(key)
+        if found is None:
+            return
+        if found != expected:
+            raise JournalConflict('retention deletion bytes differ')
+        self.client.delete(collection_name=self.collection,
+            points_selector=self.models.PointIdsList(points=[self._id(key)]),
+            wait=True, ordering=self.models.WriteOrdering.STRONG)
+        if self.get(key) is not None:
+            raise JournalError('retention deletion not durably confirmed')
+
+
 LEGACY_FLOAT_ENCODING = 'float64-hex-v1'
 
 
