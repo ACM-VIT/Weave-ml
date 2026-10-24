@@ -62,6 +62,8 @@ class FrozenModelHistory(StrictModel):
         owners = {profile.profile_id for profile in self.snapshot.profiles}
         if set(self.sessions) != owners or self.k > self.snapshot.limit:
             raise ValueError('one explicit session selection per frozen profile required')
+        if any(self.snapshot.model_exclusions.values()):
+            raise ValueError('genesis history cannot supply unproved derived model exclusions')
         for profile in self.snapshot.profiles:
             if profile.payload['last_feedback_version'] or profile.payload['feedback_state_revision']:
                 raise ValueError('history requires an explicit zero-feedback profile genesis basis')
@@ -130,12 +132,16 @@ def derive_snapshots(experiment):
     baseline, treatment = original.model_dump(mode='json'), original.model_dump(mode='json')
     storage = {}
     for kind, snapshot in [('single_vector', baseline), ('long_session', treatment)]:
+        snapshot['request_exclusions'] = {profile.profile_id: sorted(set(profile.seen) | set(profile.disliked))
+            for profile in original.bundle.profiles}
+        snapshot['model_exclusions'] = {}
         for row in snapshot['profiles']:
             owner = row['profile_id']; state = states[owner]; selection = experiment.sessions[owner]
             if set(selection) != {'session_id', 'epoch'}:
                 raise ValueError('explicit session ID/epoch selection required')
             view = model.recommendation_view(state, policy, session_id=selection['session_id'],
                 epoch=decimal(selection['epoch'], 1), as_of_ms=as_of_ms)
+            snapshot['model_exclusions'][owner] = list(view.explicit_negative_repo_ids)
             row['vector'] = list(legacy[owner].vector if kind == 'single_vector' else view.blended)
             row['payload']['last_feedback_version'] = state.feedback_version
             row['payload']['feedback_state_revision'] = state.operation_version
@@ -210,6 +216,13 @@ def validate_model_comparison(value, experiment):
         calls = execution.configuration.get('runtime', {}).get('retrieval_executor', {}).get('stages', {}).get('profile', {}).get('calls_total')
         if type(calls) is not int or calls != len(snapshot.profiles):
             raise ValueError('worker model condition includes cumulative or missing profile measurements')
+        expected_channels = {profile.profile_id: {
+            'request_count': len(snapshot.request_exclusions_for(profile)),
+            'model_count': len(snapshot.model_exclusions[profile.profile_id]),
+            'combined_count': len(set(snapshot.request_exclusions_for(profile)) | set(snapshot.model_exclusions[profile.profile_id]))}
+            for profile in snapshot.bundle.profiles}
+        if digest(execution.configuration.get('runtime', {}).get('exclusion_channels_by_profile')) != digest(expected_channels):
+            raise ValueError('worker request/model exclusion channels differ from frozen history')
         expected['results'][name] = {'execution': execution.model_dump(mode='json'),
                                       'evaluation': evaluate(snapshot.bundle, execution.run, k=experiment.k)}
     if json.dumps(value,sort_keys=True,allow_nan=False,separators=(',',':')) != json.dumps(expected,sort_keys=True,allow_nan=False,separators=(',',':')):

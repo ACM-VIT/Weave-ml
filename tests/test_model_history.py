@@ -58,9 +58,15 @@ def test_actual_production_stages_compare_same_history_and_parent_refuses_forger
     with pytest.raises(ValueError):validate_model_comparison(forged,value)
 
 
-def test_new_dislike_updates_both_common_source_and_bundle_exclusions(tmp_path):
+@pytest.mark.parametrize('seen_count',[0,500])
+def test_new_dislike_updates_both_common_source_and_bundle_exclusions(tmp_path,seen_count):
     value=experiment();raw=value.model_dump(mode='json')
     owner=raw['snapshot']['profiles'][0]['profile_id']
+    if seen_count:
+        existing=set(raw['snapshot']['bundle']['profiles'][0]['disliked'])
+        seen=sorted(existing|{uid(500000+n) for n in range(seen_count-len(existing))})
+        raw['snapshot']['bundle']['profiles'][0]['seen']=seen
+        raw['snapshot']['bundle']['dataset']['profiles'][0]['seen']=list(seen)
     target=next(r['repo_id'] for r in raw['snapshot']['repositories'] if r['repo_id'] not in set(raw['snapshot']['bundle']['profiles'][0]['disliked'])|set(raw['snapshot']['bundle']['profiles'][0]['seen']))
     for index,original in enumerate(raw['operations']):
         operation=json.loads(original)
@@ -74,6 +80,10 @@ def test_new_dislike_updates_both_common_source_and_bundle_exclusions(tmp_path):
     for snapshot in snapshots.values():
         assert target in snapshot.bundle.profiles[0].disliked
         assert snapshot.bundle.profiles[0].disliked==snapshot.bundle.dataset.profiles[0].disliked
+        if seen_count:
+            assert len(snapshot.request_exclusions[owner])==500
+            assert target not in snapshot.request_exclusions[owner]
+            assert target in snapshot.model_exclusions[owner]
     assert snapshots['single_vector'].bundle==snapshots['long_session'].bundle
 
     # Run the actual parent/worker CLI, preserving the immutable source history
@@ -90,6 +100,41 @@ def test_new_dislike_updates_both_common_source_and_bundle_exclusions(tmp_path):
     assert changed.model_dump(mode='json')==before
     report=json.loads(output.read_text());assert report['qualified'] is False
     for condition in report['results'].values():
+        if seen_count:
+            counts=condition['execution']['configuration']['runtime']['exclusion_channels_by_profile'][owner]
+            assert counts=={'request_count':500,'model_count':1,'combined_count':501}
         for profile in condition['execution']['run']['outputs']:
             if profile['profile_id']==owner:
                 assert all(target not in [row['repo_id'] for row in rows] for rows in profile['stages'].values())
+    forged=deepcopy(report)
+    forged['results']['single_vector']['execution']['configuration']['runtime']['exclusion_channels_by_profile'][owner]['request_count']+=1
+    with pytest.raises(ValueError,match='exclusion channels'):validate_model_comparison(forged,changed)
+    for wrong in (True,1.0):
+        forged=deepcopy(report)
+        forged['results']['single_vector']['execution']['configuration']['runtime']['exclusion_channels_by_profile'][owner]['model_count']=wrong
+        with pytest.raises(ValueError,match='exclusion channels'):validate_model_comparison(forged,changed)
+
+
+@pytest.mark.parametrize('mutation',['request_overflow','model_overflow','missing_owner','unbound_negative'])
+def test_separate_replay_exclusion_channels_remain_bounded_and_source_bound(mutation):
+    from evaluation.stage_runner import FrozenSnapshot
+    snapshots,_=derive_snapshots(experiment())
+    raw=snapshots['long_session'].model_dump(mode='json');owner=raw['profiles'][0]['profile_id']
+    if mutation=='request_overflow':raw['request_exclusions'][owner]=[uid(600000+n) for n in range(501)]
+    elif mutation=='model_overflow':raw['model_exclusions'][owner]=[uid(600000+n) for n in range(257)]
+    elif mutation=='missing_owner':raw['model_exclusions'].pop(owner)
+    else:raw['model_exclusions'][owner]=[uid(600000)]
+    with pytest.raises(ValueError):FrozenSnapshot.model_validate(raw)
+
+
+def test_plain_replay_request_cannot_exceed_500_or_invent_history_model_negatives():
+    from evaluation.stage_runner import FrozenSnapshot
+    raw=experiment().model_dump(mode='json');owner=raw['snapshot']['profiles'][0]['profile_id']
+    raw['snapshot']['bundle']['profiles'][0]['seen']=[uid(600000+n) for n in range(501)]
+    raw['snapshot']['bundle']['dataset']['profiles'][0]['seen']=list(raw['snapshot']['bundle']['profiles'][0]['seen'])
+    with pytest.raises(ValueError,match='backend/ML contract'):FrozenSnapshot.model_validate(raw['snapshot'])
+    original=experiment();snapshot=original.snapshot.model_dump(mode='json')
+    snapshot['request_exclusions']={p.profile_id:sorted(set(p.seen)|set(p.disliked)) for p in original.snapshot.bundle.profiles}
+    snapshot['model_exclusions']={p.profile_id:list(p.disliked) for p in original.snapshot.bundle.profiles}
+    raw=original.model_dump(mode='json');raw['snapshot']=snapshot
+    with pytest.raises(ValueError,match='unproved derived'):FrozenModelHistory.model_validate(raw)
