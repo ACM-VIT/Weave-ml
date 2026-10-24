@@ -197,6 +197,7 @@ def test_cli_cleanup_failure_does_not_publish_valid_worker_report(tmp_path,monke
             return self.manager.__enter__()
         def __exit__(self,*exc_info):
             self.manager.__exit__(*exc_info)
+            assert exc_info[0] is None
             raise OSError('controlled temporary-directory cleanup failure')
     original_temporary_directory=cli.tempfile.TemporaryDirectory
     monkeypatch.setattr(cli.subprocess,'run',worker_returns_valid_report)
