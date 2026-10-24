@@ -10,14 +10,15 @@ from contracts.admission import observe_repository_admission
 
 def _rejected_prefilter_result(repo_id: str, reason: str, repo: dict) -> IngestionResult:
     mock_novelty = NoveltyMatrix(
-        final=0.0,
-        semantic_penalty=0.0,
-        category_penalty=0.0,
-        tech_stack_penalty=0.0,
-        activity_penalty=0.0,
+        measurement_status="unmeasured",
+        final=None,
+        semantic_penalty=None,
+        category_penalty=None,
+        tech_stack_penalty=None,
+        activity_penalty=None,
         top_k=[],
-        anomaly_tag="NONE",
-        explanation="Failed pre-filter gate."
+        anomaly_tag="UNASSESSED",
+        explanation="Novelty was not measured because this compatibility path does not use repository vectors. The pre-filter decision is unrelated to novelty."
     )
     return IngestionResult(
         repo_id=repo_id, decision="REJECTED", rejection_reason=reason,
@@ -94,7 +95,7 @@ def ingest_repository(
                 "code_health": code_health,
                 "trend": flux_trends,
                 "vector": [0.0] * 384
-            }, 1.0)
+            }, None)
     else:
         decision_status = "REJECTED"
         rejection_reason = (
@@ -108,14 +109,15 @@ def ingest_repository(
             matrix_quadrant = "💤 Dormant Ecosystem Nodes"
             
     mock_novelty = NoveltyMatrix(
-        final=1.0,
-        semantic_penalty=0.0,
-        category_penalty=0.0,
-        tech_stack_penalty=0.0,
-        activity_penalty=0.0,
+        measurement_status="unmeasured",
+        final=None,
+        semantic_penalty=None,
+        category_penalty=None,
+        tech_stack_penalty=None,
+        activity_penalty=None,
         top_k=[],
-        anomaly_tag="NONE",
-        explanation="Novelty checks bypassed. Ingestion decided purely by Doc Quality & Code Health."
+        anomaly_tag="UNASSESSED",
+        explanation="Novelty was not measured: this compatibility path stores a placeholder vector and does not compare compatible repository embeddings. No novelty-based admission decision was made."
     )
 
     return IngestionResult(
@@ -147,7 +149,15 @@ def print_batch_summary(results: list[IngestionResult], corpus_timeline: list[di
     """Generates an extensive, elite terminal dashboard charting structural ecosystem growth profiles."""
     approved_nodes = [node for node in results if node.decision == "APPROVED"]
     rejected_nodes = [node for node in results if node.decision == "REJECTED"]
-    novelty_floats = [node.novelty.final for node in results]
+    measured_results = [
+        node for node in results
+        if node.novelty.measurement_status == "measured" and node.novelty.final is not None
+    ]
+    novelty_floats = [float(node.novelty.final) for node in measured_results]
+    measured_approved_nodes = [
+        node for node in approved_nodes
+        if node.novelty.measurement_status == "measured" and node.novelty.final is not None
+    ]
     
     width = 76
     double_boundary = "═" * width
@@ -165,9 +175,19 @@ def print_batch_summary(results: list[IngestionResult], corpus_timeline: list[di
         bar_graph_visualization = "▓" * min(frequency, 30)
         print(f"    {quad:<30} [{frequency:>2}]  {bar_graph_visualization}")
     
-    highest_novelty_rankings = sorted(approved_nodes, key=lambda x: x.novelty.final, reverse=True)[:5]
-    convergent_density_rankings = sorted(approved_nodes, key=lambda x: x.novelty.final)[:5]
-    flagged_anomalies = [node for node in results if node.novelty.anomaly_tag != "NONE"]
+    highest_novelty_rankings = sorted(
+        measured_approved_nodes,
+        key=lambda x: x.novelty.final,
+        reverse=True,
+    )[:5]
+    convergent_density_rankings = sorted(
+        measured_approved_nodes,
+        key=lambda x: x.novelty.final,
+    )[:5]
+    flagged_anomalies = [
+        node for node in results
+        if node.novelty.measurement_status == "measured" and node.novelty.anomaly_tag != "NONE"
+    ]
 
     print("\\n" + double_boundary)
     print(f"               OSIRIS RESEARCH ENGINE STREAM ANALYTICS REPORT")
@@ -182,6 +202,8 @@ def print_batch_summary(results: list[IngestionResult], corpus_timeline: list[di
         print(f"  Corpus Ecosystem Novelty Mean Value : {sum(novelty_floats)/len(novelty_floats):.4f}")
         print(f"  Absolute Delta Floor Min Recorded   : {min(novelty_floats):.4f}")
         print(f"  Absolute Delta Peak Max Recorded   : {max(novelty_floats):.4f}")
+    else:
+        print("  Corpus Novelty Measurements         : UNAVAILABLE (compatibility path has no compatible repository vectors)")
     print(thin_boundary)
     
     print(f"  Active Taxonomy Spatial Distributions (Registered Approved Nodes):")
@@ -190,12 +212,16 @@ def print_batch_summary(results: list[IngestionResult], corpus_timeline: list[di
         print(f"    {category_name:<30} [{frequency:>2}]  {bar_graph_visualization}")
     print(thin_boundary)
     
-    print(f"  Top 5 High-Novelty Ecosystem Disruptors:")
+    print(f"  Top 5 Measured High-Novelty Repositories:")
+    if not highest_novelty_rankings:
+        print("    No measured novelty values are available.")
     for rank, node in enumerate(highest_novelty_rankings, 1):
         print(f"    {rank}. {node.repo_id:<44} Novelty Vector Index: {node.novelty.final:.4f} [{node.category}]")
     print(thin_boundary)
     
-    print(f"  Top 5 Base-Convergent Alternates (Approved Near Minimum Floor Boundaries):")
+    print(f"  Top 5 Lowest-Measured-Novelty Repositories:")
+    if not convergent_density_rankings:
+        print("    No measured novelty values are available.")
     for rank, node in enumerate(convergent_density_rankings, 1):
         nearest_match_signature = node.novelty.top_k[0]["repo_id"].split("/")[-1] if node.novelty.top_k else "None (Corpus Origin Seed)"
         print(f"    {rank}. {node.repo_id:<44} Novelty Vector Index: {node.novelty.final:.4f} (Match: {nearest_match_signature})")
@@ -206,12 +232,19 @@ def print_batch_summary(results: list[IngestionResult], corpus_timeline: list[di
         sampling_step_interval = max(1, len(corpus_timeline) // 5)
         for position in range(0, len(corpus_timeline), sampling_step_interval):
             timeline_node = corpus_timeline[position]
-            print(f"    [Corpus Size Node: {timeline_node['growth_index']:>2}]  Source Module: {timeline_node['repo_id']:<32} Registered Novelty Tracking: {timeline_node['novelty_index_point']:.4f}")
+            novelty_point = timeline_node["novelty_index_point"]
+            novelty_display = f"{novelty_point:.4f}" if novelty_point is not None else "UNMEASURED"
+            print(f"    [Corpus Size Node: {timeline_node['growth_index']:>2}]  Source Module: {timeline_node['repo_id']:<32} Registered Novelty Tracking: {novelty_display}")
             
     if rejected_nodes:
         print(thin_boundary)
         print(f"  Rejected System Drop Registers ({len(rejected_nodes)} Conflicting Nodes):")
         for node in rejected_nodes:
-            print(f"    [!] Drop Track -> {node.repo_id:<42} Matrix Evaluation Value: {node.novelty.final:.4f}")
+            novelty_display = (
+                f"{node.novelty.final:.4f}"
+                if node.novelty.measurement_status == "measured" and node.novelty.final is not None
+                else "UNMEASURED"
+            )
+            print(f"    [!] Drop Track -> {node.repo_id:<42} Matrix Evaluation Value: {novelty_display}")
             
     print(double_boundary + "\\n")
