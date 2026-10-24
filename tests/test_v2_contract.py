@@ -451,3 +451,19 @@ def test_refresh_repository_job_backfills_missing_summary_fields_for_older_schem
     assert res["accepted"] is True
     assert res["status"] == "applied"
     assert res["feature_version"] == 2
+
+
+def test_every_non_health_route_is_guarded(monkeypatch):
+    from fastapi.testclient import TestClient
+    import api.main as api_main
+
+    monkeypatch.setenv("INTERNAL_API_SECRET", "test-secret")
+    client = TestClient(api_main.app)
+    for route in api_main.app.routes:
+        path = getattr(route, "path", "")
+        methods = getattr(route, "methods", set())
+        if not path:
+            continue
+        method = "POST" if "POST" in methods else "GET"
+        response = client.request(method, path)
+        assert response.status_code == 401, path

@@ -205,7 +205,7 @@ def test_two_devices_profile_order_dislike_and_sequential_retirement(runtime):
     assert runtime.users.read(uid(1)).state.long_entries
 
 
-from tests.test_scoring_provider import trained_ranker
+from tests.scoring_provider_fixtures import trained_ranker
 
 
 @pytest.mark.parametrize("capture", [True, False])

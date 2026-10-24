@@ -712,8 +712,9 @@ Historical mean/scale-only scalers retain their existing float32 serving behavio
 This corrects future training/export code. It does not refit or replace the
 checked-in scaler/model, remove historical training leakage, or qualify a model
 for promotion. A future candidate must pass the independent gates above. Exercise
-the isolated export and real-serving parity fixtures with
-`python -m pytest tests/test_ranker_preprocessing.py tests/test_ranker_service.py -q`.
+the retained ranker loading, input validation, and device-selection tests with
+`python -m pytest tests/test_ranker_service.py -q`. These checks do not replace
+the independent training/export qualification gates above.
 
 ## Rollout sequence
 

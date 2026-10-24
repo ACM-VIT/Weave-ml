@@ -16,7 +16,8 @@ from embedding.vector_contract import (
     REPOSITORY_SERVING_ELIGIBILITY_FIELD,
     REPOSITORY_SERVING_ELIGIBILITY_VERSION,
 )
-from feedback.event_handlers import ADJUSTMENTS_KEY, APPLIED_SIGNALS_KEY, LATENT_KEY
+from feedback.event_handlers import ADJUSTMENTS_KEY, APPLIED_SIGNALS_KEY, LATENT_KEY, vector_delta
+from feedback.interactions import INTERACTIONS, get_interaction
 from feedback.v2 import (
     CONSUMER_HEARTBEAT,
     DurableFeedbackProducer,
@@ -195,3 +196,41 @@ def test_passive_signal_is_applied_only_once(passive_action):
     assert np.allclose(client.user.vector, first_vector)
     assert client.user.payload[APPLIED_SIGNALS_KEY][repo_id] == [passive_action]
     assert client.user.payload["last_feedback_version"] == 2
+
+
+def test_action_registry_is_complete_and_immutable():
+    assert set(INTERACTIONS) == {
+        "impression", "dwell", "readme_open", "github_open", "share", "like",
+        "unlike", "dislike", "undislike", "save", "unsave",
+    }
+    assert get_interaction(" LIKE ").embedding_alpha == 0.15
+    assert get_interaction("dislike").embedding_alpha == -0.15
+    assert get_interaction("save").embedding_alpha == 0.20
+    assert get_interaction("impression").realtime is False
+    assert get_interaction("readme_open").apply_once is True
+    assert get_interaction("dwell").apply_once is False
+    assert {
+        action: definition.reference_score
+        for action, definition in INTERACTIONS.items()
+    } == {
+        "impression": 0.0,
+        "dwell": 0.0,
+        "readme_open": 0.2,
+        "github_open": 0.3,
+        "share": 0.6,
+        "like": 1.0,
+        "unlike": 0.0,
+        "dislike": -1.0,
+        "undislike": 0.0,
+        "save": 0.8,
+        "unsave": 0.0,
+    }
+    assert get_interaction("like").feedback_score == 1.0
+    with pytest.raises(TypeError):
+        INTERACTIONS["new"] = get_interaction("like")
+    with pytest.raises(ValueError):
+        get_interaction("star")
+
+
+def test_active_vector_delta_preserves_interpolation_direction():
+    assert vector_delta([1.0, 0.0], [0.0, 1.0], 0.5) == pytest.approx([-0.5, 0.5])
