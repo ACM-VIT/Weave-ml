@@ -162,6 +162,50 @@ def test_cli_worker_timeout_and_snapshot_drift_preserve_output(tmp_path,monkeypa
     assert output.read_bytes()==b'previous successful output'
 
 
+def test_cli_rejects_invalid_worker_report_without_replacing_output(tmp_path,monkeypatch):
+    import json,subprocess
+    from scripts import run_recommendation_stages as cli
+    source=tmp_path/'snapshot.json';source.write_text(json.dumps(snapshot_data()))
+    output=tmp_path/'run.json';output.write_bytes(b'previous successful output')
+    def worker_returns_invalid_report(command,**kwargs):
+        if command[0]=='git':
+            return subprocess.CompletedProcess(command,0,b'git version fixture',b'')
+        private_output=Path(command[command.index('--output')+1])
+        private_output.write_text('{}')
+        return subprocess.CompletedProcess(command,0,b'worker exited successfully',b'')
+    monkeypatch.setattr(cli.subprocess,'run',worker_returns_invalid_report)
+    assert cli.main(['--snapshot',str(source),'--output',str(output)])==2
+    assert output.read_bytes()==b'previous successful output'
+
+
+def test_cli_cleanup_failure_does_not_publish_valid_worker_report(tmp_path,monkeypatch,real_export):
+    import json,subprocess
+    from scripts import run_recommendation_stages as cli
+    source=tmp_path/'snapshot.json';source.write_text(json.dumps(snapshot_data()))
+    output=tmp_path/'run.json';output.write_bytes(b'previous successful output')
+    valid_report=real_export[1].model_dump(mode='json')
+    def worker_returns_valid_report(command,**kwargs):
+        if command[0]=='git':
+            return subprocess.CompletedProcess(command,0,b'git version fixture',b'')
+        private_output=Path(command[command.index('--output')+1])
+        private_output.write_text(json.dumps(valid_report))
+        return subprocess.CompletedProcess(command,0,b'worker exited successfully',b'')
+    class FailsAfterCleanup:
+        def __init__(self,*args,**kwargs):
+            self.manager=original_temporary_directory(*args,**kwargs)
+        def __enter__(self):
+            return self.manager.__enter__()
+        def __exit__(self,*exc_info):
+            self.manager.__exit__(*exc_info)
+            assert exc_info[0] is None
+            raise OSError('controlled temporary-directory cleanup failure')
+    original_temporary_directory=cli.tempfile.TemporaryDirectory
+    monkeypatch.setattr(cli.subprocess,'run',worker_returns_valid_report)
+    monkeypatch.setattr(cli.tempfile,'TemporaryDirectory',FailsAfterCleanup)
+    assert cli.main(['--snapshot',str(source),'--output',str(output)])==2
+    assert output.read_bytes()==b'previous successful output'
+
+
 def test_exported_final_stage_matches_actual_returned_batch_order_and_scores(monkeypatch):
     require_local_only_git()
     from retrieval.v2_retriever import QdrantV2Retriever
