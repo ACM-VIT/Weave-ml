@@ -163,13 +163,19 @@ class Snapshot:
 
 def validate_committed_head(snapshot, journal):
     if snapshot.state.operation_version == 0:
+        return _validate_committed_head(snapshot, journal, None, None)
+    return _validate_committed_head(snapshot, journal, reducer.state_sha256(snapshot.state), json.loads(snapshot.complete))
+
+
+def _validate_committed_head(snapshot, journal, state_digest, complete_body):
+    if snapshot.state.operation_version == 0:
         if snapshot.head is not None:
             raise JournalConflict('genesis seed has an unexpected committed head')
         return
     row = journal.get(snapshot.head, 'prepare')
-    complete_digest = _sha(_canonical({'schema_version': 1, 'kind': 'complete', 'value': json.loads(snapshot.complete)}))
+    complete_digest = _sha(_canonical({'schema_version': 1, 'kind': 'complete', 'value': complete_body}))
     if (row.get('user_id') != snapshot.user_id or row.get('operation_version') != snapshot.state.operation_version
-            or row.get('state_sha256') != reducer.state_sha256(snapshot.state)
+            or row.get('state_sha256') != state_digest
             or row.get('complete_sha256') != complete_digest):
         raise JournalConflict('committed head does not bind the complete user point')
 
@@ -584,6 +590,14 @@ def _exact_payload_matches(actual, expected):
     return actual == expected
 
 
+@dataclass(frozen=True)
+class _DecodedPoint:
+    snapshot: Snapshot
+    state_sha256: str
+    base_view: reducer.View | None
+    legacy_payload: dict
+
+
 class QdrantAtomicUsers:
     """One point CAS commits legacy vector/payload and full new state/head.
 
@@ -602,10 +616,17 @@ class QdrantAtomicUsers:
         self.ensure_initialized = ensure_initialized
         self.refuse_missing = refuse_missing
     def _point(self,snapshot):
-        body=_json(snapshot.complete,self.limit)
-        if set(body)!={'schema_version','user_id','state','legacy'} or body['schema_version']!=1 or body['user_id']!=snapshot.user_id:
+        body,state=self._complete(snapshot.complete,snapshot.user_id)
+        if state!=snapshot.state: raise JournalConflict('complete ledger differs')
+        return self._point_body(snapshot,body,reducer.state_sha256(snapshot.state))
+
+    def _complete(self,complete,user_id):
+        body=_json(complete,self.limit)
+        if type(body) is not dict or set(body)!={'schema_version','user_id','state','legacy'} or body['schema_version']!=1 or body['user_id']!=user_id:
             raise JournalConflict('complete point schema differs')
-        if _unpack(body['state'])!=snapshot.state: raise JournalConflict('complete ledger differs')
+        return body,_unpack(body['state'])
+
+    def _point_body(self,snapshot,body,state_digest):
         legacy=body['legacy']
         if type(legacy) is not dict or set(legacy)!={'payload','vector'} or type(legacy['payload']) is not dict:
             raise JournalError('legacy complete vector/payload required')
@@ -629,7 +650,7 @@ class QdrantAtomicUsers:
         payload=_legacy_float_projection(legacy['payload'])
         payload.update(model_legacy_vector_encoding=LEGACY_FLOAT_ENCODING,model_complete_base64=base64.b64encode(snapshot.complete).decode(),
             model_operation_version=snapshot.state.operation_version,model_journal_head=snapshot.head,
-            model_state_sha256=reducer.state_sha256(snapshot.state),model_policy_sha256=self.policy.sha256,
+            model_state_sha256=state_digest,model_policy_sha256=self.policy.sha256,
             model_basis_status='awaiting_profile' if isinstance(snapshot.state,reducer.BootstrapState) else 'ready')
         # Count the ACTUAL persisted payload, including compatibility duplication
         # and base64 expansion, against the one shared user-state budget.
@@ -655,18 +676,28 @@ class QdrantAtomicUsers:
         return snapshot
     def decode_point(self,point,user_id):
         """Validate a supplied owned point; never query another user revision."""
+        return self._decode_point(point,user_id).snapshot
+
+    def decode_for_serving(self,point,user_id,policy):
+        """Request-local validated components; never accept a caller's decoded state."""
+        if policy.sha256!=self.policy.sha256: raise reducer.CompatibilityError('serving policy differs')
+        return self._decode_point(point,user_id)
+
+    def _decode_point(self,point,user_id):
         if str(point.id)!=_uuid(user_id): raise JournalConflict('canonical snapshot owner differs')
         payload=dict(point.payload or {})
         if 'model_complete_base64' not in payload: raise JournalMissing('explicit migration checkpoint required')
         if payload.get('model_legacy_vector_encoding') != LEGACY_FLOAT_ENCODING:
             raise JournalConflict('unknown compatibility vector encoding')
         complete=base64.b64decode(payload['model_complete_base64'],validate=True)
-        body=_json(complete,self.limit); state=_unpack(body['state'])
+        body,state=self._complete(complete,user_id)
         snapshot=Snapshot(user_id,state,payload.get('model_journal_head'),complete)
-        vector,expected=self._point(snapshot)
+        state_digest=reducer.state_sha256(state)
+        vector,expected=self._point_body(snapshot,body,state_digest)
         if not _exact_payload_matches(payload, expected):
             raise JournalConflict('stored complete state/payload mismatch')
         actual = point.vector
+        base_view=None
         if isinstance(state, reducer.BootstrapState):
             if actual != {}:
                 raise JournalConflict('withdrawn-only prefix contains a real vector')
@@ -675,14 +706,14 @@ class QdrantAtomicUsers:
             import math
             if type(actual) is not list or len(actual)!=384 or any(not math.isfinite(x) or not math.isclose(x,y,abs_tol=1e-6,rel_tol=1e-6) for x,y in zip(actual,vector)):
                 raise JournalConflict('stored compatibility vector mismatch')
-            reducer.recommendation_view(state,self.policy,session_id=None,epoch=None,as_of_ms=state.effective_ms)
+            base_view=reducer.recommendation_view(state,self.policy,session_id=None,epoch=None,as_of_ms=state.effective_ms)
         if self.journal is not None:
-            validate_committed_head(snapshot, self.journal)
+            _validate_committed_head(snapshot,self.journal,state_digest,body)
         if not isinstance(state, reducer.BootstrapState) and self.ensure_initialized is not None:
             # Negative guard must become durable before a basis is observable
             # as ready, not only before the first worker ACK.
             self.ensure_initialized(user_id)
-        return snapshot
+        return _DecodedPoint(snapshot,state_digest,base_view,body['legacy']['payload'])
     def insert_once(self, desired):
         if desired.state.operation_version != 1 or desired.state.feedback_version != 0:
             raise JournalConflict('only initial profile may create a user')

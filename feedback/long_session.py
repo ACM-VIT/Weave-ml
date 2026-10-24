@@ -726,6 +726,15 @@ def recommendation_view(state,policy,*,session_id,epoch,as_of_ms):
     baseline=_normalize(state.baseline.vector,state.baseline.vector,policy.normalization_epsilon)
     durable=_sum((state.baseline.vector,*(_cap(_contribution(row),policy.long_repo_cap) for row in state.long_entries)))
     long_term=_normalize(durable,baseline,policy.normalization_epsilon)
+    negatives=tuple(row.repo_id for row in state.long_entries if any(s.action=='dislike' for s in row.signals))
+    return _recommendation_view_from_base(state,policy,long_term,negatives,session_id=session_id,epoch=epoch,as_of_ms=as_of_ms)
+
+
+def _recommendation_view_from_base(state,policy,long_term,negatives,*,session_id,epoch,as_of_ms):
+    # Internal only: base projection and immutable state were validated together
+    # within this request. Public recommendation_view still validates raw state.
+    _integer(as_of_ms)
+    if as_of_ms<state.effective_ms:raise ModelError('generation clock precedes applied effective clock')
     transient=_zero();status='none';selected_epoch=None
     if session_id is not None:
         _uuid(session_id);_integer(epoch,1)
@@ -740,7 +749,6 @@ def recommendation_view(state,policy,*,session_id,epoch,as_of_ms):
                 status='active';transient=_session_at(found,as_of_ms,policy)
     elif epoch is not None:raise ModelError('epoch without session')
     blended=_normalize(_sum((_scale(long_term,1-policy.session_blend),_scale(transient,policy.session_blend))),long_term,policy.normalization_epsilon)
-    negatives=tuple(row.repo_id for row in state.long_entries if any(s.action=='dislike' for s in row.signals))
     vector_hash=_digest({'policy':policy.sha256,'as_of_ms':as_of_ms,'operation_version':state.operation_version,
         'profile_version':state.baseline.content_version,'feedback_version':state.feedback_version,'session_id':session_id,'epoch':epoch,'vector':blended})
     return View(long_term,transient,blended,negatives,status,selected_epoch,state.operation_version,state.feedback_version,

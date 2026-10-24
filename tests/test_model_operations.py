@@ -35,6 +35,85 @@ def uid(n):
 def basis(n):
     return [float(i == n) for i in range(384)]
 
+
+def serving_point_fixture(repositories=16):
+    from feedback.model_journal import Snapshot, _canonical, _pack
+    p=policy();owner=uid(1);session=uid(50)
+    baseline=model.PinnedVector.pin('profile',owner,1,0,p.baseline_recipe,p.embedding,basis(0))
+    state=model.initial_state(owner,baseline,p,accepted_ms=0)
+    def header(version):return model.Header(uid(1000+version),owner,version,version-1,version,'a'*64)
+    state=model.reduce_operation(state,model.Begin(header(1),session,1,'b'*64),p)
+    for index in range(repositories):
+        repo=uid(100+index);source=model.PinnedVector.pin('repository',repo,1,0,p.repository_recipe,p.embedding,basis(index+1))
+        binding=model.SessionBinding(owner,session,1,1,True,'b'*64)
+        state=model.reduce_operation(state,model.Feedback(header(index+2),uid(2000+index),index+1,repo,
+            'dislike' if index%4==0 else 'like',source,binding,None,None),p)
+    class Records:
+        def __init__(self):self.data={}
+        def get(self,key):return self.data.get(key)
+        def put_once(self,key,raw):return self.data.setdefault(key,raw)
+    journal=Journal(Records(),Limits(131072,2097152,1048576,1000))
+    users=QdrantAtomicUsers(None,None,None,collection='owned-serving-fixture',combined_user_bytes=1048576,policy=p,journal=journal)
+    complete=_canonical({'schema_version':1,'user_id':owner,'state':_pack(state),'legacy':{'vector':basis(0),'payload':{
+        'user_id':owner,'profile_version':1,'last_feedback_version':repositories,'feedback_state_revision':repositories+1,'interests':['Rust']}}})
+    complete_sha=journal.put('complete',json.loads(complete))
+    head=journal.put('prepare',{'user_id':owner,'operation_version':state.operation_version,'state_sha256':model.state_sha256(state),'complete_sha256':complete_sha})
+    snapshot=Snapshot(owner,state,head,complete);vector,payload=users._point(snapshot)
+    return SimpleNamespace(id=owner,vector=vector,payload=payload),users,p,snapshot
+
+
+def test_owned_serving_reuses_validation_without_changing_float32_bytes_or_clocks(monkeypatch):
+    import struct
+    import feedback.model_journal as journal_module
+    from feedback.model_serving import Context,owned_input
+    point,users,p,snapshot=serving_point_fixture()
+    for offset in (0,5000):
+        clock=snapshot.state.effective_ms+offset
+        expected=model.recommendation_view(snapshot.state,p,session_id=uid(50),epoch=1,as_of_ms=clock)
+        calls={'state_checks':0,'state_hashes':0,'json_validations':0}
+        def counted(name,function):
+            def run(*args,**kwargs):calls[name]+=1;return function(*args,**kwargs)
+            return run
+        with monkeypatch.context() as patch:
+            patch.setattr(model,'_check_state',counted('state_checks',model._check_state))
+            patch.setattr(model,'state_sha256',counted('state_hashes',model.state_sha256))
+            patch.setattr(journal_module,'_json',counted('json_validations',journal_module._json))
+            effective=owned_input(point,users,p,Context(uid(1),uid(50),1,p.sha256,snapshot.state.operation_version,1,clock))
+        assert effective.float32_le==struct.pack('<384f',*expected.blended)
+        assert effective.explicit_negative_repo_ids==expected.explicit_negative_repo_ids
+        assert effective.state_sha256==model.state_sha256(snapshot.state)
+        assert effective.valid_until_ms==min(clock+p.generation_freshness_ms,snapshot.state.sessions[0].last_activity_ms+p.idle_expiry_ms)
+        print({'repositories':16,**calls})
+        assert calls=={'state_checks':1,'state_hashes':1,'json_validations':2}
+    point.payload['interests'].append('caller mutation')
+    point.vector[0]=0.
+    assert effective.profile_payload['interests']==['Rust'],'owned output cannot alias caller payload'
+    with pytest.raises(JournalConflict):owned_input(point,users,p,Context(uid(1),uid(50),1,p.sha256,snapshot.state.operation_version,1,clock))
+
+
+def test_owned_serving_still_checks_corrupt_points_policy_heads_and_pending_contexts():
+    from feedback.model_serving import Context,owned_input
+    point,users,p,snapshot=serving_point_fixture(2)
+    context=Context(uid(1),uid(50),1,p.sha256,snapshot.state.operation_version,1,snapshot.state.effective_ms)
+    for mutate in (lambda row:setattr(row,'id',uid(2)),lambda row:row.payload.update(profile_version=True),
+            lambda row:row.payload.update(model_state_sha256='f'*64),lambda row:row.payload.update(model_journal_head='f'*64),
+            lambda row:row.payload.update(model_policy_sha256='f'*64),lambda row:row.vector.__setitem__(1,float('nan'))):
+        bad=deepcopy(point);mutate(bad)
+        from feedback.model_journal import JournalError
+        with pytest.raises(JournalError):owned_input(bad,users,p,context)
+    other=policy(generation_freshness_ms=101)
+    with pytest.raises(model.CompatibilityError):owned_input(point,users,other,replace(context,policy_sha256=other.sha256))
+    with pytest.raises(model.OperationGap):owned_input(point,users,p,replace(context,minimum_applied_operation_version=context.minimum_applied_operation_version+1))
+    with pytest.raises(model.OperationGap):owned_input(point,users,p,replace(context,required_profile_version=2))
+    with pytest.raises(model.ModelError):owned_input(point,users,p,replace(context,as_of_ms=0))
+    with pytest.raises(model.EpochConflict):owned_input(point,users,p,replace(context,epoch=2))
+    with pytest.raises(model.EpochConflict):owned_input(point,users,p,replace(context,as_of_ms=context.as_of_ms+p.idle_expiry_ms))
+    assert owned_input(point,users,p,context).head==snapshot.head
+    # A successful read cannot cache away the next request's committed-head proof.
+    users.journal.records.data.pop('blob:'+snapshot.head)
+    from feedback.model_journal import JournalMissing
+    with pytest.raises(JournalMissing):owned_input(point,users,p,context)
+
 def policy(**changes):
     # Controlled synthetic fixture numbers only; no production policy defaults.
     values = dict(version=model.VERSION, embedding=model.EmbeddingIdentity(REPOSITORY_EMBEDDING_MODEL, EMBEDDING_MODEL_REVISION, 384),
