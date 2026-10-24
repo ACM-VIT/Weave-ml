@@ -426,3 +426,64 @@ def test_lifecycle_cas_new_content_readback_cannot_repair_old_request_summary():
     for field, value in winning_payload.items():
         assert stored.payload[field] == value
     client.close()
+
+
+@pytest.mark.parametrize('lifecycle', [observation(archived=True, day=2),
+                                     observation(disabled=True, day=2), observation(day=2)])
+def test_content_cas_race_retries_lifecycle_without_reencoding(lifecycle):
+    from api.contracts import RepositoryJob
+    from api.v2 import V2ServiceHTTPException, _embed_repository_job_locked
+    from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
+    from tests.test_v2_summary_contract import _job, FakeEmbedder
+
+    client, store, original = _indexed_feature_refresh_fixture()
+    initial = merge_lifecycle({}, observation(archived=True)) if not (
+        lifecycle['archived'] or lifecycle['disabled']) else {}
+    winning_features = {'feature_version': 5, 'feature_job_id': str(uuid.uuid4()), 'star_count': 99}
+    client.set_payload(store.collection_name, {**initial, **winning_features}, [original.id])
+    body = _job(content_hash='winning-content').model_dump(mode='json')
+    body['repository']['lifecycle'] = lifecycle
+    request = RepositoryJob.model_validate(body)
+    pipeline = RepositoryEmbeddingPipeline(embedder=FakeEmbedder())
+    # A real competing content result contains a valid current summary but
+    # lacks the request's newer status observation. It wins the atomic CAS.
+    winning_repo = {**body['repository'], 'lifecycle': None}
+    winner = pipeline.embed_repository(winning_repo)
+    winner.payload.update(content_version=request.content_version,
+                          content_job_id=str(uuid.uuid4()), **initial, **winning_features)
+    winning_vector = winner.final_embedding
+    actual_cas = store.compare_and_set_content
+
+    def publish_content_before_cas(*args, **kwargs):
+        store.upsert([winner])
+        return actual_cas(*args, **kwargs)
+
+    try:
+        with patch('api.v2.repository_store', return_value=store), patch(
+            'api.v2._repository_points', side_effect=lambda _: client.retrieve(
+                store.collection_name, [original.id], with_payload=True, with_vectors=True)), patch(
+            'api.v2.repository_embedding_pipeline', return_value=pipeline), patch.object(
+            pipeline, 'embed_repository', wraps=pipeline.embed_repository) as encode:
+            with patch.object(store, 'compare_and_set_content', side_effect=publish_content_before_cas):
+                with pytest.raises(V2ServiceHTTPException) as conflict:
+                    _embed_repository_job_locked(request, OwnedLock())
+            assert conflict.value.status_code == 503
+            assert conflict.value.retryable is True
+            assert conflict.value.headers['Retry-After'] == '2'
+            encoded_before_retry = encode.call_count
+            assert encoded_before_retry == 1
+            result = _embed_repository_job_locked(request, OwnedLock())
+            assert encode.call_count == encoded_before_retry
+        assert result['status'] == 'current'
+        stored = client.retrieve(store.collection_name, [original.id], with_payload=True, with_vectors=True)[0]
+        assert stored.payload['lifecycle_archived'] is lifecycle['archived']
+        assert stored.payload['lifecycle_disabled'] is lifecycle['disabled']
+        assert stored.payload['lifecycle_observed_at'] == '2026-01-02T00:00:00+00:00'
+        assert stored.payload['content_version'] == request.content_version
+        assert stored.payload['content_job_id'] == winner.payload['content_job_id']
+        assert stored.payload['content_hash'] == 'winning-content'
+        for field, value in winning_features.items():
+            assert stored.payload[field] == value
+        assert stored.vector == {QDRANT_VECTOR_NAME: winning_vector}
+    finally:
+        client.close()

@@ -867,6 +867,21 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
         expected_point=expected_point,
     )
     lock.assert_owned()
+    # A competing content writer may win this CAS without the independent
+    # lifecycle observation. Never acknowledge content success until status
+    # survives too; retry applies it through the lifecycle-only replay path.
+    actual_payload = dict(stored.payload or {}) if stored is not None else {}
+    if request.repository.lifecycle is not None and any(
+        actual_payload.get(field) != result.payload[field]
+        for field in LIFECYCLE_FIELDS if field in result.payload
+    ):
+        raise V2ServiceHTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Repository lifecycle state changed during the write; retry the request.",
+            error_code="CONCURRENT_REPOSITORY_WRITE",
+            retryable=True,
+            headers={"Retry-After": "2"},
+        )
     final_status, final_version = _repository_cas_outcome(
         stored,
         version_field="content_version",
