@@ -57,6 +57,7 @@ class CountedRedis:
     def __init__(self, client):
         self.client, self.commands, self.roundtrips, self.sizes = client, 0, 0, []
         self.failure = None
+        self.packed_bytes = []
 
     def __getattr__(self, name):
         return getattr(self.client, name)
@@ -85,6 +86,13 @@ class CountedRedis:
                 owner.commands += self.count
                 owner.roundtrips += 1
                 owner.sizes.append(self.count)
+                connection = self.pipe.connection_pool.get_connection()
+                try:
+                    packed = connection.pack_commands(
+                        args for args, _ in self.pipe.command_stack)
+                    owner.packed_bytes.append(sum(len(chunk) for chunk in packed))
+                finally:
+                    self.pipe.connection_pool.release(connection)
                 results = self.pipe.execute(raise_on_error=False)
                 failure, owner.failure = owner.failure, None
                 if failure == 'lost':
@@ -209,6 +217,9 @@ def test_wire_budget_splits_large_original_feedback(local_redis):
     s.admit_batch(raws)
     assert len(counted.sizes) == 2
     assert sum(counted.sizes) == 20
+    # Measure redis-py's actual RESP encoding independently of _command_bytes.
+    assert len(counted.packed_bytes) == len(counted.sizes)
+    assert all(0 < size <= 1024 * 1024 for size in counted.packed_bytes)
     assert [fields['operation_json'] for _, fields in local_redis.xrange(s.stream)] == raws
 
 
