@@ -54,7 +54,8 @@ def originals(count, same_user=False, start=1):
 
 
 class CountedRedis:
-    def __init__(self, client):
+    def __init__(self, client, *, capture_bytes=False):
+        self.capture_bytes = capture_bytes
         self.client, self.commands, self.roundtrips, self.sizes = client, 0, 0, []
         self.failure = None
         self.packed_bytes = []
@@ -86,13 +87,14 @@ class CountedRedis:
                 owner.commands += self.count
                 owner.roundtrips += 1
                 owner.sizes.append(self.count)
-                connection = self.pipe.connection_pool.get_connection()
-                try:
-                    packed = connection.pack_commands(
-                        args for args, _ in self.pipe.command_stack)
-                    owner.packed_bytes.append(sum(len(chunk) for chunk in packed))
-                finally:
-                    self.pipe.connection_pool.release(connection)
+                if owner.capture_bytes:
+                    connection = self.pipe.connection_pool.get_connection()
+                    try:
+                        packed = connection.pack_commands(
+                            args for args, _ in self.pipe.command_stack)
+                        owner.packed_bytes.append(sum(len(chunk) for chunk in packed))
+                    finally:
+                        self.pipe.connection_pool.release(connection)
                 results = self.pipe.execute(raise_on_error=False)
                 failure, owner.failure = owner.failure, None
                 if failure == 'lost':
@@ -119,6 +121,7 @@ def test_batch_parses_once_preserves_bytes_and_duplicate_hashes(local_redis, mon
     first = s.admit_batch(raws)
     assert parsed == raws
     assert counted.commands == 10 and counted.roundtrips == 1
+    assert counted.packed_bytes == []
     assert [fields['operation_json'] for _, fields in local_redis.xrange(s.stream)] == raws
     second = s.admit_batch(raws)
     assert all(x['status'] == 'duplicate' for x in second)
@@ -206,7 +209,7 @@ def test_concurrent_producers_preserve_each_batch_order_and_atomic_capacity(loca
 
 def test_wire_budget_splits_large_original_feedback(local_redis):
     import json
-    counted = CountedRedis(local_redis); s = stream(counted)
+    counted = CountedRedis(local_redis, capture_bytes=True); s = stream(counted)
     raws = []
     for i in range(1, 21):
         payload = feedback_payload(i)
