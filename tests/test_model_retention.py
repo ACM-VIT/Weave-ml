@@ -63,6 +63,109 @@ def tier(r, *, hot=2, cold=10):
         archive=archive, signing_key=b'x'*32, decision_sha256='a'*64)
 
 
+@pytest.fixture
+def counted_journal(r):
+    from qdrant_client import QdrantClient, models
+    from feedback.model_journal import QdrantRecords
+    from tests.test_model_operation_batch import CountedRedis
+    client=QdrantClient(':memory:');client.create_collection('journal',vectors_config={})
+    class CountedQdrant:
+        def __init__(self):self.reads=0;self.writes=0
+        def retrieve(self,**kwargs):self.reads+=1;return client.retrieve(**kwargs)
+        def upsert(self,**kwargs):self.writes+=1;return client.upsert(**kwargs)
+    q=CountedQdrant();counted=CountedRedis(r)
+    records=QdrantRecords(q,models,collection='journal',record_bytes=1024)
+    store=BudgetedRecords(records,counted,key='counted',max_records=1,max_bytes=1024)
+    try:yield store,counted,q
+    finally:client.close()
+
+
+def test_new_immutable_journal_write_reduces_probes_and_preserves_existing_winners(r,counted_journal):
+    store,counted,q=counted_journal;raw='exact original 検索'.encode()
+    assert store.put_once('key',raw)==raw
+    print({'record':'new','redis_roundtrips':counted.roundtrips,'qdrant_reads':q.reads,'qdrant_writes':q.writes})
+    assert (counted.roundtrips,q.reads,q.writes)==(3,2,1)
+    assert r.hget(store.key,'_count')==b'1' and r.hget(store.key,'_bytes')==str(len(raw)).encode()
+    assert r.hget(store.key,'_recovery_bytes')==b'0' and r.hget(store.candidates,'key') is None
+    for candidate in (raw,b'conflicting bytes'):
+        before=(counted.roundtrips,q.reads,q.writes)
+        assert store.put_once('key',candidate)==raw
+        assert (counted.roundtrips-before[0],q.reads-before[1],q.writes-before[2])==(1,1,0)
+    store.records.put_once('legacy',b'previously unreserved')
+    assert store.put_once('legacy',b'new candidate')==b'previously unreserved'
+    assert r.hget(store.key,'legacy') is None,'legacy winners are not reserved against replacement bytes'
+
+
+@pytest.mark.parametrize('boundary',['reserve_ack','before_write','write_ack','readback','finish_ack'])
+def test_immutable_journal_write_crashes_recover_the_exact_frozen_bytes(r,counted_journal,monkeypatch,boundary):
+    from feedback.model_runtime import _RESERVE,_FINISH_RECOVERY
+    store,counted,q=counted_journal;raw=b'first immutable candidate';armed=True
+    original_eval=counted.eval;original_write=q.upsert;original_read=q.retrieve
+    def evaluate(*args):
+        nonlocal armed
+        result=original_eval(*args)
+        if armed and ((boundary=='reserve_ack' and args[0]==_RESERVE) or (boundary=='finish_ack' and args[0]==_FINISH_RECOVERY)):
+            armed=False;raise TimeoutError('response lost after Redis commit')
+        return result
+    def write(**kwargs):
+        nonlocal armed
+        if armed and boundary=='before_write':armed=False;raise TimeoutError('interrupted before remote write')
+        result=original_write(**kwargs)
+        if armed and boundary=='write_ack':armed=False;raise TimeoutError('response lost after durable insert')
+        return result
+    def read(**kwargs):
+        nonlocal armed
+        result=original_read(**kwargs)
+        if armed and boundary=='readback' and result:
+            armed=False;raise TimeoutError('durable readback interrupted')
+        return result
+    monkeypatch.setattr(counted,'eval',evaluate);monkeypatch.setattr(q,'upsert',write);monkeypatch.setattr(q,'retrieve',read)
+    with pytest.raises(TimeoutError):store.put_once('key',raw)
+    assert r.hget(store.key,'_count')==b'1' and r.hget(store.key,'_bytes')==str(len(raw)).encode()
+    assert r.hget(store.key,'_recovery_bytes')==(b'0' if boundary=='finish_ack' else str(len(raw)).encode())
+    assert store.put_once('key',b'replacement')==raw
+    assert store.get('key')==raw
+    assert r.hget(store.candidates,'key') is None and r.hget(store.key,'_recovery_bytes')==b'0'
+    assert r.hget(store.key,'_count')==b'1','recovery never reserves a duplicate or refunds durable identity'
+
+
+def test_competing_journal_candidate_recovers_the_winner_without_bypassing_capacity(r,counted_journal,monkeypatch):
+    store,counted,q=counted_journal;raw=b'first winner';arrived=threading.Event();release=threading.Event();results=[];errors=[]
+    original=store.records.put_once
+    def held(key,candidate):
+        if threading.current_thread().name=='first-writer':arrived.set();assert release.wait(5)
+        return original(key,candidate)
+    monkeypatch.setattr(store.records,'put_once',held)
+    def first():
+        try:results.append(store.put_once('key',raw))
+        except BaseException as error:errors.append(error)
+    worker=threading.Thread(target=first,name='first-writer');worker.start()
+    try:
+        assert arrived.wait(5),'the winning reservation must reach persistence before the contender'
+        assert r.hget(store.key,'_recovery_bytes')==str(len(raw)).encode()
+        with pytest.raises(OperationCapacity):store.put_once('another',b'over capacity')
+        assert store.put_once('key',b'competing replacement')==raw
+        release.set();worker.join(5)
+        assert not worker.is_alive() and not errors and results==[raw]
+        assert store.get('key')==raw
+        assert r.hget(store.key,'_count')==b'1' and r.hget(store.key,'_recovery_bytes')==b'0'
+    finally:release.set();worker.join(5)
+
+
+def test_different_durable_readback_keeps_the_frozen_candidate_and_its_budget(r,counted_journal,monkeypatch):
+    from feedback.model_runtime import _RESERVE
+    store,counted,q=counted_journal;original=counted.eval;candidate=b'frozen candidate'
+    def conflicting_insert(*args):
+        result=original(*args)
+        if args[0]==_RESERVE and result==1:store.records.put_once('key',b'foreign durable bytes')
+        return result
+    monkeypatch.setattr(counted,'eval',conflicting_insert)
+    with pytest.raises(ModelLaneUnavailable,match='readback'):store.put_once('key',candidate)
+    assert r.hget(store.candidates,'key')==candidate
+    assert r.hget(store.key,'_recovery_bytes')==str(len(candidate)).encode()
+    with pytest.raises(ModelLaneUnavailable,match='reservation'):store.get('key')
+
+
 def test_small_hot_budget_continues_until_explicit_archive_ceiling(r):
     store = tier(r)
     before = store.metrics()
