@@ -1723,16 +1723,12 @@ async def repository_search(request: RepositorySearchRequest, http_request: Requ
 async def submit_model_operations(request: ModelOperationBatch):
     from feedback.model_runtime import model_runtime, ModelLaneUnavailable
     from feedback.model_stream import OperationBytesConflict, OperationCapacity
-    from feedback.model_wire import WireError, parse_operation
+    from feedback.model_wire import WireError
     try:
         def enqueue():
             runtime = model_runtime()
-            # Validate the whole batch before accepting its first element.
-            # Partial capacity admission remains exact-retry safe.
-            for item in request.operations:
-                parse_operation(item.operation_json, maximum_bytes=runtime.stream.limits.input_bytes,
-                                allowed_policies=runtime.stream.policies)
-            return {"schema_version": 1, "operations": [runtime.stream.admit(item.operation_json) for item in request.operations]}
+            return {"schema_version": 1, "operations": runtime.stream.admit_batch(
+                [item.operation_json for item in request.operations])}
         return await run_service_job("feedback", enqueue)
     except WireError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None

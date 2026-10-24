@@ -10,7 +10,7 @@ from feedback import long_session as model
 from feedback.model_wire import WireError, canonical_json, parse_operation
 from feedback.model_journal import Journal, Limits, QdrantAtomicUsers, JournalConflict
 from feedback.model_processor import ModelProcessor
-from feedback.model_stream import StreamLimits
+from feedback.model_stream import StreamLimits, OperationStream
 from feedback.v2 import OrderedFeedbackApplier
 from feedback.v2_settings import V2FeedbackSettings
 from embedding.qdrant_cas import payload_snapshot_filter
@@ -136,7 +136,9 @@ def test_registered_route_refuses_invalid_feedback_before_any_admission(monkeypa
     p=policy();event=__import__('json').loads(feedback_payload()['original_feedback_json']);bad_event(event)
     raw=wire(p,'feedback',2,{'original_feedback_json':canonical_json(event)})
     calls=[]
-    stream=SimpleNamespace(limits=SimpleNamespace(input_bytes=131072),policies={p.sha256},admit=lambda raw:calls.append(raw))
+    stream=OperationStream(SimpleNamespace(eval=lambda *args:calls.append(args)),
+        StreamLimits('invalid-batch',100,1000,131072,10,10),{p.sha256},
+        initialization_scope='invalid-batch',max_guard_users=100)
     monkeypatch.setattr(provider,'model_runtime',lambda:SimpleNamespace(stream=stream))
     monkeypatch.setenv('INTERNAL_API_SECRET','fixture-secret')
     app=FastAPI();app.include_router(router)
@@ -153,7 +155,9 @@ def test_registered_route_rejects_nonfinite_numeric_json_before_admission(monkey
     import feedback.model_runtime as provider
     p=policy();raw=wire(p,'profile',1,profile_payload()).replace('"allow_genesis":true','"allow_genesis":1e999')
     with pytest.raises(WireError):parse(raw,p)
-    calls=[];stream=SimpleNamespace(limits=SimpleNamespace(input_bytes=131072),policies={p.sha256},admit=lambda raw:calls.append(raw))
+    calls=[];stream=OperationStream(SimpleNamespace(eval=lambda *args:calls.append(args)),
+        StreamLimits('invalid-batch',100,1000,131072,10,10),{p.sha256},
+        initialization_scope='invalid-batch',max_guard_users=100)
     monkeypatch.setattr(provider,'model_runtime',lambda:SimpleNamespace(stream=stream));monkeypatch.setenv('INTERNAL_API_SECRET','fixture-secret')
     app=FastAPI();app.include_router(router)
     response=TestClient(app).post('/api/v2/model-operations',headers={'x-internal-secret':'fixture-secret'},json={'schema_version':1,'operations':[{'operation_json':raw}]})
