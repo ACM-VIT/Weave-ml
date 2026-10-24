@@ -6,7 +6,9 @@ from ingestion.lifecycle import LIFECYCLE_FIELDS
 
 import logging
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+
+from utils.deadline import check_deadline
 from numbers import Integral, Real
 from typing import Any
 
@@ -22,9 +24,10 @@ from config import (
     QDRANT_VECTOR_NAME,
     REPOSITORY_EMBEDDING_DIM,
 )
+from .batch_limits import check_field_budget
 from .corpus_revision import (
     CorpusAuthorityUnavailable, CorpusRevisionAuthority, MaintenanceProof,
-    authority_from_environment,
+    authority_from_environment, operation_completed,
 )
 from .qdrant_cas import payload_matches, payload_snapshot_filter
 from .repository_embedding import RepositoryEmbeddingResult
@@ -118,26 +121,78 @@ class QdrantRepositoryStore:
             raise ValueError(f"Qdrant collection {self.collection_name!r} does not exist.")
         self._validate_collection()
 
-    def upsert(self, results: Iterable[RepositoryEmbeddingResult]) -> None:
-        """Upsert embedding results into Qdrant."""
-        points = []
-        for result in results:
-            # The below deterministic ID is for safe re-runs; the same repo is
-            # updated instead of inserted as a duplicate vector.
-            points.append(
-                self._validated_point(
-                    result,
-                    point_id=self._point_id(result.repo_id),
+    def iter_upsert(
+        self,
+        results: Iterable[RepositoryEmbeddingResult],
+        *,
+        max_points: int = 64,
+        max_request_bytes: int = 1024 * 1024,
+    ) -> Iterator[RepositoryEmbeddingResult]:
+        """Yield acknowledged offline writes bounded by points and REST bytes.
+
+        Earlier chunks stay committed when validation, iteration or a write
+        fails. The failed/ambiguous chunk is never yielded. Restart by replaying
+        deterministic IDs; this is deliberately separate from online CAS.
+        """
+        self._validate_limit(max_points)
+        self._validate_limit(max_request_bytes)
+        # Use the client's REST serializer, including UTF-8, escaping and the
+        # request envelope. Character counts/estimated vector sizes undercount
+        # multilingual payloads and float representations.
+        from qdrant_client.http.api.points_api import jsonable_encoder
+
+        envelope_bytes = len(jsonable_encoder(self.models.PointsList(points=[])).encode("utf-8"))
+        points, pending = [], []
+        request_bytes = envelope_bytes
+
+        def flush():
+            check_deadline()
+            response = self._mutate(lambda: self.client.upsert(
+                collection_name=self.collection_name, points=points, wait=True,
+            ))
+            if not operation_completed(response):
+                raise CorpusAuthorityUnavailable(
+                    "Qdrant chunk completion is not proven; replay before recording progress"
                 )
+            logger.info("Upserted %d repository vectors into %s (%d REST bytes)",
+                        len(points), self.collection_name, request_bytes)
+
+        for result in results:
+            check_deadline()
+            check_field_budget(
+                [result.payload], max_bytes=max_request_bytes, label="Qdrant point payload",
             )
-        if not points:
-            return
-        self._mutate(lambda: self.client.upsert(
-            collection_name=self.collection_name,
-            points=points,
-            wait=True,
-        ))
-        logger.info("Upserted %d repository vectors into %s", len(points), self.collection_name)
+            point = self._validated_point(result, point_id=self._point_id(result.repo_id))
+            size = len(jsonable_encoder(point).encode("utf-8"))
+            if size + envelope_bytes > max_request_bytes:
+                raise ValueError(f"repository {result.repo_id} exceeds the Qdrant request byte budget")
+            if points and (len(points) >= max_points or request_bytes + 1 + size > max_request_bytes):
+                flush()
+                yield from pending
+                points, pending = [], []
+                request_bytes = envelope_bytes
+            request_bytes += size + int(bool(points))
+            points.append(point)
+            pending.append(result)
+            if len(points) == max_points:
+                flush()
+                yield from pending
+                points, pending = [], []
+                request_bytes = envelope_bytes
+        if points:
+            flush()
+            yield from pending
+
+    def upsert(
+        self,
+        results: Iterable[RepositoryEmbeddingResult],
+        *,
+        max_points: int = 64,
+        max_request_bytes: int = 1024 * 1024,
+    ) -> None:
+        """Consume bounded offline writes; use iter_upsert for progress."""
+        for _ in self.iter_upsert(results, max_points=max_points, max_request_bytes=max_request_bytes):
+            pass
 
     def compare_and_set_content(
         self,
