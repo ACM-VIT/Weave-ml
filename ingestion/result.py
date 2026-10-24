@@ -1,14 +1,15 @@
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Literal, Optional
 from config import NOVELTY_THRESHOLD
 
 @dataclass
 class NoveltyMatrix:
-    final: float
-    semantic_penalty: float
-    category_penalty: float 
-    tech_stack_penalty: float
-    activity_penalty: float
+    measurement_status: Literal["measured", "unmeasured"]
+    final: Optional[float]
+    semantic_penalty: Optional[float]
+    category_penalty: Optional[float]
+    tech_stack_penalty: Optional[float]
+    activity_penalty: Optional[float]
     top_k: list[dict]
     anomaly_tag: str
     explanation: str
@@ -41,8 +42,14 @@ class IngestionResult:
         status_banner = "✅ REGISTRATION APPROVED" if self.decision == "APPROVED" else "❌ ECOSYSTEM DROP REJECTED"
         
         anomaly_warning = ""
-        if self.novelty.anomaly_tag != "NONE":
+        if self.novelty.measurement_status == "measured" and self.novelty.anomaly_tag != "NONE":
             anomaly_warning = f"\n  ⚠️  SECURITY/INTEGRITY ANOMALY DETECTED: [{self.novelty.anomaly_tag}]"
+
+        novelty_value = (
+            f"{self.novelty.final:.4f}"
+            if self.novelty.measurement_status == "measured" and self.novelty.final is not None
+            else "UNMEASURED"
+        )
 
         output_blocks = [
             thick_divider,
@@ -58,12 +65,12 @@ class IngestionResult:
             f"  Standardized Structural Presentation Abstract:",
             "\n".join(f"    {line}" for line in self.structured_summary.split("\n")),
             thin_divider,
-            f"  Aggregate System Novelty Target Index: {self.novelty.final:.4f}  (Gateway Minimum Constraint Floor: bypassed)",
+            f"  Corpus Novelty Measurement: {novelty_value}",
             thin_divider,
             self.novelty.explanation
         ]
         
-        if self.topological_metrics and self.topological_metrics.get("nearest_cluster") != "None":
+        if self.topological_metrics and self.topological_metrics.get("measurement_status") == "measured":
             output_blocks += [
                 thin_divider,
                 f"  Corpus Cluster Topology Structural Space Vector:",
