@@ -11,6 +11,7 @@ from .contracts import CARD_SUMMARY_FORMAT_VERSION, CARD_SUMMARY_PROMPT_VERSION
 
 
 _SAFE_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$")
+OPENAI_SUMMARY_API_URL = "https://api.openai.com/v1/chat/completions"
 
 
 def _integer(name: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -46,6 +47,7 @@ class SummarySettings:
     prompt_version: str = CARD_SUMMARY_PROMPT_VERSION
     format_version: str = CARD_SUMMARY_FORMAT_VERSION
     input_max_chars: int = 12_000
+    source_overflow_policy: str = "reject"
     temperature: float = 0.1
     max_output_tokens: int = 240
     request_timeout_seconds: float = 5.0
@@ -57,8 +59,12 @@ class SummarySettings:
     retry_base_seconds: float = 1.0
 
     def __post_init__(self) -> None:
-        if self.provider != "openrouter":
-            raise ValueError("SUMMARY_PROVIDER must be 'openrouter'")
+        if self.source_overflow_policy not in {"reject", "prefix"}:
+            raise ValueError("SUMMARY_SOURCE_OVERFLOW_POLICY must be 'reject' or 'prefix'")
+        if self.provider not in {"openrouter", "openai"}:
+            raise ValueError("SUMMARY_PROVIDER must be 'openrouter' or 'openai'")
+        if self.provider == "openai" and self.api_url != OPENAI_SUMMARY_API_URL:
+            raise ValueError("SUMMARY_API_URL must be the official OpenAI endpoint")
         parsed = urlsplit(self.api_url)
         if (
             parsed.scheme != "https"
@@ -113,16 +119,17 @@ class SummarySettings:
 
     @classmethod
     def from_env(cls) -> "SummarySettings":
+        provider = os.getenv("SUMMARY_PROVIDER", "openrouter").strip().casefold()
         return cls(
-            provider=os.getenv("SUMMARY_PROVIDER", "openrouter").strip().casefold(),
+            provider=provider,
             api_url=os.getenv(
                 "SUMMARY_API_URL",
-                "https://openrouter.ai/api/v1/chat/completions",
+                OPENAI_SUMMARY_API_URL if provider == "openai" else "https://openrouter.ai/api/v1/chat/completions",
             ).strip(),
             api_key=os.getenv("SUMMARY_API_KEY") or None,
             model_id=os.getenv(
                 "SUMMARY_MODEL_ID",
-                "meta-llama/llama-3.3-70b-instruct",
+                "gpt-6-luna" if provider == "openai" else "meta-llama/llama-3.3-70b-instruct",
             ).strip(),
             prompt_version=os.getenv(
                 "SUMMARY_PROMPT_VERSION", CARD_SUMMARY_PROMPT_VERSION
@@ -133,6 +140,7 @@ class SummarySettings:
             input_max_chars=_integer(
                 "SUMMARY_INPUT_MAX_CHARS", 12_000, minimum=1_000, maximum=30_000
             ),
+            source_overflow_policy=os.getenv("SUMMARY_SOURCE_OVERFLOW_POLICY", "reject").strip().casefold(),
             temperature=_number(
                 "SUMMARY_TEMPERATURE", 0.1, minimum=0, maximum=0.2
             ),

@@ -1,9 +1,10 @@
-"""Bounded OpenRouter-compatible provider transport for card summaries."""
+"""Bounded OpenRouter and direct OpenAI transport for card summaries."""
 
 from __future__ import annotations
 
 import logging
 import json
+from copy import deepcopy
 import threading
 import time
 from typing import Any, Callable, Protocol
@@ -109,7 +110,13 @@ class OpenRouterSummaryProvider:
         *,
         repair_feedback: str | None,
     ) -> dict[str, Any]:
-        return {
+        response_schema = RESPONSE_JSON_SCHEMA
+        if self.settings.provider == "openai":
+            response_schema = deepcopy(RESPONSE_JSON_SCHEMA)
+            # OpenAI strict output requires every property, including an empty
+            # highlights array. Keep the shared public/OpenRouter schema intact.
+            response_schema["schema"]["required"] = list(response_schema["schema"]["properties"])
+        payload = {
             "model": self.settings.model_id,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -119,13 +126,19 @@ class OpenRouterSummaryProvider:
                 },
             ],
             "temperature": self.settings.temperature,
-            "max_tokens": self.settings.max_output_tokens,
             "response_format": {
                 "type": "json_schema",
-                "json_schema": RESPONSE_JSON_SCHEMA,
+                "json_schema": response_schema,
             },
-            "provider": {"require_parameters": True},
         }
+        if self.settings.provider == "openai":
+            payload["max_completion_tokens"] = self.settings.max_output_tokens
+            if self.settings.model_id == "gpt-6-luna" or self.settings.model_id.startswith("gpt-6-luna-"):
+                payload["reasoning_effort"] = "none"
+        else:
+            payload["max_tokens"] = self.settings.max_output_tokens
+            payload["provider"] = {"require_parameters": True}
+        return payload
 
     def generate(self, source: str, *, repair_feedback: str | None = None, deadline: float | None = None) -> str:
         if not source or len(source) > self.settings.input_max_chars:
@@ -133,8 +146,9 @@ class OpenRouterSummaryProvider:
         headers = {
             "Authorization": f"Bearer {self.settings.api_key}",
             "Content-Type": "application/json",
-            "X-Title": "Weave Repository Summaries",
         }
+        if self.settings.provider == "openrouter":
+            headers["X-Title"] = "Weave Repository Summaries"
         payload = self._request_payload(source, repair_feedback=repair_feedback)
         attempts = self.settings.max_retries + 1
         for attempt in range(attempts):
