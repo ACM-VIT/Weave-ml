@@ -95,13 +95,23 @@ class VerifiedJournalTier(BudgetedRecords):
                               self._identity(raw)], separators=(',', ':')).encode()
         return self._identity(raw) + ':' + hmac.new(self.signing_key, message, hashlib.sha256).hexdigest()
 
+    def _archive_record(self, key):
+        raw = self.archive.get(key)
+        if raw is not None:
+            reserved = self.redis.hget(self.archive.key, key)
+            if isinstance(reserved, bytes):
+                reserved = reserved.decode('ascii')
+            if reserved != self._identity(raw):
+                raise ModelLaneUnavailable('archive reservation missing or differs')
+        return raw
+
     def _archived(self, key):
         receipt = self.redis.hget(self.routes, key)
         if receipt is None:
             return None
         if isinstance(receipt, bytes):
             receipt = receipt.decode('ascii')
-        raw = self.archive.get(key)
+        raw = self._archive_record(key)
         if raw is None or not hmac.compare_digest(receipt, self._receipt(key, raw)):
             raise ModelLaneUnavailable('archive routing proof or exact bytes differ')
         return raw
@@ -113,14 +123,18 @@ class VerifiedJournalTier(BudgetedRecords):
             return self._archived(key)
         if entered == -2:
             raise OperationCapacity('retention reader capacity exhausted; inspect interrupted readers')
+        completed = False
         try:
             found = super().get(key)
             # A lost route must not turn an archived key into a new identity.
             if found is None and self.archive.get(key) is not None:
                 raise ModelLaneUnavailable('archive exists without routing proof; verified recovery required')
+            completed = True
             return found
         finally:
-            if int(self.redis.eval(_LEAVE, 1, self.readers, key)) != 1:
+            # A failed IO call may still complete remotely after its timeout.
+            # Keep its durable fence until controlled recovery proves quiescence.
+            if completed and int(self.redis.eval(_LEAVE, 1, self.readers, key)) != 1:
                 raise ModelLaneUnavailable('retention reader accounting differs')
 
     def put_once(self, key, raw):
@@ -154,7 +168,7 @@ class VerifiedJournalTier(BudgetedRecords):
         raw = self.get(key)
         if raw is None:
             raise ModelLaneUnavailable('cannot archive a missing journal record')
-        if self.archive.put_once(key, raw) != raw or self.archive.get(key) != raw:
+        if self.archive.put_once(key, raw) != raw or self._archive_record(key) != raw:
             raise ModelLaneUnavailable('archive verification differs from original bytes')
         receipt = self._receipt(key, raw)
         result = int(self.redis.eval(_PUBLISH, 4, self.key, self.candidates, self.routes, self.readers,

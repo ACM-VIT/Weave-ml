@@ -51,9 +51,11 @@ for absence before refund. A lost refund response is safe to retry. Failures
 propagate as capacity/unavailability errors; no exception silently authorizes ACK.
 
 The reader fence has **no timer**: a worker killed during hot IO leaves a durable
-reader entry that prevents compaction for that key. Reader-map entries and
+reader entry that prevents compaction for that key. Failed hot IO, including a
+timeout whose request may still execute remotely, also retains its reader fence;
+a successful retry does not clear that earlier uncertainty. Reader-map entries and
 per-key concurrency are bounded by max hot records. Recovery requires stopping
-all journal IO, proving old workers cannot resume, validating hot/archive records
+all journal IO, proving old workers and outstanding remote requests cannot resume, validating hot/archive records
 and reservations, then explicitly repairing abandoned reader entries. No automated
 reaper is provided. Availability is sacrificed rather than allowing stale IO to
 reinsert an uncharged point after deletion.

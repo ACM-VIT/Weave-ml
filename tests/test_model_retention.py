@@ -262,3 +262,70 @@ def test_local_qdrant_actual_runtime_reversal_withdrawal_and_replay(r):
         scenario(runtime)
     finally:
         q.close()
+
+
+def test_timed_out_write_retains_fence_until_remote_request_is_quiescent(r, monkeypatch):
+    store = tier(r)
+    original = store.records.put_once
+    release, arrived = threading.Event(), threading.Event()
+    errors = []
+    def delayed():
+        try:
+            assert release.wait(5)
+            original('key', b'original')
+            arrived.set()
+        except BaseException as exc:
+            errors.append(exc)
+    worker = threading.Thread(target=delayed)
+    def timeout(key, raw):
+        worker.start()
+        raise TimeoutError('request still in flight after client timeout')
+    monkeypatch.setattr(store.records, 'put_once', timeout)
+    try:
+        with pytest.raises(TimeoutError):
+            store.put_once('key', b'original')
+        monkeypatch.setattr(store.records, 'put_once', original)
+        # A second worker recovers and refunds the temporary candidate copy.
+        assert store.get('key') == b'original'
+        assert r.hget(store.candidates, 'key') is None
+        with pytest.raises(ModelLaneUnavailable, match='reader'):
+            store.compact('key')
+        assert store.metrics()['hot_records'] == 1
+        assert r.hget(store.routes, 'key') is None
+        release.set()
+        worker.join(5)
+        assert arrived.is_set() and not errors and not worker.is_alive()
+        # Even observing this write does not automatically prove all remote IO
+        # quiescent. The abandoned fence requires controlled operator recovery.
+        with pytest.raises(ModelLaneUnavailable, match='reader'):
+            store.compact('key')
+        assert store.records.get('key') == b'original'
+        assert store.metrics()['hot_records'] == 1
+    finally:
+        release.set()
+        if worker.ident is not None:
+            worker.join(5)
+
+
+@pytest.mark.parametrize('routed', [False, True])
+@pytest.mark.parametrize('loss', ['identity', 'ledger'])
+def test_missing_archive_reservation_blocks_route_and_hot_deletion(r, routed, loss):
+    store = tier(r)
+    store.put_once('key', b'original')
+    if routed:
+        store.compact('key')
+    else:
+        store.archive.put_once('key', b'original')
+    if loss == 'identity':
+        r.hdel(store.archive.key, 'key')
+    else:
+        r.delete(store.archive.key)
+    if routed:
+        with pytest.raises(ModelLaneUnavailable, match='reservation'):
+            store.get('key')
+        with pytest.raises(ModelLaneUnavailable, match='reservation'):
+            store.put_once('key', b'replacement')
+    with pytest.raises(ModelLaneUnavailable, match='reservation'):
+        store.compact('key')
+    assert store.records.get('key') == (None if routed else b'original')
+    assert store.metrics()['hot_records'] == (0 if routed else 1)
