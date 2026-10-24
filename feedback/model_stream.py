@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import uuid
 import re
+from itertools import islice
 
 from feedback.model_wire import parse_operation, parse_withdrawal
 
@@ -124,21 +125,99 @@ class OperationStream:
         self.ready_predecessor = None
 
     def _admission(self, script, operation, *args):
-        result = int(self.redis.eval(script, 4, self.stream, self.identities,
-            self.withdrawals, self.guard_key, *args, 0))
+        result = self.redis.eval(script, 4, self.stream, self.identities,
+            self.withdrawals, self.guard_key, *args, 0)
+        return self._recover(script, operation, result, args)
+
+    def _recover(self, script, operation, result, args):
+        if type(result) is not int or result not in {-2, -1, 0, 1, 2}:
+            raise RuntimeError('unknown operation admission response; retry original bytes')
         if result == -2 and self.ready_predecessor is not None and self.ready_predecessor(operation):
             # Exactly one global recovery slot, never one per user or gap.
             # A validated committed cursor proves this input can make progress.
             # The Lua capacity check remains atomic across replicas. After its
             # terminal CAS/ACK the same slot can admit the next missing prefix,
             # draining even legacy accepted futures with arbitrarily long gaps.
-            result = int(self.redis.eval(script, 4, self.stream, self.identities,
-                self.withdrawals, self.guard_key, *args, 1))
+            result = self.redis.eval(script, 4, self.stream, self.identities,
+                self.withdrawals, self.guard_key, *args, 1)
+            if type(result) is not int or result not in {-2, -1, 0, 1, 2}:
+                raise RuntimeError('unknown operation admission response; retry original bytes')
         return result
 
     def admit(self, original_json):
         operation = parse_operation(original_json, maximum_bytes=self.limits.input_bytes, allowed_policies=self.policies)
+        return self._admit_parsed(operation)
+
+    def _arguments(self, operation):
         h = operation.header
+        version_key = 'version:' + h.user_id + ':' + str(h.operation_version)
+        return (version_key, 'id:' + h.operation_id, h.source_envelope_sha256,
+                version_key + ':' + h.source_envelope_sha256, operation.original_json,
+                self.limits.max_pending, self.limits.max_identities, h.user_id, self.max_guard_users)
+
+    def admit_batch(self, originals):
+        """Validate all inputs, then submit bounded, individually atomic scripts.
+
+        A pipeline is not a transaction: any subset may commit before a response
+        is lost. Callers must retry the exact complete batch on failure. Profiles
+        are barriers, and recovery is resolved before another input for that
+        user can be sent. There is no claim of global ordering across producers.
+        """
+        from feedback.model_wire import WireError
+        originals = list(islice(originals, 51))
+        if not 1 <= len(originals) <= 50:
+            raise WireError('operation batch must contain 1 to 50 envelopes')
+        operations = [parse_operation(raw, maximum_bytes=self.limits.input_bytes,
+                                      allowed_policies=self.policies) for raw in originals]
+        responses, pending = [], []
+        users, byte_count = set(), 0
+
+        def flush():
+            if not pending:
+                return
+            if len(pending) == 1:
+                responses.append(self._admit_parsed(pending[0]))
+                return
+            with self.redis.pipeline(transaction=False) as pipeline:
+                for operation in pending:
+                    pipeline.eval(_ADMIT, 4, self.stream, self.identities,
+                                  self.withdrawals, self.guard_key, *self._arguments(operation), 0)
+                results = pipeline.execute(raise_on_error=False)
+            if len(results) != len(pending):
+                raise RuntimeError('incomplete operation admission response; retry original bytes')
+            # A command error does not roll back other commands. Do not expose a
+            # successful batch acknowledgement unless every result is proven.
+            if any(isinstance(result, Exception) for result in results):
+                raise next(result for result in results if isinstance(result, Exception))
+            for operation, result in zip(pending, results):
+                result = self._recover(_ADMIT, operation, result, self._arguments(operation))
+                responses.append(self._response(operation, result))
+
+        for operation in operations:
+            # Include the complete RESP command, including repeated Lua source,
+            # keys and UTF-8 payload, in the one-MiB pipeline wire budget.
+            size = self._command_bytes(operation)
+            if (operation.kind == 'profile' or len(pending) >= 50 or
+                    byte_count + size > 1024 * 1024 or
+                    (self.ready_predecessor is not None and operation.header.user_id in users)):
+                flush()
+                pending, users, byte_count = [], set(), 0
+            if operation.kind == 'profile':
+                responses.append(self._admit_parsed(operation))
+            else:
+                pending.append(operation)
+                users.add(operation.header.user_id)
+                byte_count += size
+        flush()
+        return responses
+
+    def _command_bytes(self, operation):
+        values = ('EVAL', _ADMIT, 4, self.stream, self.identities, self.withdrawals,
+                  self.guard_key, *self._arguments(operation), 0)
+        lengths = [len(str(value).encode('utf-8')) for value in values]
+        return len(str(len(values))) + 3 + sum(n + len(str(n)) + 5 for n in lengths)
+
+    def _admit_parsed(self, operation):
         if operation.kind == 'profile' and self.profile_preflight is not None:
             from feedback.model_journal import OriginalIdentityConflict
             try:
@@ -147,11 +226,13 @@ class OperationStream:
                 raise OperationBytesConflict('original profile identity conflict') from exc
             if proven is not None:
                 return proven
-        version_key = 'version:' + h.user_id + ':' + str(h.operation_version)
-        id_key = 'id:' + h.operation_id
-        result = self._admission(_ADMIT, operation, version_key, id_key,
-                                     h.source_envelope_sha256, version_key + ':' + h.source_envelope_sha256,
-                                     original_json, self.limits.max_pending, self.limits.max_identities, h.user_id, self.max_guard_users)
+        result = self._admission(_ADMIT, operation, *self._arguments(operation))
+        return self._response(operation, result)
+
+    def _response(self, operation, result):
+        h = operation.header
+        if type(result) is not int or result not in {-2, -1, 0, 1, 2}:
+            raise RuntimeError('unknown operation admission response; retry original bytes')
         if result == -1:
             raise OperationBytesConflict('operation identity was reused with different original bytes')
         if result == -2:
@@ -160,7 +241,10 @@ class OperationStream:
                 'source_envelope_sha256': h.source_envelope_sha256,
                 'status': 'withdrawal_accepted' if result == 2 else 'accepted' if result else 'duplicate'}
         if result == 2:
-            response['withdrawal_sha256'] = self.lookup_withdrawal(h.user_id, h.operation_version).withdrawal_sha256
+            withdrawal = self.lookup_withdrawal(h.user_id, h.operation_version)
+            if withdrawal is None or withdrawal.header.source_envelope_sha256 != h.source_envelope_sha256:
+                raise OperationBytesConflict('withdrawal proof unavailable or differs')
+            response['withdrawal_sha256'] = withdrawal.withdrawal_sha256
         return response
 
     def lookup_withdrawal(self, user_id, version):
