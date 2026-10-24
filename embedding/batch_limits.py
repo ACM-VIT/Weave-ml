@@ -40,4 +40,3 @@ def check_field_budget(values: list[Any], *, max_bytes: int, label: str) -> None
 
     for value in values:
         measure(value)
-
