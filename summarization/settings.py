@@ -47,6 +47,7 @@ class SummarySettings:
     prompt_version: str = CARD_SUMMARY_PROMPT_VERSION
     format_version: str = CARD_SUMMARY_FORMAT_VERSION
     input_max_chars: int = 12_000
+    source_overflow_policy: str = "reject"
     temperature: float = 0.1
     max_output_tokens: int = 240
     request_timeout_seconds: float = 5.0
@@ -58,6 +59,8 @@ class SummarySettings:
     retry_base_seconds: float = 1.0
 
     def __post_init__(self) -> None:
+        if self.source_overflow_policy not in {"reject", "prefix"}:
+            raise ValueError("SUMMARY_SOURCE_OVERFLOW_POLICY must be 'reject' or 'prefix'")
         if self.provider not in {"openrouter", "openai"}:
             raise ValueError("SUMMARY_PROVIDER must be 'openrouter' or 'openai'")
         if self.provider == "openai" and self.api_url != OPENAI_SUMMARY_API_URL:
@@ -137,6 +140,7 @@ class SummarySettings:
             input_max_chars=_integer(
                 "SUMMARY_INPUT_MAX_CHARS", 12_000, minimum=1_000, maximum=30_000
             ),
+            source_overflow_policy=os.getenv("SUMMARY_SOURCE_OVERFLOW_POLICY", "reject").strip().casefold(),
             temperature=_number(
                 "SUMMARY_TEMPERATURE", 0.1, minimum=0, maximum=0.2
             ),

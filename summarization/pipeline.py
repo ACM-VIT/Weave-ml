@@ -24,7 +24,7 @@ from .provider import SUMMARY_COMPLETION_RESERVE_SECONDS, SummaryProvider, Summa
 from . import reuse
 from .reuse import SummaryReuseCache, SummaryWork, source_identity
 from .settings import SummarySettings
-from .source import build_summary_source
+from .source import MAX_SOURCE_ANALYSIS_LINES, build_summary_source
 from .sentences import (
     has_complete_sentence_ending,
     has_two_or_three_complete_sentences,
@@ -178,6 +178,24 @@ class CardSummaryPipeline:
         self.provider = provider
         self.reuse_cache = reuse_cache or SummaryReuseCache()
 
+    def _summary_inputs(self, source: Any, repo: Mapping[str, Any]) -> tuple[Any, Mapping[str, Any]]:
+        """Project an explicitly approved prefix without changing canonical content.
+
+        A full backend content hash is required so edits outside the prefix still
+        invalidate reuse. Discard derived variants made from the uncut document.
+        """
+        raw = repo.get("readme")
+        content_hash = repo.get("content_hash")
+        if (self.settings.source_overflow_policy != "prefix" or not isinstance(raw, str)
+                or len(raw) <= MAX_PREPROCESS_CHARS or not isinstance(content_hash, str)
+                or re.fullmatch(r"[a-f0-9]{64}", content_hash) is None):
+            return source, repo
+        prefix = "".join(raw[:MAX_PREPROCESS_CHARS].splitlines(keepends=True)[:MAX_SOURCE_ANALYSIS_LINES])
+        projected = {key: value for key, value in repo.items()
+                     if key not in {"clean_text", "readme_md", "extracted_paragraphs"}}
+        projected["readme"] = prefix
+        return projected, projected
+
     def is_current(self, artifact: CardSummaryArtifact, *, repo: Mapping[str, Any] | None = None) -> bool:
         if (
             artifact.prompt_version != self.settings.prompt_version
@@ -219,6 +237,7 @@ class CardSummaryPipeline:
                 and not (repo is not None and callable(deferred) and deferred(repo)))
 
     def _reuse_key(self, source: Any, repo: Mapping[str, Any]) -> bytes | None:
+        source, repo = self._summary_inputs(source, repo)
         identity = source_identity(source, repo)
         if identity is None:
             return None
@@ -228,10 +247,12 @@ class CardSummaryPipeline:
             reuse.SUMMARY_VALIDATION_VERSION, reuse.SOURCE_ANALYSIS_VERSION,
             self.settings.input_max_chars, self.settings.temperature,
             self.settings.max_output_tokens,
+            self.settings.source_overflow_policy,
         )
         return hashlib.sha256(identity + json.dumps(versions).encode("utf-8")).digest()
 
     def _analysis(self, source: Any, repo: Mapping[str, Any], key: bytes | None) -> SummaryWork:
+        source, repo = self._summary_inputs(source, repo)
         work = self.reuse_cache.get(key)
         if work is None:
             material = build_summary_source(source, repo, max_chars=self.settings.input_max_chars)

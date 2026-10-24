@@ -572,6 +572,9 @@ def _validate_vector_and_model(v: _Validator) -> None:
 
 
 def _validate_card_summary(v: _Validator) -> None:
+    overflow = v.raw("SUMMARY_SOURCE_OVERFLOW_POLICY", required=False)
+    if overflow is not None and overflow not in {"reject", "prefix"}:
+        v.issue("SUMMARY_SOURCE_OVERFLOW_POLICY", "must be 'reject' or 'prefix'")
     provider = v.raw("SUMMARY_PROVIDER", required=True)
     if provider is not None and provider not in {"openrouter", "openai"}:
         v.issue("SUMMARY_PROVIDER", "must be 'openrouter' or 'openai'")

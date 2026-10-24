@@ -18,7 +18,7 @@ from .validation import SourceAnalysis
 
 # Bump when source projection or validation policy changes. These are local
 # reuse identities; the public backend artifact schema stays unchanged.
-SOURCE_ANALYSIS_VERSION = "summary-source-analysis-v1"
+SOURCE_ANALYSIS_VERSION = "summary-source-analysis-v2"
 SUMMARY_VALIDATION_VERSION = "summary-validation-v1"
 
 
