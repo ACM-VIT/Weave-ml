@@ -127,12 +127,13 @@ def test_current_payload_builder_publishes_the_frozen_contract():
         config=RepositoryEmbeddingConfig(),
     )
 
-    # Summary provenance is optional internal metadata; existing vectors keep
+    # Summary provenance and admission observations are optional internal metadata; existing vectors keep
     # the frozen required serving contract and need no reindex.
     assert set(payload) == (set(REPOSITORY_PAYLOAD_REQUIRED_FIELDS) - {
         REPOSITORY_SERVING_ELIGIBILITY_FIELD
-    }) | {"card_summary_reuse_key"}
+    }) | {"card_summary_reuse_key", "admission_observation"}
     assert payload["card_summary_reuse_key"] is None
+    assert payload["admission_observation"]["quality_approval"] == "not_evaluated"
     for field_name, expected_type in REPOSITORY_PAYLOAD_FIELD_TYPES.items():
         if field_name == REPOSITORY_SERVING_ELIGIBILITY_FIELD:
             continue

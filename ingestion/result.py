@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 from config import NOVELTY_THRESHOLD
 
@@ -31,6 +31,8 @@ class IngestionResult:
     embedding: list[float]
     topological_metrics: dict
     quadrant: str
+    # Legacy decision is path-local; this observation never claims approval.
+    admission_observation: dict = field(default_factory=dict)
 
     def __str__(self):
         width = 72
