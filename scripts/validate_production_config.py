@@ -573,10 +573,12 @@ def _validate_vector_and_model(v: _Validator) -> None:
 
 def _validate_card_summary(v: _Validator) -> None:
     provider = v.raw("SUMMARY_PROVIDER", required=True)
-    if provider is not None and provider != "openrouter":
-        v.issue("SUMMARY_PROVIDER", "must be exactly 'openrouter'")
+    if provider is not None and provider not in {"openrouter", "openai"}:
+        v.issue("SUMMARY_PROVIDER", "must be 'openrouter' or 'openai'")
 
     api_url = v.url("SUMMARY_API_URL", schemes={"https"})
+    if provider == "openai" and api_url is not None and api_url != "https://api.openai.com/v1/chat/completions":
+        v.issue("SUMMARY_API_URL", "must be the official OpenAI endpoint")
     if api_url is not None:
         parsed = urlsplit(api_url)
         if parsed.username is not None or parsed.password is not None:
