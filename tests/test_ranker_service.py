@@ -1,27 +1,19 @@
 import json
 import hashlib
 from unittest.mock import MagicMock, patch
-
 import numpy as np
 import pytest
 import torch
-
 from config import EMBEDDING_MODEL_REVISION, REPOSITORY_EMBEDDING_MODEL
-from inference.feature_spec import (
-    EMBEDDING_DIM,
-    FEATURE_COUNT,
-    FEATURE_SPEC_VERSION,
-    INPUT_DIM,
-)
-from inference.ranker_service import (
-    MMoEHeavyRanker,
-    RankerService,
-    _cached_repository_keywords,
-    _repository_keywords,
-    calculate_match_score,
-)
+from inference.feature_spec import EMBEDDING_DIM, FEATURE_COUNT, FEATURE_SPEC_VERSION, INPUT_DIM
+from inference.ranker_service import MMoEHeavyRanker, RankerService, _cached_repository_keywords, _repository_keywords, calculate_match_score
 from inference.value_function import VALUE_WEIGHTS, compute_value_score
+from pathlib import Path
+from inference.ranker_service import RankerService
+from retrieval.v2_retriever import QdrantV2Retriever
 
+
+# Ranker service
 
 def _write_scaler(path, feature_count=FEATURE_COUNT):
     path.write_text(
@@ -32,7 +24,6 @@ def _write_scaler(path, feature_count=FEATURE_COUNT):
             }
         )
     )
-
 
 def _write_manifest(path, **overrides):
     manifest = {
@@ -46,10 +37,8 @@ def _write_manifest(path, **overrides):
     manifest.update(overrides)
     path.write_text(json.dumps(manifest))
 
-
 def _sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
-
 
 def _write_production_manifest(path, *, model_path, scaler_path, **overrides):
     manifest = {
@@ -80,7 +69,6 @@ def _write_production_manifest(path, *, model_path, scaler_path, **overrides):
     manifest.update(overrides)
     path.write_text(json.dumps(manifest))
 
-
 @pytest.fixture
 def loaded_ranker_service(tmp_path):
     scaler_path = tmp_path / "feature_scaler.json"
@@ -95,15 +83,12 @@ def loaded_ranker_service(tmp_path):
             scaler_path=str(scaler_path),
         )
 
-
 @pytest.fixture
 def cpu_ranker_service(loaded_ranker_service):
     # These tests inspect CPU NumPy/storage sharing, not CUDA transfer behavior.
     loaded_ranker_service.device = torch.device("cpu")
     loaded_ranker_service.model.to(loaded_ranker_service.device)
     return loaded_ranker_service
-
-
 
 @pytest.mark.parametrize("count", [1, 150, 2000])
 def test_contiguous_ranker_input_matches_reference_for_pool_sizes(
@@ -145,7 +130,6 @@ def test_contiguous_ranker_input_matches_reference_for_pool_sizes(
                                [score["final_score"] for score in expected_scores],
                                rtol=0, atol=0)
 
-
 @pytest.mark.parametrize("field", ["user", "repo"])
 @pytest.mark.parametrize("bad", [np.zeros(383), np.zeros((1, 384)),
                                  np.full(384, np.nan), np.full(384, np.inf)])
@@ -156,7 +140,6 @@ def test_ranker_input_rejects_malformed_external_vectors(
     repo = bad if field == "repo" else np.zeros(EMBEDDING_DIM)
     with pytest.raises(ValueError, match="exactly 384|only finite"):
         cpu_ranker_service.score_batch(user, [], [{"id": "bad", "embedding": repo}])
-
 
 def test_ranker_input_does_not_alias_caller_arrays_or_later_requests(cpu_ranker_service):
     user = np.zeros(EMBEDDING_DIM, np.float32)
@@ -174,7 +157,6 @@ def test_ranker_input_does_not_alias_caller_arrays_or_later_requests(cpu_ranker_
     second = cpu_ranker_service.model.call_args.args[0]
     assert not np.shares_memory(first.numpy(), second.numpy())
     assert second[0, 0] == 0.25 and second[0, EMBEDDING_DIM] == 0.5
-
 
 def test_concurrent_ranker_requests_keep_independent_buffers(cpu_ranker_service):
     from concurrent.futures import ThreadPoolExecutor
@@ -201,8 +183,6 @@ def test_concurrent_ranker_requests_keep_independent_buffers(cpu_ranker_service)
     assert scores == [0.25, 0.75]
     assert not np.shares_memory(inputs[0].numpy(), inputs[1].numpy())
 
-
-
 @pytest.mark.parametrize("shape", [(2, 1), (1, FEATURE_COUNT), (3, FEATURE_COUNT),
                                    (2, FEATURE_COUNT - 1), (2, FEATURE_COUNT + 1),
                                    (FEATURE_COUNT,)])
@@ -224,7 +204,6 @@ def test_ranker_service_rejects_scaler_with_wrong_feature_count(tmp_path):
             scaler_path=str(scaler_path),
         )
 
-
 def test_missing_model_disables_scoring(tmp_path, caplog):
     scaler_path = tmp_path / "feature_scaler.json"
     _write_scaler(scaler_path)
@@ -238,7 +217,6 @@ def test_missing_model_disables_scoring(tmp_path, caplog):
     with caplog.at_level("WARNING", logger="pipeline.ranker"):
         assert service.score_batch(np.zeros(384), [], [{}]) == []
     assert "model is not loaded" in caplog.text
-
 
 def test_ranker_service_exposes_manifest_versions(tmp_path):
     scaler_path = tmp_path / "feature_scaler.json"
@@ -255,7 +233,6 @@ def test_ranker_service_exposes_manifest_versions(tmp_path):
     assert service.model_version == "heavy-ranker-test"
     assert service.embedding_version == "repo-embedding-test"
 
-
 def test_ranker_service_rejects_incompatible_manifest(tmp_path):
     scaler_path = tmp_path / "feature_scaler.json"
     manifest_path = tmp_path / "model_manifest.json"
@@ -268,7 +245,6 @@ def test_ranker_service_rejects_incompatible_manifest(tmp_path):
             scaler_path=str(scaler_path),
             manifest_path=str(manifest_path),
         )
-
 
 def test_ranker_service_accepts_explicit_v2_embedding_compatibility(tmp_path):
     scaler_path = tmp_path / "feature_scaler.json"
@@ -291,7 +267,6 @@ def test_ranker_service_accepts_explicit_v2_embedding_compatibility(tmp_path):
 
     assert "repo-embedding-v2" in service.compatible_embedding_versions
 
-
 def test_ranker_service_rejects_unlisted_serving_embedding_version(tmp_path):
     scaler_path = tmp_path / "feature_scaler.json"
     manifest_path = tmp_path / "model_manifest.json"
@@ -305,7 +280,6 @@ def test_ranker_service_rejects_unlisted_serving_embedding_version(tmp_path):
             manifest_path=str(manifest_path),
             expected_embedding_version="repo-embedding-v2",
         )
-
 
 def test_legacy_manifest_loads_for_inspection_but_is_not_production_qualified(
     tmp_path,
@@ -324,7 +298,6 @@ def test_legacy_manifest_loads_for_inspection_but_is_not_production_qualified(
     assert service.production_qualified is False
     assert "missing or invalid model_sha256" in service.qualification_errors
     assert "missing or invalid training_data" in service.qualification_errors
-
 
 def test_production_manifest_requires_verified_provenance_and_metrics(tmp_path):
     scaler_path = tmp_path / "feature_scaler.json"
@@ -354,7 +327,6 @@ def test_production_manifest_requires_verified_provenance_and_metrics(tmp_path):
     assert service.production_qualified is True
     assert service.qualification_errors == ()
 
-
 def test_synthetic_training_manifest_cannot_be_production_qualified(tmp_path):
     scaler_path = tmp_path / "feature_scaler.json"
     model_path = tmp_path / "heavy_ranker.pt"
@@ -375,7 +347,6 @@ def test_synthetic_training_manifest_cannot_be_production_qualified(tmp_path):
             manifest_path=str(manifest_path),
             require_production_manifest=True,
         )
-
 
 def test_synthetic_manifest_can_be_explicitly_manually_qualified(tmp_path):
     scaler_path = tmp_path / "feature_scaler.json"
@@ -406,8 +377,6 @@ def test_synthetic_manifest_can_be_explicitly_manually_qualified(tmp_path):
     assert "synthetic training data is not production-qualified" in (
         service.qualification_errors
     )
-
-
 
 @pytest.mark.parametrize("count", [0, 1, 150, 2000])
 def test_compact_and_diagnostic_outputs_match_scalar_baseline(loaded_ranker_service, count):
@@ -444,7 +413,6 @@ def test_compact_and_diagnostic_outputs_match_scalar_baseline(loaded_ranker_serv
     expected.sort(key=lambda result: result["final_score"], reverse=True)
     assert diagnostic == expected  # Exact equality, including stable ordering.
 
-
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_compact_value_precision_preserves_near_ties_and_stable_order(loaded_ranker_service, dtype):
     ctr = torch.tensor([0.5, 0.5, 0.50000006], dtype=dtype)
@@ -459,7 +427,6 @@ def test_compact_value_precision_preserves_near_ties_and_stable_order(loaded_ran
     ))) for index in range(3)]
     assert [result["repo_id"] for result in results] == ["2", "0", "1"]
     assert [result["final_score"] for result in results] == [expected[2], expected[0], expected[1]]
-
 
 @pytest.mark.parametrize("method", ["score_batch", "score_batch_compact"])
 def test_ranker_output_uses_one_transfer_in_inference_mode(loaded_ranker_service, monkeypatch, method):
@@ -483,7 +450,6 @@ def test_ranker_output_uses_one_transfer_in_inference_mode(loaded_ranker_service
     assert transfers == [(3, 5)]
     assert not torch.is_inference_mode_enabled()  # Context must not leak to training.
 
-
 @pytest.mark.parametrize("head", [0, 4])
 def test_compact_path_retains_nonfinite_prediction_rejection(loaded_ranker_service, head):
     outputs = [torch.tensor(0.0) for _ in range(5)]
@@ -493,7 +459,6 @@ def test_compact_path_retains_nonfinite_prediction_rejection(loaded_ranker_servi
         loaded_ranker_service.score_batch_compact(np.zeros(EMBEDDING_DIM), [],
             [{"id": "invalid", "embedding": np.zeros(EMBEDDING_DIM)}])
 
-
 def test_direct_ranker_training_still_supports_autograd():
     model = MMoEHeavyRanker(INPUT_DIM).train()
     inputs = torch.randn(2, INPUT_DIM, requires_grad=True)
@@ -502,14 +467,12 @@ def test_direct_ranker_training_still_supports_autograd():
     assert inputs.grad is not None and torch.all(torch.isfinite(inputs.grad))
     assert torch.count_nonzero(inputs.grad) > 0
 
-
 def test_score_batch_empty_candidates_returns_empty(loaded_ranker_service):
     assert loaded_ranker_service.score_batch(
         np.zeros(384, dtype=np.float32),
         ["Python"],
         [],
     ) == []
-
 
 def test_score_batch_single_candidate_shape(loaded_ranker_service):
     candidate = {
@@ -543,7 +506,6 @@ def test_score_batch_single_candidate_shape(loaded_ranker_service):
         "p_follow",
     }
 
-
 def test_score_batch_candidate_missing_optional_fields(loaded_ranker_service):
     candidate = {
         "id": "minimal-repo",
@@ -558,7 +520,6 @@ def test_score_batch_candidate_missing_optional_fields(loaded_ranker_service):
 
     assert len(results) == 1
     assert results[0]["repo_id"] == "minimal-repo"
-
 
 def test_score_batch_preserves_repo_id_order_mapping(loaded_ranker_service):
     candidates = [
@@ -588,7 +549,6 @@ def test_score_batch_preserves_repo_id_order_mapping(loaded_ranker_service):
         candidate["id"] for candidate in candidates
     ]
 
-
 def test_score_batch_rejects_wrong_embedding_dimensions(loaded_ranker_service):
     with pytest.raises(ValueError, match="exactly 384"):
         loaded_ranker_service.score_batch(
@@ -596,7 +556,6 @@ def test_score_batch_rejects_wrong_embedding_dimensions(loaded_ranker_service):
             [],
             [{"id": "repo-1", "embedding": np.zeros(384, dtype=np.float32)}],
         )
-
 
 def test_score_batch_clips_outliers_and_prediction_ranges(loaded_ranker_service):
     loaded_ranker_service.model = MagicMock(
@@ -631,7 +590,6 @@ def test_score_batch_clips_outliers_and_prediction_ranges(loaded_ranker_service)
         "p_follow": 0.25,
     }
 
-
 def test_score_batch_rejects_non_finite_model_output(loaded_ranker_service):
     loaded_ranker_service.model = MagicMock(
         return_value=(
@@ -649,7 +607,6 @@ def test_score_batch_rejects_non_finite_model_output(loaded_ranker_service):
             [],
             [{"id": "repo-1", "embedding": np.zeros(384, dtype=np.float32)}],
         )
-
 
 @pytest.mark.parametrize(
     "skills,languages,topics,tags,expected",
@@ -677,7 +634,6 @@ def test_keyword_features_preserve_golden_scores(
     )
     assert result[0]["skill_match"] == pytest.approx(expected)
 
-
 def test_keyword_cache_invalidates_mutable_repository_content(loaded_ranker_service):
     candidate = {"id": "same-id", "embedding": np.zeros(EMBEDDING_DIM),
                  "languages": ["Python"], "topics": [], "tags": []}
@@ -700,7 +656,6 @@ def test_keyword_cache_invalidates_mutable_repository_content(loaded_ranker_serv
     _repository_keywords(candidate["languages"], candidate["topics"], candidate["tags"])
     assert _cached_repository_keywords.cache_info().hits == 1
 
-
 def test_keyword_cache_is_bounded_and_results_are_immutable():
     _cached_repository_keywords.cache_clear()
     for index in range(4100):
@@ -708,7 +663,6 @@ def test_keyword_cache_is_bounded_and_results_are_immutable():
     assert isinstance(result, frozenset)
     assert _cached_repository_keywords.cache_info().currsize == 4096
     _cached_repository_keywords.cache_clear()
-
 
 def test_score_batch_normalizes_single_use_user_keywords_once(loaded_ranker_service):
     candidates = [
@@ -721,7 +675,6 @@ def test_score_batch_normalizes_single_use_user_keywords_once(loaded_ranker_serv
     )
     assert [score["skill_match"] for score in scores] == [1.0, 1.0, 1.0]
 
-
 @pytest.mark.parametrize("topics", [["Σ" * 1025], [f"topic-{i}" for i in range(65)]])
 def test_oversized_keyword_metadata_preserves_scores_without_cache_retention(topics):
     _cached_repository_keywords.cache_clear()
@@ -729,3 +682,44 @@ def test_oversized_keyword_metadata_preserves_scores_without_cache_retention(top
     assert _repository_keywords(None, topics, None) == expected
     assert calculate_match_score(topics, None, topics, None) == 1.0
     assert _cached_repository_keywords.cache_info().currsize == 0
+
+
+# Ranker device selection
+
+ARTIFACTS = Path(__file__).resolve().parents[1] / "inference"
+
+def load_ranker(**kwargs):
+    return RankerService(model_path=str(ARTIFACTS / "heavy_ranker.pt"),
+                         scaler_path=str(ARTIFACTS / "feature_scaler.json"),
+                         manifest_path=str(ARTIFACTS / "model_manifest.json"),
+                         require_production_manifest=True, **kwargs)
+
+def test_explicit_cpu_ignores_automatic_cuda_preference(monkeypatch):
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    service = load_ranker(device="cpu")
+    assert service.ready and service.production_qualified
+    assert service.device.type == "cpu"
+    assert next(service.model.parameters()).device.type == "cpu"
+    assert service.qualification_overridden  # Preserve the existing manifest provenance.
+
+def test_factory_honors_explicit_cpu_on_cuda_capable_host(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("V2_HEAVY_RANKER_DEVICE", "cpu")
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    retriever = QdrantV2Retriever(client=object(), heavy_ranker_enabled=True,
+                                  heavy_ranker_required=True, allow_unqualified_ranker=False,
+                                  minimum_eligible_repositories=0)
+    assert retriever.ranker is not None
+    assert retriever.ranker.device.type == "cpu"
+    assert retriever.heavy_ranker_required
+
+def test_explicit_unavailable_cuda_does_not_fall_back_to_cpu(monkeypatch):
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="CUDA.*unavailable"):
+        load_ranker(device="cuda")
+
+def test_invalid_runtime_device_is_a_configuration_error(monkeypatch):
+    monkeypatch.setenv("V2_HEAVY_RANKER_DEVICE", "cdua")
+    with pytest.raises(ValueError, match="V2_HEAVY_RANKER_DEVICE"):
+        QdrantV2Retriever(client=object(), heavy_ranker_enabled=False,
+                          minimum_eligible_repositories=0)
