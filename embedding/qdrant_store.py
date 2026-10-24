@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ingestion.lifecycle import LIFECYCLE_FIELDS
+
 import logging
 import math
 from collections.abc import Iterable, Mapping
@@ -208,6 +210,7 @@ class QdrantRepositoryStore:
                         "content_job_id",
                         "feature_version",
                         "feature_job_id",
+                        *LIFECYCLE_FIELDS,
                     ),
                 ),
             )
@@ -243,7 +246,7 @@ class QdrantRepositoryStore:
             self.models,
             point_id=expected_point.id,
             payload=expected_payload,
-            fields=("feature_version", "feature_job_id"),
+            fields=("feature_version", "feature_job_id", *LIFECYCLE_FIELDS),
         )
         self._mutate(lambda: self.client.set_payload(
             collection_name=self.collection_name,
@@ -251,6 +254,25 @@ class QdrantRepositoryStore:
             points=selector,
             wait=True,
             ordering=self.models.WriteOrdering.STRONG,
+        ))
+        return self._retrieve_point(str(expected_point.id))
+
+    def compare_and_set_lifecycle(self, *, expected_point: Any, lifecycle_payload: Mapping[str, Any]) -> Any | None:
+        """Status observations can arrive after newer unrelated feature jobs.
+
+        Fence both the independent status snapshot and feature revision; never
+        rewind feature versions or overwrite counts while applying delayed status.
+        """
+        if not lifecycle_payload or any(field not in LIFECYCLE_FIELDS for field in lifecycle_payload):
+            raise ValueError("lifecycle CAS accepts only lifecycle observation fields")
+        expected_payload = dict(expected_point.payload or {})
+        selector = payload_snapshot_filter(
+            self.models, point_id=expected_point.id, payload=expected_payload,
+            fields=("content_version", "content_job_id", "feature_version", "feature_job_id", *LIFECYCLE_FIELDS),
+        )
+        self._mutate(lambda: self.client.set_payload(
+            collection_name=self.collection_name, payload=dict(lifecycle_payload),
+            points=selector, wait=True, ordering=self.models.WriteOrdering.STRONG,
         ))
         return self._retrieve_point(str(expected_point.id))
 

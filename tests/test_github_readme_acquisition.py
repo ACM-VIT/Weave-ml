@@ -455,3 +455,30 @@ def test_inline_readme_is_preserved_without_model_rewrite():
     assert result.readme.base_url == (
         "https://raw.githubusercontent.com/owner/repo/refs/heads/main/"
     )
+
+
+@pytest.mark.parametrize('flags,expected', [
+    ({'isArchived': True, 'isDisabled': False}, True),
+    ({'isArchived': False, 'isDisabled': False}, False),
+    ({'isArchived': True}, None),
+    ({'isArchived': True, 'isDisabled': None}, None),
+])
+def test_complete_authoritative_lifecycle_reaches_backend_ingestion(flags, expected):
+    from acquisition.backend_client import repository_upsert_record
+    data = {
+        'id': 'R_lifecycle', 'databaseId': 123, 'nameWithOwner': 'owner/repo', 'name': 'repo',
+        'description': 'Stable useful project', 'url': 'https://github.com/owner/repo',
+        'owner': {'login': 'owner', 'databaseId': 456},
+        'defaultBranchRef': {'name': 'main', 'target': {'history': {'nodes': []}}},
+        'repositoryTopics': {'nodes': []}, 'languages': {'edges': []},
+        'stargazers': {'edges': []}, **flags,
+    }
+    result = RepositoryEnricher(graphql_client=MagicMock())._process_graphql_data(data, None, None)
+    wire = repository_upsert_record(result)
+    if expected is None:
+        assert 'lifecycle' not in wire
+    else:
+        assert wire['lifecycle']['archived'] is expected
+        assert wire['lifecycle']['disabled'] is False
+        assert wire['lifecycle']['source'] == 'github-graphql-repository'
+        assert wire['lifecycle']['observed_at']

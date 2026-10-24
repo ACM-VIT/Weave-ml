@@ -30,9 +30,9 @@ def payload_snapshot_filter(
             )
             continue
         value = payload[field]
-        if isinstance(value, bool) or not isinstance(value, (str, int)):
+        if not isinstance(value, (str, int, bool)):
             raise TypeError(
-                f"Qdrant CAS field {field!r} must contain a scalar string or number"
+                f"Qdrant CAS field {field!r} must contain a scalar string, boolean or number"
             )
         conditions.append(
             models.FieldCondition(

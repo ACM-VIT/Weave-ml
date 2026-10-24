@@ -81,6 +81,8 @@ def build_batch_metadata_query(repos: list[tuple[str, str]], *, projection: str 
     createdAt
     updatedAt
     pushedAt
+    isArchived
+    isDisabled
     stargazerCount
     forkCount
     {lineage_fields}
@@ -151,6 +153,8 @@ query GetRepository($owner: String!, $name: String!) {
     createdAt
     updatedAt
     pushedAt
+    isArchived
+    isDisabled
     stargazerCount
     forkCount
     
