@@ -32,6 +32,24 @@ def timestamp(value: Any) -> datetime:
 
 def load_manifest(client: Any) -> dict[str, dict[str, Any]]:
     """Discard partial scans on failure; an unavailable inventory is never empty."""
+    deadline = time.monotonic() + 120
+
+    async def scan():
+        async with httpx.AsyncClient(
+            transport=client.manifest_transport,
+        ) as session:
+            return await asyncio.wait_for(
+                _scan_pages(client, session, deadline),
+                timeout=max(0, deadline - time.monotonic()),
+            )
+
+    try:
+        return asyncio.run(scan())
+    except Exception as exc:
+        raise ManifestUnavailable("backend manifest unavailable or invalid") from exc
+
+
+async def _scan_pages(client: Any, session: httpx.AsyncClient, deadline: float):
     records: dict[str, dict[str, Any]] = {}
     names: set[str] = set()
     github_ids: set[str] = set()
@@ -39,13 +57,12 @@ def load_manifest(client: Any) -> dict[str, dict[str, Any]]:
     cursors: set[str] = set()
     as_of = None
     previous_id = ""
-    deadline = time.monotonic() + 120
     for _ in range(MAX_MANIFEST_ROWS // 250):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ManifestUnavailable("manifest scan exceeded its time budget")
         try:
-            page = _read_page(client, cursor, remaining)
+            page = await _read_page_async(client, session, cursor, remaining)
             if (
                 not isinstance(page, dict)
                 or type(page.get("version")) is not int
@@ -117,6 +134,8 @@ def load_manifest(client: Any) -> dict[str, dict[str, Any]]:
                     timestamp(item["source_updated_at"])
                 records[repo_id] = {**item, "full_name": key}
             next_cursor = page["next_cursor"]
+            if time.monotonic() >= deadline:
+                raise ManifestUnavailable("manifest scan exceeded its time budget")
             if next_cursor is None:
                 return records
             if (
@@ -136,20 +155,17 @@ def load_manifest(client: Any) -> dict[str, dict[str, Any]]:
     raise ManifestUnavailable("manifest exceeds the bounded inventory size")
 
 
-def _read_page(client: Any, cursor: str | None, remaining: float):
+async def _read_page_async(
+    client: Any, session: httpx.AsyncClient, cursor: str | None, remaining: float,
+):
     async def read():
-        async with (
-            httpx.AsyncClient(
-                transport=client.manifest_transport,
-                timeout=min(client.timeout, 5, remaining),
-            ) as session,
-            session.stream(
-                "GET",
-                f"{client.base_url}/api/internal/v2/ingestion/repositories/manifest",
-                params={"limit": 250, **({"cursor": cursor} if cursor else {})},
-                headers={"x-internal-secret": client.internal_secret},
-            ) as response,
-        ):
+        async with session.stream(
+            "GET",
+            f"{client.base_url}/api/internal/v2/ingestion/repositories/manifest",
+            params={"limit": 250, **({"cursor": cursor} if cursor else {})},
+            headers={"x-internal-secret": client.internal_secret},
+            timeout=min(client.timeout, 5, remaining),
+        ) as response:
             response.raise_for_status()
             body = bytearray()
             async for chunk in response.aiter_bytes(16384):
@@ -158,7 +174,13 @@ def _read_page(client: Any, cursor: str | None, remaining: float):
                     raise ValueError("manifest response exceeded its byte budget")
             return json.loads(body)
 
-    async def bounded_read():
-        return await asyncio.wait_for(read(), timeout=remaining)
+    return await asyncio.wait_for(read(), timeout=remaining)
 
-    return asyncio.run(bounded_read())
+
+def _read_page(client: Any, cursor: str | None, remaining: float):
+    """Read a standalone page; full inventories use the scan-owned session."""
+    async def read():
+        async with httpx.AsyncClient(transport=client.manifest_transport) as session:
+            return await _read_page_async(client, session, cursor, remaining)
+
+    return asyncio.run(read())
