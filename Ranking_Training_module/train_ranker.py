@@ -121,7 +121,7 @@ def _load_npz_arrays(data):
 
 
 def _validate_training_arrays(arrays):
-    if any(value.ndim == 0 or value.dtype.kind not in "fiu" for value in arrays.values()):
+    if any(value.ndim == 0 or value.dtype.kind not in "fiub" for value in arrays.values()):
         raise ValueError("Training arrays must have rows and real numeric dtypes")
     dense_features = arrays["dense_features"]
     if dense_features.ndim != 2 or dense_features.shape[1] != FEATURE_COUNT:
