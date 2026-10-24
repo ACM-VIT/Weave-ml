@@ -91,9 +91,14 @@ def enriched_sources(prefix):
                     contributors=[{"login": "fixture-a"}, {"login": "fixture-b"}], events=[],
                     stargazers=[{"starred_at": (now - timedelta(days=days)).isoformat()} for days in (1, 6, 20)],
                     recent_commits=[(now - timedelta(days=days)).isoformat() for days in (1, 2, 3)])
+        if variant == "observed":
+            # Exercise an explicitly supplied legacy caller field, not a count
+            # inferred or collected by the canonical enrichment path (ML #155).
+            assert "mentionable_users_count" not in payload
+            payload["mentionable_users_count"] = 2
         if variant == "zero":
             # Explicit zero/empty observations at the delivery boundary, not a
-            # claim that the enrichment contributor proxy can observe zero.
+            # claim that canonical enrichment measures a zero contributor population.
             payload.update({field: 0 for field in OBSERVATIONS[:5]})
             payload.update(readme_to_codebase_ratio=0.0, recent_commits=[])
         elif variant == "unknown":

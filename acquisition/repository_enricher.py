@@ -370,7 +370,8 @@ class RepositoryEnricher:
                 "created_at": commit.get("committedDate")
             })
 
-        # Contributor data is not required downstream; returning an empty list as audited.
+        # Contributor/community evidence is not collected by this bounded query.
+        # Keep the compatibility list empty; never infer counts from its owner.
         contributors = []
 
         # Construct raw_repository (REST equivalent structure for downstream compatibility)
@@ -479,7 +480,6 @@ class RepositoryEnricher:
             "readme_default_branch": readme.default_branch,
             "readme_base_url": readme.base_url,
             "readme_to_codebase_ratio": self._readme_to_codebase_ratio(readme.readme_length, size_kb),
-            "mentionable_users_count": self._mentionable_users_count(contributors, repository),
             "delta_3d": deltas[3],
             "delta_7d": deltas[7],
             "delta_30d": deltas[30],
@@ -533,12 +533,6 @@ class RepositoryEnricher:
     def _readme_to_codebase_ratio(readme_length: int, size_kb: int) -> float:
         codebase_bytes = max(size_kb * 1024, 1)
         return round(readme_length / codebase_bytes, 8)
-
-    @staticmethod
-    def _mentionable_users_count(contributors: list[dict[str, Any]], repository: dict[str, Any]) -> int:
-        if contributors:
-            return min(len(contributors), 100)
-        return 1 if repository.get("owner") else 0
 
     def _estimate_star_deltas(
         self,

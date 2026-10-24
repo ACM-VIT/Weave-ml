@@ -664,6 +664,7 @@ def test_trend_velocity_clamps_decline_and_preserves_positive_scale() -> None:
             {"trend_velocity"},
         ),
         ({"mentionable_users_count": 4}, set()),
+        ({"mentionable_users_count": 99}, set()),
         ({"star_count": 42}, set()),
         (
             {
@@ -678,7 +679,8 @@ def test_trend_velocity_clamps_decline_and_preserves_positive_scale() -> None:
         "recency",
         "positive-delta",
         "negative-delta",
-        "unchanged-dependency",
+        "unchanged-legacy-counter",
+        "changed-legacy-counter",
         "unrelated-count",
         "timestamps",
     ],
@@ -804,7 +806,7 @@ def test_feature_refresh_rejects_inconsistent_caller_derived_scores() -> None:
         assert exc_info.value.status_code == 422
         assert exc_info.value.detail == (
             "Repository derived features are inconsistent with the resulting "
-            "observation; expected activity_score=0.6325."
+            "observation; expected activity_score=1.0."
         )
         stored = client.retrieve(
             store.collection_name,
@@ -820,8 +822,8 @@ def test_feature_refresh_rejects_inconsistent_caller_derived_scores() -> None:
 def test_feature_refresh_accepts_matching_derived_score_echo(echo_kind) -> None:
     client, store, expected = _indexed_feature_refresh_fixture()
     if echo_kind == "recomputed":
-        feature_patch = {"pushed_days_ago": 0, "activity_score": 0.6325}
-        expected_activity = 0.6325
+        feature_patch = {"pushed_days_ago": 0, "activity_score": 1.0}
+        expected_activity = 1.0
     else:
         expected_activity = expected.payload["activity_score"]
         feature_patch = {
@@ -919,7 +921,7 @@ def test_refresh_http_error_for_score_echo_matches_validation_contract(
         assert body["details"] == [
             {
                 "path": "body.features.activity_score",
-                "message": "Value must match the effective server-owned score 0.6325.",
+                "message": "Value must match the effective server-owned score 1.0.",
                 "type": "value_error.derived_feature_mismatch",
             }
         ]

@@ -132,7 +132,7 @@ _REPOSITORY_FEATURE_DEPENDENCIES = {
         {"fork_count", "open_issues_count", "pushed_days_ago"}
     ),
     "activity_score": frozenset(
-        {"pushed_days_ago", "mentionable_users_count"}
+        {"pushed_days_ago"}
     ),
     "trend_velocity": frozenset({"delta_3d", "delta_7d", "delta_30d"}),
 }
