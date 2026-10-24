@@ -64,3 +64,20 @@ def test_production_preflight_rejects_openai_key_routed_to_openrouter():
     env = valid_production_env()
     env.update(SUMMARY_PROVIDER="openai", SUMMARY_API_URL="https://openrouter.ai/api/v1/chat/completions", SUMMARY_MODEL_ID="gpt-6-luna")
     assert any(issue.name == "SUMMARY_API_URL" for issue in validate_production_config(env))
+
+
+def test_openai_strict_schema_requires_every_property_without_changing_openrouter_schema():
+    from summarization.prompt import RESPONSE_JSON_SCHEMA
+    openai = OpenRouterSummaryProvider(SummarySettings(provider="openai",
+        api_url="https://api.openai.com/v1/chat/completions", model_id="gpt-6-luna", api_key="test-key"))
+    router = OpenRouterSummaryProvider(SummarySettings(api_key="test-key"))
+    try:
+        payload = openai._request_payload("Repository documentation", repair_feedback=None)
+        schema = payload["response_format"]["json_schema"]["schema"]
+        assert set(schema["required"]) == set(schema["properties"])
+        assert schema["additionalProperties"] is False
+        assert RESPONSE_JSON_SCHEMA["schema"]["required"] == ["summary"]
+        assert router._request_payload("Repository documentation", repair_feedback=None)["response_format"]["json_schema"] == RESPONSE_JSON_SCHEMA
+    finally:
+        openai.close()
+        router.close()

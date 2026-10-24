@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import json
+from copy import deepcopy
 import threading
 import time
 from typing import Any, Callable, Protocol
@@ -109,6 +110,12 @@ class OpenRouterSummaryProvider:
         *,
         repair_feedback: str | None,
     ) -> dict[str, Any]:
+        response_schema = RESPONSE_JSON_SCHEMA
+        if self.settings.provider == "openai":
+            response_schema = deepcopy(RESPONSE_JSON_SCHEMA)
+            # OpenAI strict output requires every property, including an empty
+            # highlights array. Keep the shared public/OpenRouter schema intact.
+            response_schema["schema"]["required"] = list(response_schema["schema"]["properties"])
         payload = {
             "model": self.settings.model_id,
             "messages": [
@@ -121,7 +128,7 @@ class OpenRouterSummaryProvider:
             "temperature": self.settings.temperature,
             "response_format": {
                 "type": "json_schema",
-                "json_schema": RESPONSE_JSON_SCHEMA,
+                "json_schema": response_schema,
             },
         }
         if self.settings.provider == "openai":
