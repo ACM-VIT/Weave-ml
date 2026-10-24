@@ -24,7 +24,15 @@ def test_actual_trained_cpu_serving_and_stages():
     assert result["cuda_peak_allocated_bytes"] is None
     assert result["cuda_peak_allocated_bytes_scope"] == "post_warmup_headline_and_instrumented_calls"
     assert result["timed_compact_max_abs_error"] == 0
-    assert result["process_peak_rss_kib"] > 0
+    try:
+        import resource
+    except ImportError:
+        assert result["process_peak_rss_kib"] is None
+        assert result["process_peak_rss_bytes"] is None
+    else:
+        assert result["process_peak_rss_kib"] > 0
+        assert result["process_peak_rss_bytes"] == result["process_peak_rss_kib"] * 1024
+    assert result["process_peak_rss_scope"] == "whole_process_imports_fixtures_headline_and_instrumented_calls"
     assert set(result["instrumented_stages"]) == {"host_input", "input_placement", "forward", "output_cpu", "remaining"}
     assert all(value["samples"] == 2 and value["p50_ms"] >= 0 for value in result["instrumented_stages"].values())
 
@@ -117,3 +125,41 @@ def test_timed_comparison_uses_identity_and_all_iterations():
     assert error == 0 and order is False
     with pytest.raises(AssertionError):
         compare_timed_compact([(('a',.21),('b',.11)), (('a',.2),('b',.1))], reference)
+
+
+def test_import_help_and_unknown_memory_without_unix_resource():
+    code = """
+import builtins
+real_import = builtins.__import__
+def without_resource(name, *args, **kwargs):
+    if name == 'resource':
+        raise ModuleNotFoundError("No module named 'resource'")
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = without_resource
+from scripts import benchmark_ranker_devices as benchmark
+assert benchmark._peak_process_rss_bytes() is None
+benchmark.main(['--help'])
+"""
+    result = subprocess.run([sys.executable, '-c', code], capture_output=True,
+                            text=True, timeout=30, cwd=ARTIFACTS.parent)
+    assert result.returncode == 0, result.stderr
+    assert '--counts' in result.stdout
+
+
+@pytest.mark.parametrize('platform_name,expected', [('linux',128*1024),('darwin',128)])
+def test_memory_reports_normalized_platform_bytes(monkeypatch,platform_name,expected):
+    from types import SimpleNamespace
+    from scripts import benchmark_ranker_devices as benchmark
+    fake=SimpleNamespace(RUSAGE_SELF=0,getrusage=lambda who:SimpleNamespace(ru_maxrss=128))
+    monkeypatch.setitem(sys.modules,'resource',fake)
+    monkeypatch.setattr(benchmark.sys,'platform',platform_name)
+    assert benchmark._peak_process_rss_bytes()==expected
+
+
+def test_actual_cpu_measurement_keeps_unavailable_memory_unknown(monkeypatch):
+    from scripts import benchmark_ranker_devices as benchmark
+    monkeypatch.setattr(benchmark,'_peak_process_rss_bytes',lambda:None)
+    result=benchmark.run_case('cpu',3,2,1)
+    assert result['process_peak_rss_bytes'] is None
+    assert result['process_peak_rss_kib'] is None
+    assert result['cpu_reference_max_abs_error']==0

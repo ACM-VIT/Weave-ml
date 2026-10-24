@@ -1,0 +1,144 @@
+{
+  "policy_sha256": "b1e7419d3baa561357870280caa1cc149561147a2d904767a1fc711651c9082b",
+  "reference": "Independent actual model-stage receipt fa75736d431d4ca26df8ef6d025637305d4a1d6c dated2026-10-23T19:25:27.145773Z; raw source metadata isexplicit syntheticfixture; no promotedbaseline claim",
+  "report": {
+    "artifact": {
+      "code_commit": "fa75736d431d4ca26df8ef6d025637305d4a1d6c",
+      "created_at": "2026-10-23T19:25:27.145773+00:00",
+      "feature_schema": "v2",
+      "model_id": "heavy-ranker-v2",
+      "model_sha256": "ab7d804261bf204e51962192c26b445e058057993ddb67ff75cf32791cca9215",
+      "scaler_sha256": "3c168432741b1e58877692f9cd116a7362bc3a902e63154b88be5e0c2009c5ee",
+      "schema_version": 1,
+      "timing_kind": "measured"
+    },
+    "bundle_sha256": "02408f07a064ab9b3ab1ea3b98bc9801519838ac9670dc5eaf7e1dd1653807bc",
+    "embedding_identity": {
+      "dimension": 384,
+      "document_prompt": "",
+      "model": "all-MiniLM-L6-v2",
+      "normalized": true,
+      "pooling": "mean",
+      "query_prompt": "",
+      "recipe": "repo-embedding-v2",
+      "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+    },
+    "embedding_sha256": "35756e8a6f8e3fa31d5968e2742355bc9e75a1c5b7952b63e5b11c66a92c2665",
+    "evaluation_dataset_sha256": "95461012e2aaabb03e220f8572656a292b8678a34bb4f47ee57d2a07185e1c7f",
+    "k": 4,
+    "provenance": {
+      "ingestion_watermark": null,
+      "kind": "synthetic",
+      "label_horizon_end": null,
+      "observation_cutoff": null,
+      "reference": "generated unit diagnostic, no human relevance judgments"
+    },
+    "run_sha256": "ff73124d182cadf909fb743d0fb4136c67af33c235e7813438c6809ca5b86506",
+    "schema_version": 1,
+    "snapshot_id": "synthetic-actual-stages-v1",
+    "stages": {
+      "assembly": {
+        "counts": {
+          "latency_samples": 2,
+          "profiles": 2,
+          "quality_profiles": 2,
+          "returned": 8,
+          "similarity_pairs": 12,
+          "unjudged_returned": 6
+        },
+        "metrics": {
+          "archived_rate": 0.0,
+          "catalogue_coverage": 0.5714285714285714,
+          "excluded_rate": 0.0,
+          "fork_metadata_coverage": 1.0,
+          "fork_repeat_rate": 0.0,
+          "intra_list_similarity": 0.16666666666666666,
+          "judged_mrr_at_k": 0.25,
+          "judged_ndcg_at_k": 0.43067655807339306,
+          "judged_recall_at_k": 1.0,
+          "judgment_coverage": 0.25,
+          "latency_p50_ms": 0.08476699986204039,
+          "latency_p95_ms": 0.10133999967365526,
+          "novelty_bits": 2.9824439758631835,
+          "owner_concentration": 0.25,
+          "owner_metadata_coverage": 1.0,
+          "repeat_rate": 0.0,
+          "topic_concentration": 1.0,
+          "topic_metadata_coverage": 1.0
+        },
+        "source_share": {
+          "semantic": 1.0
+        }
+      },
+      "ranking": {
+        "counts": {
+          "latency_samples": 2,
+          "profiles": 2,
+          "quality_profiles": 2,
+          "returned": 8,
+          "similarity_pairs": 12,
+          "unjudged_returned": 8
+        },
+        "metrics": {
+          "archived_rate": 0.0,
+          "catalogue_coverage": 0.5714285714285714,
+          "excluded_rate": 0.0,
+          "fork_metadata_coverage": 1.0,
+          "fork_repeat_rate": 0.0,
+          "intra_list_similarity": 0.16666666666666666,
+          "judged_mrr_at_k": 0.0,
+          "judged_ndcg_at_k": 0.0,
+          "judged_recall_at_k": 0.0,
+          "judgment_coverage": 0.0,
+          "latency_p50_ms": 2.9867079992982326,
+          "latency_p95_ms": 3.8571380000576028,
+          "novelty_bits": 2.9075539053984567,
+          "owner_concentration": 0.25,
+          "owner_metadata_coverage": 1.0,
+          "repeat_rate": 0.0,
+          "topic_concentration": 1.0,
+          "topic_metadata_coverage": 1.0
+        },
+        "source_share": {
+          "semantic": 1.0
+        }
+      },
+      "retrieval": {
+        "counts": {
+          "latency_samples": 2,
+          "profiles": 2,
+          "quality_profiles": 2,
+          "returned": 8,
+          "similarity_pairs": 12,
+          "unjudged_returned": 8
+        },
+        "metrics": {
+          "archived_rate": 0.0,
+          "catalogue_coverage": 0.5714285714285714,
+          "excluded_rate": 0.0,
+          "fork_metadata_coverage": 1.0,
+          "fork_repeat_rate": 0.0,
+          "intra_list_similarity": 0.16666666666666666,
+          "judged_mrr_at_k": 0.0,
+          "judged_ndcg_at_k": 0.0,
+          "judged_recall_at_k": 0.0,
+          "judgment_coverage": 0.0,
+          "latency_p50_ms": 71.60441199994239,
+          "latency_p95_ms": 262.5983739999356,
+          "novelty_bits": 2.9075539053984567,
+          "owner_concentration": 0.25,
+          "owner_metadata_coverage": 1.0,
+          "repeat_rate": 0.0,
+          "topic_concentration": 1.0,
+          "topic_metadata_coverage": 1.0
+        },
+        "source_share": {
+          "semantic": 1.0
+        }
+      }
+    }
+  },
+  "report_sha256": "eda383609b93bde339daf0e4294527663138c3220389b0746344a0672ad6489f",
+  "schema_version": 1,
+  "status": "diagnostic"
+}

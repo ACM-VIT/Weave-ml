@@ -1,0 +1,98 @@
+{
+  "artifact": {
+    "accepted_artifact_commit": "c691c73998f401a74d15a044fb678bef621ff343",
+    "feature_schema": "v2",
+    "measurement_runner_commit": "c8277985dfc15ecad02158c38708fab000c27fe7",
+    "measurement_source_dirty": true,
+    "measurement_source_manifest_sha256": "07fc60aba9973c02286c8bb0095cd6eda201f7e5aec9eec660017a8fbc24f2fa",
+    "model_sha256": "ab7d804261bf204e51962192c26b445e058057993ddb67ff75cf32791cca9215",
+    "scaler_sha256": "3c168432741b1e58877692f9cd116a7362bc3a902e63154b88be5e0c2009c5ee",
+    "timing_kind": "measured"
+  },
+  "bundle_sha256": "2b02e07882671102509a8c03fc9c117bee3527352987dfbc52b623bab62c8d0c",
+  "embedding_sha256": "35756e8a6f8e3fa31d5968e2742355bc9e75a1c5b7952b63e5b11c66a92c2665",
+  "evaluation_dataset_sha256": "d3c90c60ccbe61eed83f7d9d2adcbd2099b17f2be687244a61f84ba2bb9b1d20",
+  "format": "curated-metric-reference-v1",
+  "k": 5,
+  "policy_sha256": "dedee8072463a848ab51492e7264159d455235616fcc5e0382f9eb036475c853",
+  "provenance": {
+    "ingestion_watermark": null,
+    "kind": "synthetic",
+    "label_horizon_end": null,
+    "observation_cutoff": null,
+    "reference": "Agent-curated 10 task intents and 320 complete 0-3 qrels over 32 real public repository snapshots; no real users/human judgments/holdouts. Purposive eight-domain diagnostic, not production-traffic representativeness. Raw README withheld; exact retained encoding-input hashes and collection dates in provenance.json; source-text omission is not empty-input encoding. Unknown lineage/recency/trends remain explicitly documented. Base archive=false is a controlled eligible-catalogue assumption from active backend status, not verified GitHub archival. Retained exact source-input manifest SHA256 64d0f3246d1db2b887fca15fbf5bf2f8adb89a11b21fe333f3f0ade7c08317d1."
+  },
+  "reference": "Reviewed scalar expectations from an independent run of initial manually accepted c691c739 artifact bytes, matched by SHA256 to current weights/scaler, on this frozen common bundle. Modern pinned compatibility manifest/runner used for both measurements. Same quality is expected, not claimed uplift. Raw reports/traces remain private. Synthetic task labels and unknown lineage cannot qualify production.",
+  "reference_run_sha256": "020ee719c122f6eb45a3c1194ea3c1c512d44acad60b6865f8d8cd4a84a9a820",
+  "schema_version": 1,
+  "snapshot_id": "public-catalog32-agent-intents10-v1",
+  "stages": {
+    "assembly": {
+      "metrics": {
+        "archived_rate": 0.0,
+        "catalogue_coverage": 0.78125,
+        "excluded_rate": 0.0,
+        "fork_metadata_coverage": 0.0,
+        "fork_repeat_rate": 0.0,
+        "intra_list_similarity": 0.3965287359469102,
+        "judged_mrr_at_k": 1.0,
+        "judged_ndcg_at_k": 0.6121815409113137,
+        "judged_recall_at_k": 0.41369047619047616,
+        "judgment_coverage": 1.0,
+        "latency_p50_ms": 0.14784799714107066,
+        "latency_p95_ms": 0.21563200061791576,
+        "novelty_bits": 7.9347102697589955,
+        "owner_concentration": 0.22000000000000003,
+        "owner_metadata_coverage": 1.0,
+        "repeat_rate": 0.0,
+        "topic_concentration": 0.1079660514923673,
+        "topic_metadata_coverage": 0.86
+      }
+    },
+    "ranking": {
+      "metrics": {
+        "archived_rate": 0.0,
+        "catalogue_coverage": 0.78125,
+        "excluded_rate": 0.0,
+        "fork_metadata_coverage": 0.0,
+        "fork_repeat_rate": 0.0,
+        "intra_list_similarity": 0.3965287359469102,
+        "judged_mrr_at_k": 1.0,
+        "judged_ndcg_at_k": 0.6121815409113137,
+        "judged_recall_at_k": 0.41369047619047616,
+        "judgment_coverage": 1.0,
+        "latency_p50_ms": 8.15119500111905,
+        "latency_p95_ms": 17.210809000971494,
+        "novelty_bits": 7.9347102697589955,
+        "owner_concentration": 0.22000000000000003,
+        "owner_metadata_coverage": 1.0,
+        "repeat_rate": 0.0,
+        "topic_concentration": 0.1079660514923673,
+        "topic_metadata_coverage": 0.86
+      }
+    },
+    "retrieval": {
+      "metrics": {
+        "archived_rate": 0.0,
+        "catalogue_coverage": 0.84375,
+        "excluded_rate": 0.0,
+        "fork_metadata_coverage": 0.0,
+        "fork_repeat_rate": 0.0,
+        "intra_list_similarity": 0.5486191593679355,
+        "judged_mrr_at_k": 0.95,
+        "judged_ndcg_at_k": 0.7485901291041203,
+        "judged_recall_at_k": 0.5575396825396826,
+        "judgment_coverage": 1.0,
+        "latency_p50_ms": 266.1458879993006,
+        "latency_p95_ms": 363.4072950007976,
+        "novelty_bits": 6.1387838913208785,
+        "owner_concentration": 0.24000000000000005,
+        "owner_metadata_coverage": 1.0,
+        "repeat_rate": 0.0,
+        "topic_concentration": 0.09638949646844383,
+        "topic_metadata_coverage": 0.94
+      }
+    }
+  },
+  "status": "diagnostic"
+}

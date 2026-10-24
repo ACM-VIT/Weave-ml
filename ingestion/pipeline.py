@@ -6,6 +6,7 @@ from .classification import classify_category
 from .corpus import CorpusStore, dynamic_cluster_discovery
 from .result import IngestionResult, NoveltyMatrix
 from config import GATE_APPROVAL_THRESHOLD, MIN_STARS_PREFILTER, MIN_README_PREFILTER
+from contracts.admission import observe_repository_admission
 
 def _rejected_prefilter_result(repo_id: str, reason: str, repo: dict) -> IngestionResult:
     mock_novelty = NoveltyMatrix(
@@ -24,7 +25,8 @@ def _rejected_prefilter_result(repo_id: str, reason: str, repo: dict) -> Ingesti
         novelty=mock_novelty, tags=[], category="General / Other",
         structured_summary="(Failed pre-filter gate)", doc_found=[], doc_missing=[],
         embedding=[0.0] * 384, topological_metrics={},
-        quadrant="💤 Dormant Ecosystem Nodes"
+        quadrant="💤 Dormant Ecosystem Nodes",
+        admission_observation=observe_repository_admission(repo),
     )
 
 def ingest_repository(
@@ -35,7 +37,11 @@ def ingest_repository(
     auto_index:     bool          = True,
     compute_topology: bool        = False,
 ) -> IngestionResult:
-    """Runs a single repository entry metadata payload map through the Osiris pipeline processing layout."""
+    """Run the compatibility scorer with its existing legacy gates.
+
+    APPROVED is a legacy local decision, not canonical quality approval.
+    The shared admission proposal is observation-only pending owner approval.
+    """
     repo_id = repo.get("id", f"anonymous/unidentified-node-{uuid.uuid4().hex[:6]}")
     
     # 1. Fast-Fail Pre-Filters
@@ -119,7 +125,8 @@ def ingest_repository(
         novelty=mock_novelty, tags=extracted_tags, category=taxonomy_category,
         structured_summary=structured_abstract, doc_found=documentation_metrics.found, doc_missing=documentation_metrics.missing,
         embedding=[0.0] * 384, topological_metrics=spatial_topography_data,
-        quadrant=matrix_quadrant
+        quadrant=matrix_quadrant,
+        admission_observation=observe_repository_admission(repo),
     )
 
 

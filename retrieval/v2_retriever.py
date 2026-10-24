@@ -15,7 +15,7 @@ import uuid
 from collections.abc import Mapping
 from concurrent.futures import Future
 from contextlib import nullcontext
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -118,6 +118,7 @@ _USER_RETRIEVAL_PAYLOAD_FIELDS = [
     "embedding_dim",
     "embedding_model",
     "embedding_model_revision",
+    "model_policy_sha256",
 ]
 
 _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS = [
@@ -179,6 +180,7 @@ class RecommendationBatch:
     fallback_code: str | None = None
     retrieval_mode: str = "personalized"
     captured_scoring: CapturedScoring | None = field(default=None, repr=False, compare=False)
+    model_context: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -726,6 +728,11 @@ class QdrantV2Retriever:
             **qdrant_timeout(self.qdrant_timeout_seconds),
         )
 
+    def _fetch_user_model(self, user_id: str) -> list[Any]:
+        # A single owned read supplies baseline, ledgers and every revision.
+        return self.client.retrieve(collection_name=self.user_collection, ids=[user_point_id(user_id)],
+                                    with_payload=True, with_vectors=True, **qdrant_timeout(self.qdrant_timeout_seconds))
+
     def _fetch_user_profile_for_capture(self, user_id: str) -> list[Any]:
         return self.client.retrieve(
             collection_name=self.user_collection,
@@ -747,6 +754,8 @@ class QdrantV2Retriever:
         if not point:
             return None, {}
         payload = dict(point.payload or {})
+        if payload.get("model_policy_sha256") is not None:
+            raise RetrievalDependencyError("negotiated user state requires an applied session model context")
         try:
             vector = validate_embedding_vector(
                 self._vector(point.vector, TARGET_VECTOR_NAME),
@@ -1719,8 +1728,26 @@ class QdrantV2Retriever:
         social_repo_ids: list[str] | None = None,
         social_candidates: list[SocialCandidate] | None = None,
         scoring_capture: CaptureOptions | None = None,
+        model_context=None,
     ) -> RecommendationBatch:
         check_deadline()
+        effective_input = None
+        def decode_profile(points):
+            nonlocal effective_input
+            if model_context is None:
+                return self._profile_from_points(user_id, points)
+            from feedback.model_runtime import model_runtime
+            from feedback.model_serving import owned_input
+            if len(points) != 1:
+                raise RetrievalDependencyError("required applied user model is unavailable")
+            runtime = model_runtime()
+            effective_input = owned_input(points[0], runtime.users, runtime.policy, model_context)
+            excluded.update(effective_input.explicit_negative_repo_ids)
+            vector, payload = self._profile_from_points(user_id, [SimpleNamespace(
+                id=user_id, vector=list(effective_input.vector), payload=effective_input.profile_payload)])
+            if vector is None:
+                raise RetrievalDependencyError("applied user model embedding identity differs")
+            return list(effective_input.vector), payload
         excluded = {str(uuid.UUID(item)) for item in exclude_repo_ids}
         candidates: dict[str, RankedRepository] = {}
         metadata: dict[str, dict[str, Any]] = {}
@@ -1761,8 +1788,9 @@ class QdrantV2Retriever:
         discovery_plan = _DiscoveryPlan(budget=budget)
         try:
             with RetrievalWork() as work:
-                profile_future = work.submit("profile", self._fetch_user_profile if scoring_capture is None
-                                             else self._fetch_user_profile_for_capture, user_id)
+                profile_reader = (self._fetch_user_model if model_context is not None else
+                                  self._fetch_user_profile if scoring_capture is None else self._fetch_user_profile_for_capture)
+                profile_future = work.submit("profile", profile_reader, user_id)
                 def submit_social(read_limit):
                     if lifecycle_social:
                         return work.submit("social", self._fetch_lifecycle_social_candidates, social_ids, read_limit)
@@ -1772,9 +1800,7 @@ class QdrantV2Retriever:
                 # Validate the required profile before any vector-bearing
                 # repository RPC. Deferred mode retains its parallel overlap.
                 if inline_vectors:
-                    user_vector, user_profile = self._profile_from_points(
-                        user_id, work.result(profile_future),
-                    )
+                    user_vector, user_profile = decode_profile(work.result(profile_future))
                     if user_vector is None:
                         self._record_ranking_result(
                             heavy_selected=heavy_selected, ranker_applied=False,
@@ -1789,9 +1815,7 @@ class QdrantV2Retriever:
                     exclude_repo_ids=excluded,
                 )
                 if not inline_vectors:
-                    user_vector, user_profile = self._profile_from_points(
-                        user_id, work.result(profile_future),
-                    )
+                    user_vector, user_profile = decode_profile(work.result(profile_future))
                 if self.heavy_ranker_required and not heavy_selected:
                     raise RetrievalDependencyError(
                         "the required V2 heavy ranker was not selected"
@@ -2171,6 +2195,7 @@ class QdrantV2Retriever:
             ranker_applied=ranker_applied,
             fallback_code=fallback_code,
         )
+        from feedback.model_serving import input_identity
         return RecommendationBatch(
             items=items,
             model_version=model_version,
@@ -2183,6 +2208,7 @@ class QdrantV2Retriever:
             fallback_code=fallback_code,
             retrieval_mode=retrieval_mode,
             captured_scoring=captured_scoring,
+            model_context=(None if effective_input is None else input_identity(effective_input)),
         )
 
     def recommend(

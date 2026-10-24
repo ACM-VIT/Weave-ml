@@ -8,7 +8,7 @@ from api.contracts import RepositoryJob
 from config import ZERO_RECENCY_EMBEDDING_VERSION
 from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
 from embedding.repository_embedding import RepositoryEmbeddingConfig, build_metadata_text
-from ingestion.features import trend_velocity
+from ingestion.features import activity_score, trend_velocity
 from summarization.pipeline import description_fallback_artifact
 
 
@@ -74,3 +74,38 @@ def test_valid_declining_v2_job_embeds_and_semantic_correction_is_explicitly_ver
     assert result.embedding_version == version
     assert any(f"Pushed days ago: {recency}\n" in text for text in encoder.texts)
     assert all(math.isfinite(value) for value in result.final_embedding)
+
+
+@pytest.mark.parametrize("owner", [None, {"login": "one-maintainer", "databaseId": 7},
+                                  {"login": "an-organization", "databaseId": 8, "__typename": "Organization"}])
+def test_enrichment_leaves_uncollected_contributor_evidence_unknown(owner):
+    from acquisition.repository_enricher import RepositoryEnricher
+    from acquisition.backend_client import repository_upsert_record
+    data = {"nameWithOwner": "fixture/repository", "name": "repository", "databaseId": 123,
+            "id": "R_fixture123", "url": "https://github.com/fixture/repository", "owner": owner,
+            "pushedAt": "2026-10-24T00:00:00Z", "defaultBranchRef": {"name": "main", "target": {"history": {"nodes": []}}}}
+    # A client without methods proves this fixture cannot collect contributor
+    # data, request a new credential or add another GitHub API call.
+    result = RepositoryEnricher(graphql_client=object())._process_graphql_data(data, None, None, readme_text="# Fixture")
+    assert "mentionable_users_count" not in result.payload
+    if owner:
+        assert "mentionable_users_count" not in repository_upsert_record(result)
+    else:
+        with pytest.raises(ValueError, match="owner_github_id"):
+            repository_upsert_record(result)  # Existing canonical identity requirement.
+    assert result.payload["owner_github_id"] == (str(owner["databaseId"]) if owner else None), "identity remains separate from contributor evidence"
+
+
+@pytest.mark.parametrize("days,expected", [(0, 1.0), (30, 0.5), (60, 0.25), (999, 0.0)])
+@pytest.mark.parametrize("legacy_count", [None, 0, 1, 100])
+def test_activity_fallback_uses_push_recency_without_owner_or_legacy_count(days, expected, legacy_count):
+    assert activity_score({"pushed_days_ago": days, "recent_commits": [],
+                           "mentionable_users_count": legacy_count}) == expected
+    assert activity_score({"pushed_days_ago": days}) == expected
+
+
+def test_observed_commits_remain_independent_of_the_legacy_counter():
+    from datetime import datetime, timezone
+    observed = {"recent_commits": [datetime.now(timezone.utc).isoformat()]}
+    assert activity_score(observed) > 0
+    assert activity_score({**observed, "mentionable_users_count": 0}) == activity_score({**observed, "mentionable_users_count": 100})

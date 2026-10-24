@@ -15,6 +15,7 @@ import sys
 from typing import Any
 
 from dotenv import load_dotenv
+from contracts.admission import ADMISSION_OBSERVATION_FIELD, observe_repository_admission
 
 load_dotenv()
 
@@ -54,7 +55,10 @@ def filter_enriched(
     *,
     min_readme_chars: int = 200,
 ) -> tuple[list[Any], list[tuple[Any, list[str]]]]:
-    """Split enriched repositories into approved and rejected audit groups."""
+    """Apply the legacy acquisition gate, recording the shared proposal.
+
+    Kept means acquisition accepted; it does not mean quality approved.
+    """
     if min_readme_chars < 1:
         raise ValueError("min_readme_chars must be a positive integer")
 
@@ -62,6 +66,7 @@ def filter_enriched(
     dropped: list[tuple[Any, list[str]]] = []
     for repository in enriched:
         payload = repository.payload
+        payload[ADMISSION_OBSERVATION_FIELD] = observe_repository_admission(payload)
         reasons: list[str] = []
         readme_length = payload.get("readme_length", 0)
         if readme_length == 0:

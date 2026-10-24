@@ -58,7 +58,27 @@ class FrozenSnapshot(StrictModel):
     as_of: str
     limit: Annotated[int, Field(ge=1, le=100)] = 15
     seed: Annotated[str, Field(min_length=1, max_length=128)]
+    # Offline replay keeps the bounded backend request distinct from negatives
+    # derived from a frozen applied model. Empty defaults preserve old fixtures.
+    request_exclusions: dict[str, Annotated[list[str], Field(max_length=500)]] = Field(
+        default_factory=dict, max_length=32, exclude_if=lambda value: not value)
+    model_exclusions: dict[str, Annotated[list[str], Field(max_length=256)]] = Field(
+        default_factory=dict, max_length=32, exclude_if=lambda value: not value)
     _time = field_validator('as_of')(aware_timestamp)
+
+    @field_validator('request_exclusions', 'model_exclusions')
+    @classmethod
+    def canonical_exclusions(cls, value):
+        for owner, ids in value.items():
+            canonical_id(owner)
+            if len(ids) != len(set(ids)):
+                raise ValueError('exclusion channels require unique repository IDs')
+            for repo_id in ids:
+                canonical_id(repo_id)
+        return value
+
+    def request_exclusions_for(self, profile):
+        return self.request_exclusions.get(profile.profile_id, sorted(set(profile.seen) | set(profile.disliked)))
 
     @model_validator(mode='after')
     def coherent(self):
@@ -70,6 +90,9 @@ class FrozenSnapshot(StrictModel):
                 or {row.profile_id for row in self.profiles} != set(by_profile)):
             raise ValueError('snapshot requires every unique bundle repository/profile exactly once')
         embedding = self.bundle.embedding
+        separated = bool(self.request_exclusions or self.model_exclusions)
+        if separated and (set(self.request_exclusions) != set(by_profile) or set(self.model_exclusions) != set(by_profile)):
+            raise ValueError('separate exclusion channels require every frozen profile')
         from config import EMBEDDING_MODEL_REVISION, REPOSITORY_EMBEDDING_MODEL, REPOSITORY_EMBEDDING_VERSION
         if (embedding.model != REPOSITORY_EMBEDDING_MODEL or embedding.revision != EMBEDDING_MODEL_REVISION
                 or embedding.dimension != 384 or embedding.pooling != 'mean'
@@ -94,7 +117,13 @@ class FrozenSnapshot(StrictModel):
                         or any(not isinstance(v,str) or not 1<=len(v)<=128 for v in values)):
                     raise ValueError('frozen profile terms must be explicitly bounded lists')
             profile=by_profile[row.profile_id]
-            if len(set(profile.seen)|set(profile.disliked))>500:
+            combined = set(profile.seen) | set(profile.disliked)
+            if separated:
+                request = set(self.request_exclusions[row.profile_id])
+                learned = set(self.model_exclusions[row.profile_id])
+                if not learned <= set(profile.disliked) or combined != request | learned:
+                    raise ValueError('request/model exclusion channels differ from bound metric/source exclusions')
+            elif len(combined)>500:
                 raise ValueError('frozen exclusions exceed backend/ML contract')
         for row in self.repositories:
             p=row.payload; repo=by_repo[row.repo_id]
@@ -111,6 +140,20 @@ class FrozenSnapshot(StrictModel):
             if (p['star_count']!=repo.popularity or p['topics']!=repo.topics
                     or p.get('owner_github_id')!=repo.owner or p.get('fork_family_github_id')!=repo.fork_family):
                 raise ValueError('bundle metrics metadata and frozen payload disagree')
+        if self.bundle.dataset is not None:
+            sources={row.repo_id:row for row in self.bundle.dataset.repositories}
+            from evaluation.dataset_identity import common_ranking_material
+            for row in self.repositories:
+                source=sources[row.repo_id]
+                material=common_ranking_material(row.payload,content_hash_origin=source.content_hash_origin)
+                expected=common_ranking_material(source.ranking_material,content_hash_origin=source.content_hash_origin)
+                if expected != material:
+                    raise ValueError('raw dataset and actual ranking material differ')
+            profiles={row.profile_id:row for row in self.bundle.dataset.profiles}
+            for row in self.profiles:
+                for key in ('skills','tech_stack','interests','topics'):
+                    if getattr(profiles[row.profile_id],key) != row.payload[key]:
+                        raise ValueError('raw dataset and actual profile context differ')
         return self
 
 
@@ -136,7 +179,8 @@ class StageRunExport(StrictModel):
     @model_validator(mode='after')
     def bound_artifacts(self):
         if (self.run.model_sha256!=self.artifacts.model_sha256 or self.run.scaler_sha256!=self.artifacts.scaler_sha256
-                or self.run.code_commit!=self.code_commit or self.run.timing_kind!='measured'):
+                or self.run.code_commit!=self.code_commit or self.run.timing_kind!='measured'
+                or (self.run.manifest_sha256 is not None and self.run.manifest_sha256!=self.artifacts.manifest_sha256)):
             raise ValueError('stage export and actual run identity disagree')
         if set(self.source_scores)!={row.profile_id for row in self.run.outputs}:
             raise ValueError('source score/profile identity mismatch')
@@ -178,6 +222,8 @@ def source_identity():
     tracked=local_git('ls-files','-z','--','*.py','pyproject.toml','uv.lock').decode().split('\0')
     paths={ROOT/name for name in tracked if name}
     paths.update({Path(__file__),ROOT/'scripts/run_recommendation_stages.py'})
+    for name in ('evaluation/variant_policy.py','evaluation/variant_comparison.py','scripts/compare_recommendation_variants.py'):
+        if (ROOT/name).exists():paths.add(ROOT/name)
     hashes={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(paths)}
     commit=local_git('rev-parse','HEAD').decode().strip()
     dirty=bool(local_git('status','--porcelain','--untracked-files=normal'))
@@ -185,10 +231,10 @@ def source_identity():
 
 
 
-def execute_snapshot(snapshot: FrozenSnapshot, artifact_dir: Path) -> StageRunExport:
+def execute_snapshot(snapshot: FrozenSnapshot, artifact_dir: Path, *, treatment=None, social_evidence=None) -> StageRunExport:
     """Run actual components only against owned in-memory collections.
 
-    No encoder download, remote Qdrant/Redis/SQL/GitHub, social projection, model
+    No encoder download, remote Qdrant/Redis/SQL/GitHub, live social projection lookup, model
     promotion or production environment mutation. The CLI bounds worker lifetime.
     """
     # Own every nested list/payload, not just the outer Pydantic object. The
@@ -198,10 +244,19 @@ def execute_snapshot(snapshot: FrozenSnapshot, artifact_dir: Path) -> StageRunEx
         raise ValueError('frozen snapshot exceeds replay byte bound')
     snapshot=FrozenSnapshot.model_validate_json(raw)
     frozen_snapshot_sha=digest(snapshot)
+    from evaluation.variant_policy import FrozenTreatment,FrozenVariantContext
+    selected=FrozenTreatment(name='baseline',diversity=None,social=None) if treatment is None else treatment
+    context=FrozenVariantContext(treatment=selected,social_evidence=[] if social_evidence is None else social_evidence)
+    # Independently own every treatment/evidence container before any workers.
+    context=FrozenVariantContext.model_validate_json(json.dumps(context.model_dump(mode='json'),sort_keys=True,allow_nan=False))
+    context.validate_for(snapshot)
+    context_sha=digest(context)
+    projections={row.viewer_id:row for row in context.social_evidence}
     import torch
     from qdrant_client import QdrantClient, models
     from inference.ranker_service import RankerService
     from inference.feed_assembly import FeedAssemblySystem
+    from inference.diversity import DiversityPolicy
     from retrieval.v2_retriever import QdrantV2Retriever, QDRANT_VECTOR_NAME
     from retrieval.social_candidates import SocialPolicy
     from utils.deadline import RequestDeadline, deadline_scope, check_deadline
@@ -227,7 +282,8 @@ def execute_snapshot(snapshot: FrozenSnapshot, artifact_dir: Path) -> StageRunEx
         def shape_batch(self, ranked, **kwargs):
             started=time.perf_counter()
             shaped=super().shape_batch(ranked,**{**kwargs,'reference_time':reference})
-            self.elapsed_ms=(time.perf_counter()-started)*1000
+            self.elapsed_ms+=(time.perf_counter()-started)*1000
+            self.calls+=1
             return shaped
 
     def candidates(items):
@@ -242,6 +298,18 @@ def execute_snapshot(snapshot: FrozenSnapshot, artifact_dir: Path) -> StageRunEx
         return result
 
     class RecordingRetriever(QdrantV2Retriever):
+        def recommend_batch(self, user_id, limit, exclude_repo_ids, *args, **kwargs):
+            if len(set(exclude_repo_ids)) > 500:
+                raise ValueError('offline backend request exclusions exceed the online contract')
+            # The online model-context path adds applied-model negatives after
+            # request validation. Here those same bounded negatives are already
+            # derived from frozen history, without an online runtime/database.
+            learned = set(snapshot.model_exclusions.get(user_id, []))
+            excluded = sorted(set(exclude_repo_ids) | learned)
+            self.exclusion_channels[user_id] = {'request_count': len(set(exclude_repo_ids)),
+                'model_count': len(learned), 'combined_count': len(excluded)}
+            return super().recommend_batch(user_id, limit, excluded, *args, **kwargs)
+
         def _heavy_rank(self, **kwargs):
             started=time.perf_counter()
             self.retrieval_ms=(started-self.began)*1000
@@ -285,8 +353,14 @@ def execute_snapshot(snapshot: FrozenSnapshot, artifact_dir: Path) -> StageRunEx
             allow_unqualified_ranker=False,minimum_eligible_repositories=0,max_candidates=150,
             compatible_embedding_versions={snapshot.bundle.embedding.recipe},social_policy=SocialPolicy(mode='disabled'),candidate_vector_mode='deferred')
         # This explicitly selected offline policy changes only our owned engine.
-        engine.diversity_mode='disabled';engine.diversity_traffic_percent=0
+        engine.diversity_mode='enabled' if context.treatment.diversity is not None else 'disabled'
+        engine.diversity_traffic_percent=100 if context.treatment.diversity is not None else 0
+        if context.treatment.diversity is not None:
+            engine.diversity_policy=DiversityPolicy(**context.treatment.diversity)
+        if context.treatment.social is not None:
+            engine.social_policy=SocialPolicy(**context.treatment.social)
         engine.required_content_version=1;engine.required_feature_spec_version='v2'
+        engine.exclusion_channels = {}
         engine.allow_missing_embedding_revision=False
         engine.embedding_model_revision=snapshot.bundle.embedding.revision
         configuration={'retrieval':{key:getattr(engine,key) for key in (
@@ -298,22 +372,30 @@ def execute_snapshot(snapshot: FrozenSnapshot, artifact_dir: Path) -> StageRunEx
                 'generation_reference_capacity','generation_reference_ttl_seconds')},
             'social':asdict(engine.social_policy),'diversity':asdict(engine.diversity_policy),
             'runtime':{'repository_vector_name':QDRANT_VECTOR_NAME,'overall_cooperative_deadline_seconds':120,'max_candidate_pool':150,
-                       'external_social_evidence':False,'device':str(ranker.device),'requested_limit':snapshot.limit,
+                       'external_social_evidence':bool(context.social_evidence),'device':str(ranker.device),'requested_limit':snapshot.limit,
                        'warmup':'none; first profile includes first actual forward',
                        'torch_threads':torch.get_num_threads(),'torch_interop_threads':torch.get_num_interop_threads(),
                        'archived_policy':'excluded from local eligible catalogue before retrieval'}}
+        configuration['variant_context_sha256']=context_sha
+        configuration['treatment']=context.treatment.model_dump(mode='json')
+        configuration['social_projection_declarations']=[{'viewer_id':row.viewer_id,'observed_at':row.observed_at,
+            'declared_origin':row.declared_origin,'declared_policy':row.declared_policy,'reference':row.reference,
+            'candidate_count':len(row.candidates)} for row in context.social_evidence]
         configuration['retrieval']['compatible_embedding_versions']=sorted(engine.compatible_embedding_versions)
         from retrieval.runtime import retrieval_runtime_status
         from retrieval.v2_retriever import _CANDIDATE_READ_MULTIPLIER, _MAX_RETRIEVAL_ROUNDS
         configuration['runtime'].update(candidate_read_multiplier=_CANDIDATE_READ_MULTIPLIER,max_retrieval_rounds=_MAX_RETRIEVAL_ROUNDS)
-        outputs=[];totals={};source_scores={}
+        outputs=[];totals={};source_scores={};shape_calls={}
         with deadline_scope(RequestDeadline(120)):
             for profile in snapshot.bundle.profiles:
                 check_deadline()
                 generation=str(uuid.uuid5(uuid.NAMESPACE_URL,snapshot.seed+':'+profile.profile_id))
+                assembler.elapsed_ms=0.;assembler.calls=0
                 engine.began=time.perf_counter()
                 engine.retrieved=engine.ranked=None
-                batch=engine.recommend_batch(profile.profile_id,snapshot.limit,sorted(set(profile.seen)|set(profile.disliked)),generation)
+                projection=projections.get(profile.profile_id)
+                batch=engine.recommend_batch(profile.profile_id,snapshot.limit,snapshot.request_exclusions_for(profile),generation,
+                    social_candidates=projection.candidates if projection is not None else [])
                 elapsed=(time.perf_counter()-engine.began)*1000
                 if client.read_errors or not batch.ranker_applied or batch.served_ranker!='heavy' or batch.fallback_code or engine.retrieved is None:
                     raise ValueError('offline stage replay cannot export partial/fallback evidence')
@@ -321,13 +403,19 @@ def execute_snapshot(snapshot: FrozenSnapshot, artifact_dir: Path) -> StageRunEx
                     latency_ms={'retrieval':engine.retrieval_ms,'ranking':engine.ranking_ms,'assembly':assembler.elapsed_ms}))
                 totals[profile.profile_id]=elapsed
                 source_scores[profile.profile_id]=engine.source_scores
+                shape_calls[profile.profile_id]=assembler.calls
         configuration['runtime']['retrieval_executor']=retrieval_runtime_status()
+        configuration['runtime']['shape_calls_by_profile']=shape_calls
+        if snapshot.request_exclusions or snapshot.model_exclusions:
+            configuration['runtime']['exclusion_channels_by_profile'] = engine.exclusion_channels
+    if digest(context)!=context_sha:
+        raise ValueError('owned frozen treatment/evidence changed during replay')
     if digest(snapshot)!=frozen_snapshot_sha:
         raise ValueError('owned frozen snapshot changed during replay')
     if before!={key:hashlib.sha256((artifact_dir/name).read_bytes()).hexdigest() for key,name in names.items()} or source_identity()!=(commit,dirty,hashes):
         raise ValueError('source/artifact identity changed during replay')
     run=Run.model_validate(dict(schema_version=1,embedding=snapshot.bundle.embedding.model_dump(),model_id=ranker.model_version,
-        model_sha256=before['model_sha256'],scaler_sha256=before['scaler_sha256'],feature_schema=ranker.feature_spec_version,
+        manifest_sha256=before['manifest_sha256'],model_sha256=before['model_sha256'],scaler_sha256=before['scaler_sha256'],feature_schema=ranker.feature_spec_version,
         code_commit=commit,created_at=datetime.now(timezone.utc).isoformat(),timing_kind='measured',outputs=outputs))
     return StageRunExport(bundle_sha256=digest(snapshot.bundle),snapshot_sha256=frozen_snapshot_sha,artifacts=snapshot.artifacts,
         source_sha256=hashes,code_commit=commit,source_tree_dirty=dirty,as_of=snapshot.as_of,seed=snapshot.seed,total_ms=totals,source_scores=source_scores,configuration=configuration,

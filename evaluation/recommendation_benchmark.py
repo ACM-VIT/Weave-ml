@@ -112,8 +112,12 @@ class Judgment(StrictModel):
     _ids = field_validator('profile_id', 'repo_id')(canonical_id)
 
 
+from evaluation.dataset_identity import SourceDataset
+
+
 class Bundle(StrictModel):
     schema_version: Literal[1]
+    dataset: SourceDataset | None = Field(default=None, exclude_if=lambda value: value is None)
     snapshot_id: Text
     created_at: str
     provenance: Provenance
@@ -147,6 +151,8 @@ class Bundle(StrictModel):
                 raise ValueError('duplicate repository topic')
         if not any(not repo.archived for repo in self.repositories):
             raise ValueError('corpus has no eligible repositories')
+        if self.dataset is not None:
+            self.dataset.validate_bundle(self)
         return self
 
 
@@ -175,6 +181,7 @@ class Run(StrictModel):
     schema_version: Literal[1]
     embedding: EmbeddingIdentity
     model_id: Text
+    manifest_sha256: Digest | None = Field(default=None, exclude_if=lambda value: value is None)
     model_sha256: Digest
     scaler_sha256: Digest
     feature_schema: Text
@@ -313,7 +320,10 @@ def evaluate(bundle: Bundle, run: Run, *, k: int) -> dict:
                        'unjudged_returned': unjudged, 'similarity_pairs': similarity_pairs, 'latency_samples': len(latencies)},
             'source_share': {source: ratio(count) for source, count in sorted(sources.items())},
         }
-    return {'schema_version': 1, 'bundle_sha256': digest(bundle), 'run_sha256': digest(run),
+    dataset_identity = {} if bundle.dataset is None else {
+        'evaluation_dataset_sha256': bundle.dataset.sha256,
+        'embedding_identity': bundle.embedding.model_dump(mode='json')}
+    return {**dataset_identity, 'schema_version': 1, 'bundle_sha256': digest(bundle), 'run_sha256': digest(run),
             'snapshot_id': bundle.snapshot_id, 'provenance': bundle.provenance.model_dump(),
             'embedding_sha256': digest(bundle.embedding), 'k': k,
             'artifact': run.model_dump(exclude={'outputs', 'embedding'}), 'stages': stages}

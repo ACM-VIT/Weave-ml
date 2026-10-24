@@ -9,6 +9,10 @@ PRODUCT_OPERATIONS = {
     '/api/v2/repositories/refresh': 200,
     '/api/v2/users/onboard': 200,
     '/api/v2/search/repositories': 200,
+    '/api/v2/model-operations': 200,
+    '/api/v2/model-authority': 200,
+    '/api/v2/model-operation-withdrawals': 200,
+    '/api/v2/model-operation-status': 200,
 }
 
 
@@ -19,9 +23,10 @@ def test_all_product_success_responses_have_explicit_wire_models():
         wire = response['content']['application/json']['schema']
         if path == '/api/v2/recommendations/generate':
             references = [choice['$ref'] for choice in wire['anyOf']]
-            assert len(references) == 3
+            assert len(references) == 4
             assert set(references) == {
                 '#/components/schemas/RecommendationResponse',
+                '#/components/schemas/ModelRecommendationResponse',
                 '#/components/schemas/CapturedRecommendationResponse',
                 '#/components/schemas/UnscoredEmptyRecommendationResponse',
             }

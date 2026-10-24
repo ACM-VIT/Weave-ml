@@ -20,6 +20,7 @@ from urllib.parse import urlparse, parse_qs
 from typing import Any
 
 from acquisition.identity import normalize_repository_name, repository_identity_key
+from database.schema_readiness import LEGACY_REPOSITORY_COLUMNS, validate_table_schema
 
 try:
     import pg8000.dbapi
@@ -53,27 +54,6 @@ class PostgreSQLConnector:
     Automatically detects whether the target is a local PostgreSQL instance
     or a Supabase-hosted database and configures SSL accordingly.
     """
-    _migration_columns = [
-        ("owner_id", "VARCHAR(100)"),
-        ("repo_name", "VARCHAR(200)"),
-        ("full_name", "VARCHAR(255)"),
-        ("description", "TEXT"),
-        ("primary_language", "VARCHAR(50)"),
-        ("special_label", "VARCHAR(50)"),
-        ("language_used", "JSONB DEFAULT '[]'::jsonb"),
-        ("topics", "JSONB DEFAULT '[]'::jsonb"),
-        ("readme_summary", "TEXT"),
-        ("readme_md", "TEXT"),
-        ("star_count", "INT DEFAULT 0"),
-        ("forks_count", "INT DEFAULT 0"),
-        ("pr_count", "INT DEFAULT 0"),
-        ("likes_count", "INT DEFAULT 0"),
-        ("comments_count", "INT DEFAULT 0"),
-        ("saves_count", "INT DEFAULT 0"),
-        ("views_count", "INT DEFAULT 0"),
-    ]
-
-
     def __init__(self, database_url: str | None = None) -> None:
         self.database_url = database_url or os.getenv("DATABASE_URL")
         self.enabled = bool(self.database_url)
@@ -223,116 +203,20 @@ class PostgreSQLConnector:
             )
             return False
 
-    # ── Schema Initialization ─────────────────────────────────────────────────
+    # ── Read-only schema readiness ────────────────────────────────────────────
 
     def init_db(self) -> None:
-        """Initialize pgcrypto extension and the Repo table if they do not exist."""
+        """Retained legacy API: validate schema without creating or altering it."""
         if not self.enabled:
             return
-
-        logger.info("Initializing PostgreSQL database schemas...")
         conn = None
         try:
             conn = self.connect()
             cursor = conn.cursor()
-
-            # Enable pgcrypto for UUID gen_random_uuid()
-            try:
-                cursor.execute('CREATE EXTENSION IF NOT EXISTS "pgcrypto";')
-                conn.commit()
-            except Exception as exc:
-                # pgcrypto is enabled by default on Supabase and most managed PG hosts.
-                # On local PG it might need superuser — not fatal.
-                logger.warning(f"Could not enable pgcrypto extension: {exc}. Continuing...")
-                conn.rollback()  # clear the failed transaction state
-
-            # Create table if missing — matches the backend team's schema
-            create_table_query = """
-            CREATE TABLE IF NOT EXISTS Repo (
-                repo_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                github_repo_url VARCHAR(500) NOT NULL UNIQUE,
-                owner_id VARCHAR(100) NOT NULL,
-                repo_name VARCHAR(200) NOT NULL,
-                full_name VARCHAR(255) NOT NULL,
-                description TEXT,
-                primary_language VARCHAR(50),
-                special_label VARCHAR(50),
-                language_used JSONB DEFAULT '[]'::jsonb,
-                topics JSONB DEFAULT '[]'::jsonb,
-                readme_summary TEXT,
-                readme_md TEXT,
-                star_count INT DEFAULT 0,
-                likes_count INT DEFAULT 0,
-                comments_count INT DEFAULT 0,
-                saves_count INT DEFAULT 0,
-                views_count INT DEFAULT 0,
-                forks_count INT DEFAULT 0,
-                pr_count INT DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-            try:
-                cursor.execute(create_table_query)
-                conn.commit()
-            except Exception as exc:
-                # If creating table fails (possibly due to gen_random_uuid() being unavailable),
-                # rollback the failed transaction state and try creating without the DEFAULT constraint.
-                logger.warning(
-                    f"Failed to create table with gen_random_uuid() default: {exc}. "
-                    "Attempting fallback table creation without DEFAULT constraint..."
-                )
-                conn.rollback()
-                cursor = conn.cursor()
-                fallback_table_query = """
-                CREATE TABLE IF NOT EXISTS Repo (
-                    repo_id UUID PRIMARY KEY,
-                    github_repo_url VARCHAR(500) NOT NULL UNIQUE,
-                    owner_id VARCHAR(100) NOT NULL,
-                    repo_name VARCHAR(200) NOT NULL,
-                    full_name VARCHAR(255) NOT NULL,
-                    description TEXT,
-                    primary_language VARCHAR(50),
-                    special_label VARCHAR(50),
-                    language_used JSONB DEFAULT '[]'::jsonb,
-                    topics JSONB DEFAULT '[]'::jsonb,
-                    readme_summary TEXT,
-                    readme_md TEXT,
-                    star_count INT DEFAULT 0,
-                    likes_count INT DEFAULT 0,
-                    comments_count INT DEFAULT 0,
-                    saves_count INT DEFAULT 0,
-                    views_count INT DEFAULT 0,
-                    forks_count INT DEFAULT 0,
-                    pr_count INT DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-                cursor.execute(fallback_table_query)
-                conn.commit()
-
-            for col_name, col_def in self._migration_columns:
-                try:
-                    cursor.execute(
-                        f"ALTER TABLE Repo ADD COLUMN IF NOT EXISTS {col_name} {col_def};"
-                    )
-                    conn.commit()
-                except Exception:
-                    conn.rollback()
-
-            # Ensure github_repo_url limit is increased if existing table has VARCHAR(200)
-            try:
-                cursor.execute(
-                    "ALTER TABLE Repo ALTER COLUMN github_repo_url TYPE VARCHAR(500);"
-                )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-
-            logger.info("Database schemas verified successfully.")
-        except Exception as exc:
-            logger.error(f"Database initialization failed: {exc}")
+            validate_table_schema(cursor, "repo", LEGACY_REPOSITORY_COLUMNS)
+            conn.commit()
+            logger.info("Legacy repository schema is compatible; no schema changes performed.")
+        except Exception:
             if conn:
                 conn.rollback()
             raise

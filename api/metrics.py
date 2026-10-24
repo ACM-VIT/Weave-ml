@@ -15,6 +15,10 @@ from summarization.runtime import summary_admission_metrics
 
 
 _ROUTES = {
+    "/api/v2/model-operations",
+    "/api/v2/model-authority",
+    "/api/v2/model-operation-withdrawals",
+    "/api/v2/model-operation-status",
     "/api/v2/search/repositories",
     "/api/v2/recommendations/generate",
     "/api/v2/feedback/batch",

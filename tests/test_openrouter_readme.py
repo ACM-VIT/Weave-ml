@@ -218,10 +218,9 @@ class TestEnricherIntegration:
 class TestDatabaseConnectorSchema:
     """Test database schema updates for readme_md."""
 
-    def test_migration_columns_contains_readme_md(self):
-        db = PostgreSQLConnector()
-        col_names = [col[0] for col in getattr(db, "_migration_columns", [])]
-        assert "readme_md" in col_names
+    def test_schema_readiness_requires_raw_readme_markdown(self):
+        from database.schema_readiness import LEGACY_REPOSITORY_COLUMNS
+        assert LEGACY_REPOSITORY_COLUMNS["readme_md"] == "text"
 
     @patch("database.connector.PostgreSQLConnector.connect")
     def test_upsert_includes_readme_md(self, mock_connect):

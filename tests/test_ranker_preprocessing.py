@@ -1,11 +1,13 @@
 """Training-only statistics and the exported preprocessing/serving contract."""
 import json
+import hashlib
 
 import numpy as np
 import pytest
 
 from Ranking_Training_module.train_ranker import (
     build_dataloaders, chronological_split_index, standardize_dense_features, train,
+    load_training_data, training_array_sha256,
 )
 from inference.feature_spec import EMBEDDING_DIM, FEATURE_COUNT, FEATURE_ORDER
 from inference.preprocessing import (
@@ -61,6 +63,17 @@ def test_export_reload_matches_real_serving_inputs_for_normal_extreme_and_missin
     assert document["feature_order"] == FEATURE_ORDER
     manifest = json.loads((output / "model_manifest.json").read_text())
     assert manifest["preprocessing_version"] == PREPROCESSING_VERSION
+    data_digest = training_array_sha256(load_training_data(tmp_path / "export.npz"))
+    assert manifest["training_data"]["content_sha256"] == data_digest
+    assert len(manifest["code_commit"]) == 40
+    assert all(char in "0123456789abcdef" for char in manifest["code_commit"])
+    assert type(manifest["source_tree_dirty"]) is bool
+    assert "Ranking_Training_module/train_ranker.py" in manifest["source_sha256"]
+    split = {"dataset_sha256": data_digest, "split": "input_order_80_20",
+             "training_range": [0, 8], "validation_range": [8, 10]}
+    assert manifest["training_split_sha256"] == hashlib.sha256(
+        json.dumps(split, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert manifest["training_timestamp"] and manifest["offline_metrics"]
     assert manifest["preprocessing_fit"] == {
         "split": "input_order_80_20", "training_rows": 8, "validation_rows": 2,
     }
