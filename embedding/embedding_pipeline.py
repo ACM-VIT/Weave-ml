@@ -332,17 +332,18 @@ class RepositoryEmbeddingPipeline:
         if self.store is None:
             self.store = QdrantRepositoryStore(vector_size=self.config.embedding_dim)
         self.store.ensure_collection()
-        if isinstance(self.store, QdrantRepositoryStore):
-            yield from self.store.iter_upsert(
-                self.iter_embed(sources), max_points=MAX_OFFLINE_REPOSITORIES,
-            )
-            return
-        # Preserve injected stores implementing the existing upsert protocol.
         results = iter(self.iter_embed(sources))
         while chunk := list(islice(results, MAX_OFFLINE_REPOSITORIES)):
             check_deadline()
-            self.store.upsert(chunk)
-            yield from chunk
+            # Drain byte-split writes before resuming the embedding iterator:
+            # otherwise its next window can be prepared while the last small
+            # chunk of this window is still waiting for a write.
+            if isinstance(self.store, QdrantRepositoryStore):
+                yield from self.store.iter_upsert(chunk, max_points=MAX_OFFLINE_REPOSITORIES)
+            else:
+                # Preserve injected stores implementing the existing protocol.
+                self.store.upsert(chunk)
+                yield from chunk
 
     def index_batch(self, sources: Iterable[Any]) -> list[RepositoryEmbeddingResult]:
         """Materialized compatibility API; use iter_index for large corpora."""
