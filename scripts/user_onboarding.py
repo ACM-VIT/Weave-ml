@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import logging
+import math
+import threading
 from collections.abc import Mapping
 from typing import Any
 
@@ -15,6 +19,7 @@ from config import (
 )
 from embedding.embeddings import aggregate_vectors
 from embedding.repository_embedding import SUPPORTED_REPOSITORY_EMBEDDING_DIMS
+from embedding.tower_cache import TowerEmbeddingCache
 from embedding.user_profile_store import QdrantUserProfileStore
 from embedding.vector_contract import (
     FEEDBACK_STATE_REVISION_FIELD,
@@ -22,6 +27,7 @@ from embedding.vector_contract import (
     canonical_backend_uuid,
     validate_embedding_vector,
 )
+from utils.deadline import check_deadline
 
 logger = logging.getLogger("pipeline.user_onboarding")
 
@@ -31,6 +37,8 @@ EMBEDDING_MODEL = REPOSITORY_EMBEDDING_MODEL
 VECTOR_DIMENSION = USER_PROFILE_COLLECTION_CONTRACT.vector_size
 USER_PROFILES_COLLECTION = USER_PROFILE_COLLECTION_CONTRACT.collection_name
 TARGET_VECTOR_NAME = USER_PROFILE_COLLECTION_CONTRACT.vector_name
+# Bump when semantic projection, encoding options or normalization changes.
+USER_BASELINE_PREPROCESSING_VERSION = "user-context-l2-v1"
 
 _FEEDBACK_PAYLOAD_KEYS = {
     "feedback_latent_vector",
@@ -169,6 +177,8 @@ class UserOnboardingPipeline:
             )
         self._model = model
         self.store = store
+        self._baseline_cache: TowerEmbeddingCache | None = None
+        self._baseline_cache_lock = threading.Lock()
 
     def _get_model(self):
         if self._model is None:
@@ -191,11 +201,41 @@ class UserOnboardingPipeline:
     def synthesize_user_context(self, user_data: dict[str, Any]) -> str:
         return _synthesize_user_context_impl(user_data)
 
+    def _cache_for_model(self, model: Any) -> TowerEmbeddingCache:
+        revision = getattr(model, "query_embedding_revision", EMBEDDING_MODEL_REVISION)
+        with self._baseline_cache_lock:
+            cache = self._baseline_cache
+            if cache is None or not cache.owns(model) or cache.model_revision != revision:
+                # Separate from repository towers: at most 128 packed 384D
+                # vectors (384 KiB), plus bounded digest/entry overhead. No text,
+                # user identity, payload or in-flight inference is retained.
+                cache = TowerEmbeddingCache(
+                    model=model, model_revision=revision,
+                    max_entries=128, max_bytes=128 * VECTOR_DIMENSION * 8,
+                )
+                self._baseline_cache = cache
+            return cache
+
     def generate_interest_vector(self, user_data: dict[str, Any]) -> list[float]:
         """Create one finite, normalized 384-dimensional interest vector."""
         _validate_backend_onboarding_metadata(user_data)
         context = self.synthesize_user_context(user_data)
-        embedding = self._get_model().encode(
+        check_deadline()
+        model = self._get_model()
+        cache = self._cache_for_model(model)
+        key = hashlib.sha256(json.dumps({
+            "context": context, "model": self.model_name,
+            "model_revision": cache.model_revision, "dimension": VECTOR_DIMENSION,
+            "preprocessing": USER_BASELINE_PREPROCESSING_VERSION,
+            "max_seq_length": getattr(model, "max_seq_length", 256),
+            "normalize_embeddings": True, "convert_to_numpy": True,
+        }, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).digest()
+        cached = cache.get(key, expected_size=VECTOR_DIMENSION)
+        if cached is not None and math.isclose(
+            sum(value * value for value in cached), 1.0, rel_tol=1e-6, abs_tol=1e-6,
+        ):
+            return cached
+        embedding = model.encode(
             context,
             convert_to_numpy=True,
             normalize_embeddings=True,
@@ -211,7 +251,9 @@ class UserOnboardingPipeline:
         )
         # Normalize again at our boundary rather than relying on model-specific
         # behavior.  This also rejects an unusable all-zero embedding.
-        return aggregate_vectors([validated])
+        normalized = aggregate_vectors([validated])
+        cache.put(key, normalized, expected_size=VECTOR_DIMENSION)
+        return normalized
 
     def save_to_qdrant(
         self,
