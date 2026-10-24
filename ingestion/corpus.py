@@ -70,6 +70,33 @@ def dynamic_cluster_discovery(corpus: list[dict]) -> dict:
             "reason": "Fewer than four valid non-zero repository vectors are available.",
         }
 
+    provenance_fields = (
+        "embedding_model",
+        "embedding_model_revision",
+        "embedding_version",
+        "feature_spec_version",
+    )
+    provenance = [tuple(node.get(field) for field in provenance_fields) for node, _ in vectors]
+    if any(
+        any(not isinstance(value, str) or not value.strip() for value in values)
+        for values in provenance
+    ):
+        return {
+            "current_cluster": "Unavailable",
+            "nearest_cluster": "Unavailable",
+            "distance": None,
+            "measurement_status": "unmeasured",
+            "reason": "Repository vector model and version provenance is incomplete.",
+        }
+    if len(set(provenance)) != 1:
+        return {
+            "current_cluster": "Unavailable",
+            "nearest_cluster": "Unavailable",
+            "distance": None,
+            "measurement_status": "unmeasured",
+            "reason": "Repository vectors use incompatible model or feature versions.",
+        }
+
     dimensions = {vector.size for _, vector in vectors}
     if len(dimensions) != 1:
         return {

@@ -10,10 +10,12 @@ decisions.
 
 The compatibility path may still collect local history for exploratory output.
 `dynamic_cluster_discovery` reports a centroid distance only when it has at
-least four finite, non-zero vectors with one shared dimension and at least two
-observed categories. Missing, zero, malformed, mixed-dimension, or insufficient
-vectors produce an explicit `unmeasured` result. This is descriptive topology,
-not a novelty score, semantic label, threshold, or admission rule.
+least four finite, non-zero vectors with one shared dimension and matching
+model, model-revision, embedding-version, and feature-spec provenance, across
+at least two observed categories. Missing, zero, malformed, incompatible, or
+insufficient vectors produce an explicit `unmeasured` result. This is
+descriptive topology, not a novelty score, semantic label, threshold, or
+admission rule.
 
 No bounded reference-set evaluation is included yet. The repository's existing
 Qdrant nearest-neighbor tooling reads a configured collection; it does not by
