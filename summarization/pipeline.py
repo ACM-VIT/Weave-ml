@@ -228,6 +228,7 @@ class CardSummaryPipeline:
                 validate_generated_summary(
                     artifact,
                     source_analysis=work.analysis if work is not None else (),
+                    canonical_readme=repo.get("readme") if repo is not None else None,
                 )
             except SummaryValidationError:
                 return False
@@ -323,6 +324,7 @@ class CardSummaryPipeline:
                     )
                     content = validate_generated_summary(
                         parse_summary_response(raw), source_analysis=work.analysis,
+                        canonical_readme=repo.get("readme"),
                     )
                     return CardSummaryArtifact(
                         **content.model_dump(),

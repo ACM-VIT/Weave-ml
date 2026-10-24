@@ -8,6 +8,7 @@ from difflib import SequenceMatcher
 from itertools import chain
 import json
 import re
+import unicodedata
 from typing import Iterable
 
 from pydantic import ValidationError
@@ -93,6 +94,37 @@ class SourceAnalysis:
     words: tuple[str, ...]
     joined: str
     eightgrams: frozenset[tuple[str, ...]]
+    normalized_prose: str
+
+
+def _normalized_prose(value: str) -> str:
+    """Match the backend's lowercase Unicode-letter/number normalization."""
+    lowered = value.lower()
+    if lowered.isascii():
+        return re.sub(r"[^a-z0-9]+", " ", lowered).strip()
+    return " ".join("".join(
+        char if unicodedata.category(char)[0] in {"L", "N"} else " "
+        for char in lowered
+    ).split())
+
+
+def _contains_partial_copy(prose: str, source_prose: str) -> bool:
+    if prose.isascii() and source_prose.isascii():
+        return any(prose[index:index + 80] in source_prose
+                   for index in range(len(prose) - 79))
+    # JavaScript length/slice use UTF-16 units, including windows whose ends
+    # split surrogate pairs. Match its 80-unit gate without matching odd byte
+    # offsets, which cannot represent the backend's string positions.
+    candidate = prose.encode("utf-16-le", "surrogatepass")
+    source = source_prose.encode("utf-16-le", "surrogatepass")
+    for index in range(0, len(candidate) - 159, 2):
+        passage = candidate[index:index + 160]
+        match = source.find(passage)
+        while match >= 0:
+            if match % 2 == 0:
+                return True
+            match = source.find(passage, match + 1)
+    return False
 
 
 def analyze_comparison_texts(texts: Iterable[str]) -> tuple[SourceAnalysis, ...]:
@@ -105,6 +137,7 @@ def analyze_comparison_texts(texts: Iterable[str]) -> tuple[SourceAnalysis, ...]
         analyses.append(SourceAnalysis(
             words, " " + " ".join(words) + " ",
             frozenset(words[index:index + 8] for index in range(len(words) - 7)),
+            _normalized_prose(source),
         ))
     return tuple(analyses)
 
@@ -221,12 +254,24 @@ def validate_generated_summary(
     *,
     comparison_texts: Iterable[str] = (),
     source_analysis: tuple[SourceAnalysis, ...] | None = None,
+    canonical_readme: str | None = None,
 ) -> CardSummaryContent:
     """Return normalized safe content or raise deterministic validation errors."""
 
     # Internal callers pass complete precomputed analysis across highlights and
     # repairs; direct callers retain the same fail-closed input bound.
     sources = source_analysis if source_analysis is not None else analyze_comparison_texts(comparison_texts)
+    # The provider may see an approved prefix, but the acceptance boundary
+    # checks the complete canonical README. This is the existing HTTP source
+    # limit, not a larger prompt/markdown/tokenization budget. Do not retain the
+    # full normalization in the process-local analysis cache.
+    if canonical_readme is not None and (
+        not isinstance(canonical_readme, str) or len(canonical_readme) > 1_000_000
+    ):
+        raise SummaryValidationError(("canonical README exceeds the source contract",))
+    copy_sources = tuple(source.normalized_prose for source in sources)
+    if canonical_readme:
+        copy_sources += (_normalized_prose(canonical_readme),)
     reasons = _unsafe_text(content.summary)
     normalized = normalize_summary(content.summary)
     if len(normalized) > CARD_SUMMARY_MAX_CHARS:
@@ -242,11 +287,15 @@ def validate_generated_summary(
         normalized_highlight = normalize_summary(highlight)
         normalized_highlights.append(normalized_highlight)
         highlight_words = tuple(_words(normalized_highlight))
-        if any(_near_copy_words(highlight_words, source) for source in sources):
+        highlight_prose = _normalized_prose(normalized_highlight)
+        if (any(_contains_partial_copy(highlight_prose, source) for source in copy_sources)
+                or any(_near_copy_words(highlight_words, source) for source in sources)):
             reasons.append("highlight copies a long contiguous source passage")
 
     summary_words = tuple(_words(normalized))
-    if any(_near_copy_words(summary_words, source) for source in sources):
+    summary_prose = _normalized_prose(normalized)
+    if (any(_contains_partial_copy(summary_prose, source) for source in copy_sources)
+            or any(_near_copy_words(summary_words, source) for source in sources)):
         reasons.append("summary copies a long contiguous source passage")
     if reasons:
         raise SummaryValidationError(reasons)
