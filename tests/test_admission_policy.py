@@ -227,6 +227,9 @@ def test_compatibility_placeholders_cannot_produce_topology():
         "reason": "Fewer than four valid non-zero repository vectors are available.",
     }
     assert "Corpus Cluster Topology Structural Space Vector" not in str(result)
+    assert "Corpus Cluster Topology: UNMEASURED" in str(result)
+    assert result.topological_metrics['reason'] in str(result)
+    assert "Spatial Centroid Distance" not in str(result)
 
 
 @pytest.mark.parametrize(
@@ -280,3 +283,28 @@ def test_topology_measures_compatible_synthetic_centroids():
         "distance": 1.0,
         "measurement_status": "measured",
     }
+
+
+def test_mixed_novelty_summary_ranks_only_measured_results_with_nullable_timeline(capsys):
+    from dataclasses import replace
+
+    unknown = ingest_repository(
+        _approved_compatibility_repo('owner/unmeasured'), corpus_store=CorpusStore(), auto_index=False,
+    )
+    measured = replace(unknown, repo_id='owner/measured', novelty=replace(
+        unknown.novelty, measurement_status='measured', final=0.3,
+        semantic_penalty=0.0, category_penalty=0.0, tech_stack_penalty=0.0,
+        activity_penalty=0.0, anomaly_tag='NONE',
+    ))
+    print_batch_summary([unknown, measured], [
+        {'growth_index': 1, 'repo_id': unknown.repo_id, 'novelty_index_point': None},
+        {'growth_index': 2, 'repo_id': measured.repo_id, 'novelty_index_point': 0.3},
+    ])
+    output = capsys.readouterr().out
+    assert 'Corpus Ecosystem Novelty Mean Value : 0.3000' in output
+    rankings = output.split('Top 5 Measured High-Novelty Repositories:', 1)[1].split(
+        'Ecosystem Corpus Growth & Novelty Vector Decay Timeline Analysis:', 1)[0]
+    assert rankings.count('owner/measured') == 2
+    assert 'owner/unmeasured' not in rankings
+    assert 'Registered Novelty Tracking: UNMEASURED' in output
+    assert 'Registered Novelty Tracking: 0.3000' in output
