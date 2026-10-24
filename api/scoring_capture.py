@@ -40,6 +40,7 @@ class CapturedRequest:
     cold_start: bool
     locale: str | None
     options: CaptureOptions
+    model_context: object | None = None
 
 
 @dataclass(frozen=True)
@@ -56,7 +57,7 @@ def _execute_captured_request_private(active_retriever, request: CapturedRequest
         check_deadline()
         batch = active_retriever.recommend_batch(request.user_id, request.limit, list(request.excluded),
             request.generation_id, request.cold_start, list(request.social_ids), list(request.social_candidates),
-            scoring_capture=request.options)
+            scoring_capture=request.options, **({"model_context": request.model_context} if request.model_context is not None else {}))
         stage = "output_validation"
         items = batch.items
         if len({item.repo_id for item in items}) != len(items) or any(not math.isfinite(item.score) for item in items):
@@ -69,6 +70,7 @@ def _execute_captured_request_private(active_retriever, request: CapturedRequest
                 "fallback_reason": batch.fallback_reason, "retrieval_mode": batch.retrieval_mode,
                 "context_status": {"cold_start_applied": request.cold_start,
                                    "locale": "reserved_unused" if request.locale else "not_provided"},
+                **({"model_context": batch.model_context} if request.model_context is not None else {}),
                 "items": [asdict(item) for item in items]}
         if not items:
             # Only an existing genuinely successful empty result reaches here.
@@ -77,7 +79,7 @@ def _execute_captured_request_private(active_retriever, request: CapturedRequest
             stage = "response_validation"
             validated = UnscoredEmptyRecommendationResponse.model_validate_json(json.dumps(body, allow_nan=False), strict=True)
             stage = "sealing"
-            wire = json.dumps(validated.model_dump(mode="json"), ensure_ascii=False, allow_nan=False,
+            wire = json.dumps(validated.model_dump(mode="json", exclude_unset=True), ensure_ascii=False, allow_nan=False,
                               sort_keys=True, separators=(",", ":")).encode()
             if len(wire) > DEFAULT_WIRE_LIMIT:
                 raise ValueError("Captured response exceeds exact wire budget")
@@ -96,7 +98,7 @@ def _execute_captured_request_private(active_retriever, request: CapturedRequest
                 for item in body["items"]]
             stage = "response_validation"
             validated = CapturedRecommendationResponse.model_validate_json(json.dumps(body, allow_nan=False), strict=True)
-            normalized = validated.model_dump(mode="json")
+            normalized = validated.model_dump(mode="json", exclude_unset=True)
             for item in normalized["items"]:
                 item.pop("scored_input")
             stage = "sealing"

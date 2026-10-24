@@ -58,7 +58,27 @@ class FrozenSnapshot(StrictModel):
     as_of: str
     limit: Annotated[int, Field(ge=1, le=100)] = 15
     seed: Annotated[str, Field(min_length=1, max_length=128)]
+    # Offline replay keeps the bounded backend request distinct from negatives
+    # derived from a frozen applied model. Empty defaults preserve old fixtures.
+    request_exclusions: dict[str, Annotated[list[str], Field(max_length=500)]] = Field(
+        default_factory=dict, max_length=32, exclude_if=lambda value: not value)
+    model_exclusions: dict[str, Annotated[list[str], Field(max_length=256)]] = Field(
+        default_factory=dict, max_length=32, exclude_if=lambda value: not value)
     _time = field_validator('as_of')(aware_timestamp)
+
+    @field_validator('request_exclusions', 'model_exclusions')
+    @classmethod
+    def canonical_exclusions(cls, value):
+        for owner, ids in value.items():
+            canonical_id(owner)
+            if len(ids) != len(set(ids)):
+                raise ValueError('exclusion channels require unique repository IDs')
+            for repo_id in ids:
+                canonical_id(repo_id)
+        return value
+
+    def request_exclusions_for(self, profile):
+        return self.request_exclusions.get(profile.profile_id, sorted(set(profile.seen) | set(profile.disliked)))
 
     @model_validator(mode='after')
     def coherent(self):
@@ -70,6 +90,9 @@ class FrozenSnapshot(StrictModel):
                 or {row.profile_id for row in self.profiles} != set(by_profile)):
             raise ValueError('snapshot requires every unique bundle repository/profile exactly once')
         embedding = self.bundle.embedding
+        separated = bool(self.request_exclusions or self.model_exclusions)
+        if separated and (set(self.request_exclusions) != set(by_profile) or set(self.model_exclusions) != set(by_profile)):
+            raise ValueError('separate exclusion channels require every frozen profile')
         from config import EMBEDDING_MODEL_REVISION, REPOSITORY_EMBEDDING_MODEL, REPOSITORY_EMBEDDING_VERSION
         if (embedding.model != REPOSITORY_EMBEDDING_MODEL or embedding.revision != EMBEDDING_MODEL_REVISION
                 or embedding.dimension != 384 or embedding.pooling != 'mean'
@@ -94,7 +117,13 @@ class FrozenSnapshot(StrictModel):
                         or any(not isinstance(v,str) or not 1<=len(v)<=128 for v in values)):
                     raise ValueError('frozen profile terms must be explicitly bounded lists')
             profile=by_profile[row.profile_id]
-            if len(set(profile.seen)|set(profile.disliked))>500:
+            combined = set(profile.seen) | set(profile.disliked)
+            if separated:
+                request = set(self.request_exclusions[row.profile_id])
+                learned = set(self.model_exclusions[row.profile_id])
+                if not learned <= set(profile.disliked) or combined != request | learned:
+                    raise ValueError('request/model exclusion channels differ from bound metric/source exclusions')
+            elif len(combined)>500:
                 raise ValueError('frozen exclusions exceed backend/ML contract')
         for row in self.repositories:
             p=row.payload; repo=by_repo[row.repo_id]
@@ -269,6 +298,18 @@ def execute_snapshot(snapshot: FrozenSnapshot, artifact_dir: Path, *, treatment=
         return result
 
     class RecordingRetriever(QdrantV2Retriever):
+        def recommend_batch(self, user_id, limit, exclude_repo_ids, *args, **kwargs):
+            if len(set(exclude_repo_ids)) > 500:
+                raise ValueError('offline backend request exclusions exceed the online contract')
+            # The online model-context path adds applied-model negatives after
+            # request validation. Here those same bounded negatives are already
+            # derived from frozen history, without an online runtime/database.
+            learned = set(snapshot.model_exclusions.get(user_id, []))
+            excluded = sorted(set(exclude_repo_ids) | learned)
+            self.exclusion_channels[user_id] = {'request_count': len(set(exclude_repo_ids)),
+                'model_count': len(learned), 'combined_count': len(excluded)}
+            return super().recommend_batch(user_id, limit, excluded, *args, **kwargs)
+
         def _heavy_rank(self, **kwargs):
             started=time.perf_counter()
             self.retrieval_ms=(started-self.began)*1000
@@ -319,6 +360,7 @@ def execute_snapshot(snapshot: FrozenSnapshot, artifact_dir: Path, *, treatment=
         if context.treatment.social is not None:
             engine.social_policy=SocialPolicy(**context.treatment.social)
         engine.required_content_version=1;engine.required_feature_spec_version='v2'
+        engine.exclusion_channels = {}
         engine.allow_missing_embedding_revision=False
         engine.embedding_model_revision=snapshot.bundle.embedding.revision
         configuration={'retrieval':{key:getattr(engine,key) for key in (
@@ -352,7 +394,7 @@ def execute_snapshot(snapshot: FrozenSnapshot, artifact_dir: Path, *, treatment=
                 engine.began=time.perf_counter()
                 engine.retrieved=engine.ranked=None
                 projection=projections.get(profile.profile_id)
-                batch=engine.recommend_batch(profile.profile_id,snapshot.limit,sorted(set(profile.seen)|set(profile.disliked)),generation,
+                batch=engine.recommend_batch(profile.profile_id,snapshot.limit,snapshot.request_exclusions_for(profile),generation,
                     social_candidates=projection.candidates if projection is not None else [])
                 elapsed=(time.perf_counter()-engine.began)*1000
                 if client.read_errors or not batch.ranker_applied or batch.served_ranker!='heavy' or batch.fallback_code or engine.retrieved is None:
@@ -364,6 +406,8 @@ def execute_snapshot(snapshot: FrozenSnapshot, artifact_dir: Path, *, treatment=
                 shape_calls[profile.profile_id]=assembler.calls
         configuration['runtime']['retrieval_executor']=retrieval_runtime_status()
         configuration['runtime']['shape_calls_by_profile']=shape_calls
+        if snapshot.request_exclusions or snapshot.model_exclusions:
+            configuration['runtime']['exclusion_channels_by_profile'] = engine.exclusion_channels
     if digest(context)!=context_sha:
         raise ValueError('owned frozen treatment/evidence changed during replay')
     if digest(snapshot)!=frozen_snapshot_sha:

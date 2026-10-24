@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timedelta
 from functools import lru_cache
 import os
-from typing import Annotated, Literal, get_args
+from typing import Annotated, Any, Literal, get_args
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -147,13 +147,52 @@ def _recommendation_request_schema(schema: dict) -> None:
     schema["oneOf"] = [
         {"required": ["feed_version"], "properties": {
             "feed_version": {"type": "integer", "minimum": 1, "maximum": 2**53-1},
-            "scoring_capture": {"type": "null"}}},
+            "scoring_capture": {"type": "null"}, "model_context": {"type": "null"}}},
         {"required": ["feed_version", "scoring_capture"], "properties": {
             "feed_version": {"type": "string", "minLength": 1, "maxLength": 19,
                 "pattern": _CAPTURE_FEED_VERSION_PATTERN,
                 "not": {"pattern": "[^0-9]"}},
             "scoring_capture": {"$ref": capture_reference}}},
+        {"required": ["feed_version", "model_context"], "properties": {
+            "feed_version": {"type": "string", "minLength": 1, "maxLength": 19,
+                "pattern": _CAPTURE_FEED_VERSION_PATTERN, "not": {"pattern": "[^0-9]"}},
+            "scoring_capture": {"type": "null"},
+            "model_context": {"$ref": next(choice["$ref"] for choice in schema["properties"]["model_context"]["anyOf"] if "$ref" in choice)}}},
     ]
+
+
+PositiveModelDecimal = Annotated[str, StringConstraints(strict=True, max_length=19, pattern=_CAPTURE_FEED_VERSION_PATTERN),
+                                 Field(json_schema_extra={"not": {"pattern": "[^0-9]"}})]
+NonnegativeModelDecimal = Annotated[str, StringConstraints(strict=True, max_length=19,
+    pattern=_CAPTURE_FEED_VERSION_PATTERN.replace("^(?:", "^(?:0|", 1)),
+    Field(json_schema_extra={"not": {"pattern": "[^0-9]"}})]
+
+
+class ModelRecommendationContext(StrictModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=False, hide_input_in_errors=True)
+    schema_version: Literal[1]
+    session_id: Annotated[str, StringConstraints(strict=True, min_length=36, max_length=36,
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")]
+    epoch: PositiveModelDecimal
+    policy_sha256: Annotated[str, StringConstraints(strict=True, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")]
+    minimum_applied_operation_version: PositiveModelDecimal
+    required_profile_version: PositiveModelDecimal
+    as_of_ms: NonnegativeModelDecimal
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def exact_schema(cls, value):
+        if type(value) is not int:
+            raise ValueError("Model context schema must be an integer")
+        return value
+
+    @model_validator(mode="after")
+    def exact_context(self):
+        from feedback.model_wire import decimal, digest, canonical_uuid
+        canonical_uuid(self.session_id)
+        decimal(self.epoch, 1); decimal(self.minimum_applied_operation_version, 1)
+        decimal(self.required_profile_version, 1); decimal(self.as_of_ms); digest(self.policy_sha256)
+        return self
 
 
 class RecommendationRequest(StrictModel):
@@ -163,6 +202,7 @@ class RecommendationRequest(StrictModel):
     user_id: uuid.UUID
     feed_version: Annotated[int, Field(strict=True, ge=1, le=2**53-1)] | Annotated[str, StringConstraints(strict=True, max_length=19, pattern=_CAPTURE_FEED_VERSION_PATTERN)]
     scoring_capture: ScoringCaptureRequest | None = None
+    model_context: ModelRecommendationContext | None = None
     limit: int = Field(ge=1, le=100)
 
     @field_validator("feed_version", mode="before")
@@ -177,7 +217,7 @@ class RecommendationRequest(StrictModel):
 
     @model_validator(mode="after")
     def negotiated_feed_version(self):
-        if (self.scoring_capture is not None) != (type(self.feed_version) is str):
+        if (self.scoring_capture is not None or self.model_context is not None) != (type(self.feed_version) is str):
             raise ValueError("Captured requests require an exact decimal string; ordinary requests require an integer")
         return self
     exclude_repo_ids: list[uuid.UUID] = Field(default_factory=list, max_length=500)
@@ -544,11 +584,29 @@ class RecommendationContextStatus(StrictModel):
     locale: Literal["reserved_unused", "not_provided"]
 
 
+class AppliedModelContext(StrictModel):
+    schema_version: Literal[1]
+    user_id: uuid.UUID
+    session_id: uuid.UUID
+    epoch: PositiveModelDecimal
+    profile_version: PositiveModelDecimal
+    applied_operation_version: PositiveModelDecimal
+    applied_feedback_version: NonnegativeModelDecimal
+    state_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    head: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    policy_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    effective_vector_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    session_witness_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    as_of_ms: NonnegativeModelDecimal
+    valid_until_ms: PositiveModelDecimal
+    explicit_negative_repo_ids: list[uuid.UUID] = Field(max_length=256)
+
+
 class RecommendationResponse(StrictModel):
     schema_version: Literal[2]
     generation_id: uuid.UUID
     user_id: uuid.UUID
-    feed_version: int = Field(ge=1)
+    feed_version: int = Field(strict=True, ge=1, le=2**53-1)
     model_version: str = Field(min_length=1, max_length=512)
     # Retrieval supports eight compatible 128-character identities plus the
     # mixed-version prefix and seven separating commas.
@@ -569,6 +627,11 @@ class RecommendationResponse(StrictModel):
         if len({item.repo_id for item in value}) != len(value):
             raise ValueError("recommendation IDs must be unique")
         return value
+
+
+class ModelRecommendationResponse(RecommendationResponse):
+    feed_version: PositiveModelDecimal
+    model_context: AppliedModelContext
 
 
 from inference.scoring_provenance import ScoringContext, ScoredPacket, decode_owned_packet
@@ -602,6 +665,7 @@ class EmptyScoringStatus(StrictModel):
 
 
 class CapturedRecommendationResponse(RecommendationResponse):
+    model_context: AppliedModelContext | None = None
     model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
     feed_version: Annotated[str, StringConstraints(strict=True, pattern=r"^[1-9][0-9]{0,18}$")]
     scoring_capture: CapturedScoringStatus
@@ -635,6 +699,7 @@ class CapturedRecommendationResponse(RecommendationResponse):
 
 
 class UnscoredEmptyRecommendationResponse(RecommendationResponse):
+    model_context: AppliedModelContext | None = None
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     feed_version: Annotated[str, StringConstraints(strict=True, pattern=r"^[1-9][0-9]{0,18}$")]
     scoring_capture: EmptyScoringStatus
@@ -650,7 +715,7 @@ class UnscoredEmptyRecommendationResponse(RecommendationResponse):
         return value
 
 
-RecommendationWireResponse = RecommendationResponse | CapturedRecommendationResponse | UnscoredEmptyRecommendationResponse
+RecommendationWireResponse = RecommendationResponse | ModelRecommendationResponse | CapturedRecommendationResponse | UnscoredEmptyRecommendationResponse
 
 
 class FeedbackResponse(StrictModel):
@@ -693,3 +758,101 @@ class OnboardingResponse(StrictModel):
     status: Literal["applied", "duplicate", "current"]
     user_id: uuid.UUID
     profile_version: int = Field(ge=1)
+
+
+class ModelOperationInput(StrictModel):
+    # Whitespace and original Unicode are part of the immutable source hash.
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=False, hide_input_in_errors=True)
+    operation_json: str = Field(min_length=1, max_length=131072)
+
+
+class ModelOperationBatch(StrictModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    schema_version: Literal[1]
+    operations: list[ModelOperationInput] = Field(min_length=1, max_length=50)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def exact_schema(cls, value):
+        if type(value) is not int:
+            raise ValueError("Model operation schema must be an integer")
+        return value
+
+
+class ModelOperationAcknowledgement(StrictModel):
+    operation_id: uuid.UUID
+    model_operation_version: str
+    source_envelope_sha256: str
+    status: Literal["accepted", "duplicate", "withdrawal_accepted"]
+    withdrawal_sha256: str | None = None
+
+
+class ModelOperationResponse(StrictModel):
+    schema_version: Literal[1]
+    operations: list[ModelOperationAcknowledgement]
+
+
+class ModelAuthorityRequest(StrictModel):
+    schema_version: Literal[1]
+    user_id: uuid.UUID
+    model_context: ModelRecommendationContext
+
+
+class ModelAuthorityResponse(StrictModel):
+    schema_version: Literal[1]
+    model_context: AppliedModelContext
+
+
+class ProfileWithdrawalInput(StrictModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=False, hide_input_in_errors=True)
+    withdrawal_json: str = Field(min_length=1, max_length=131072)
+
+
+class ProfileWithdrawalBatch(StrictModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    schema_version: Literal[1]
+    withdrawals: list[ProfileWithdrawalInput] = Field(min_length=1, max_length=50)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def exact_schema(cls, value):
+        if type(value) is not int:
+            raise ValueError("Withdrawal schema must be an integer")
+        return value
+
+
+class ProfileWithdrawalAcknowledgement(StrictModel):
+    operation_id: uuid.UUID
+    model_operation_version: PositiveModelDecimal
+    source_envelope_sha256: str
+    withdrawal_sha256: str
+    status: Literal["accepted", "duplicate"]
+
+
+class ProfileWithdrawalResponse(StrictModel):
+    schema_version: Literal[1]
+    withdrawals: list[ProfileWithdrawalAcknowledgement]
+
+
+class ModelOperationStatusRequest(StrictModel):
+    schema_version: Literal[1]
+    user_id: uuid.UUID
+    operation_id: uuid.UUID
+    model_operation_version: PositiveModelDecimal
+    source_envelope_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+
+
+class ModelOperationStatusResponse(StrictModel):
+    schema_version: Literal[1]
+    user_id: uuid.UUID
+    operation_id: uuid.UUID
+    model_operation_version: PositiveModelDecimal
+    source_envelope_sha256: str
+    status: Literal["pending", "applied", "withdrawn_profile", "rejected_capacity", "rejected_session_dependency"]
+    basis_status: Literal["missing", "awaiting_profile", "ready"]
+    applied_operation_version: PositiveModelDecimal | None = None
+    applied_profile_version: PositiveModelDecimal | None = None
+    applied_feedback_version: NonnegativeModelDecimal | None = None
+    current_head: str | None = None
+    operation_head: str | None = None
+    withdrawal_sha256: str | None = None

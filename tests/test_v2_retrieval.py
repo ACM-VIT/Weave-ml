@@ -935,6 +935,7 @@ def test_default_recommendation_path_has_a_bounded_qdrant_call_budget() -> None:
         "embedding_dim",
         "embedding_model",
         "embedding_model_revision",
+        "model_policy_sha256",  # scalar guard; never fetch the full feedback ledger
     }
     assert len(client.query_calls) == 1  # semantic candidate query
     assert len(client.scroll_calls) == 4  # four bounded discovery channels

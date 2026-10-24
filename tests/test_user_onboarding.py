@@ -77,6 +77,9 @@ class FakeQdrantClient:
     def upsert(self, **kwargs):
         self.upsert_call = kwargs
 
+    def retrieve(self, **kwargs):
+        return self.upsert_call["points"] if self.upsert_call else []
+
 
 class CollectionCreationRaceClient(FakeQdrantClient):
     def __init__(self):

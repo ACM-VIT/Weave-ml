@@ -85,3 +85,19 @@ def test_capture_variant_keeps_the_complete_reusable_object_contract():
     assert not validator.is_valid({})
     assert not validator.is_valid({"unexpected": "field"})
     assert not validator.is_valid({"schema_version": 1, "encoding": "wrong"})
+
+
+@pytest.mark.parametrize('field,value,accepted',[
+    ('epoch','1',True),('epoch','0',False),('epoch',1,False),('epoch','01',False),
+    ('as_of_ms','0',True),('as_of_ms',str(2**63-1),True),('as_of_ms',str(2**63),False),
+    ('minimum_applied_operation_version','1\n',False),('required_profile_version','+1',False),
+])
+def test_model_context_negotiation_schema_matches_actual_runtime(field,value,accepted):
+    body=payload(captured=False,feed_version='1')
+    body['model_context']={'schema_version':1,'session_id':'00000000-0000-0000-0000-000000000001',
+        'epoch':'1','policy_sha256':'a'*64,'minimum_applied_operation_version':'1','required_profile_version':'1','as_of_ms':'1'}
+    body['model_context'][field]=value
+    assert _generated_request_validator().is_valid(body) is accepted
+    try:RecommendationRequest.model_validate_json(json.dumps(body));valid=True
+    except ValidationError:valid=False
+    assert valid is accepted

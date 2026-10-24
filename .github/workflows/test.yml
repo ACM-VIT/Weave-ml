@@ -152,6 +152,7 @@ jobs:
         QDRANT_URL: http://127.0.0.1:6333
         RUN_FEEDBACK_INTEGRATION: "true"
         RUN_V2_FEEDBACK_INTEGRATION: "true"
+        RUN_MODEL_OPERATION_INTEGRATION: "1"
       run: |
         uv run pytest tests/ -m "integration" -v
 
