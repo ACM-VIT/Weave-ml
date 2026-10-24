@@ -1133,3 +1133,141 @@ def test_bootstrap_user_cannot_occupy_ready_recovery_slot(runtime):
     assert runtime.redis.xlen(runtime.stream.stream)==1
     assert runtime.stream.admit(wire(p,'feedback',3,feedback_payload(1,kind='unsave')))['status']=='accepted'
     assert runtime.redis.xlen(runtime.stream.stream)==2
+
+
+def test_interrupted_alias_reservation_recovers_frozen_source_after_revision_changes(runtime,tmp_path):
+    from dataclasses import asdict
+    from pathlib import Path
+    import sys,base64
+    initialize(runtime);p=runtime.policy
+    checkpoint=runtime.processor.coordinator.checkpoint(uid(1))
+    raw=wire(p,'feedback',3,feedback_payload());runtime.stream.admit(raw)
+    target=tmp_path/'owned-settings.json';target.write_text(json.dumps({'config':runtime_config(p),'settings':asdict(runtime.settings)}))
+    result=subprocess.run([sys.executable,'-m','tests.fixtures.model_operation_worker',str(target),'after_alias_reservation'],
+        cwd=Path(__file__).parents[1],capture_output=True,text=True,timeout=20)
+    assert result.returncode==71,result.stderr
+    assert runtime.journal.records.records.get('operation:'+uid(1)+':3') is None
+    assert runtime.users.read(uid(1)).state.operation_version==2
+    point=runtime.qdrant.retrieve(runtime.settings.repository_collection,ids=[uid(100)],with_vectors=True,with_payload=True)[0]
+    runtime.qdrant.upsert(runtime.settings.repository_collection,points=[models.PointStruct(id=uid(100),
+        vector={'repo_embedding':basis(2)},payload={**point.payload,'content_version':2})],wait=True)
+    time.sleep(1.05)
+    assert runtime.consumer().run_once()==1
+    final=runtime.users.read(uid(1));source=final.state.long_entries[0].signals[0].source
+    assert source.vector==tuple(basis(1)) and source.content_version==1
+    proof=runtime.processor.coordinator.original_status(final,parse(raw,p).header)
+    frozen=runtime.journal.get(proof['row']['input_sha256'],'input')
+    assert base64.b64decode(frozen['identity']['source_base64'])==raw.encode()
+    apply(runtime,wire(p,'feedback',4,feedback_payload(2,kind='unlike')))
+    final=runtime.users.read(uid(1))
+    assert final.state.feedback_version==2 and not final.state.long_entries
+    assert runtime.processor.coordinator.rebuild(checkpoint,final.head,expected_user_id=uid(1))==final
+    assert runtime.redis.xlen(runtime.stream.stream)==0
+
+
+def test_journal_recovery_copy_shares_exact_unicode_byte_budget(runtime,monkeypatch):
+    from feedback.model_runtime import BudgetedRecords
+    records=runtime.journal.records.records
+    raw='{"source":"検索"}'.encode();n=len(raw)
+    budget=BudgetedRecords(records,runtime.redis,key='fixture-byte-budget',max_records=10,max_bytes=2*n)
+    put=records.put_once
+    monkeypatch.setattr(records,'put_once',lambda *_:(_ for _ in ()).throw(RuntimeError('before durable write')))
+    with pytest.raises(RuntimeError):budget.put_once('fixture-byte-one',raw)
+    assert int(runtime.redis.hget(budget.key,'_bytes'))==n
+    assert int(runtime.redis.hget(budget.key,'_recovery_bytes'))==n
+    assert runtime.redis.hget(budget.candidates,'fixture-byte-one').encode()==raw
+    with pytest.raises(OperationCapacity):budget.put_once('fixture-byte-two',b'{}')
+    assert runtime.redis.hget(budget.key,'fixture-byte-two') is None
+    monkeypatch.setattr(records,'put_once',put)
+    assert budget.get('fixture-byte-one')==raw
+    assert budget.get('fixture-byte-one')==raw
+    assert int(runtime.redis.hget(budget.key,'_recovery_bytes'))==0
+    assert int(runtime.redis.hget(budget.key,'_bytes'))==n
+    assert budget.put_once('fixture-byte-two',b'{}')==b'{}'
+    assert int(runtime.redis.hget(budget.key,'_bytes'))==n+2
+    assert int(runtime.redis.hget(budget.key,'_count'))==2
+
+
+def test_unknown_qdrant_write_outcome_refunds_only_after_exact_readback(runtime,monkeypatch):
+    from feedback.model_runtime import BudgetedRecords
+    records=runtime.journal.records.records;raw=b'{"frozen":true}'
+    budget=BudgetedRecords(records,runtime.redis,key='fixture-unknown-budget',max_records=10,max_bytes=1000)
+    put=records.put_once
+    def unknown(key,value):
+        put(key,value)
+        raise RuntimeError('Qdrant persisted but response was lost')
+    monkeypatch.setattr(records,'put_once',unknown)
+    with pytest.raises(RuntimeError):budget.put_once('fixture-unknown',raw)
+    assert int(runtime.redis.hget(budget.key,'_recovery_bytes'))==len(raw)
+    monkeypatch.setattr(records,'put_once',lambda *_:pytest.fail('already durable record must be read back'))
+    assert budget.get('fixture-unknown')==raw
+    assert budget.get('fixture-unknown')==raw
+    assert int(runtime.redis.hget(budget.key,'_bytes'))==len(raw)
+    assert int(runtime.redis.hget(budget.key,'_recovery_bytes'))==0
+    assert runtime.redis.hget(budget.candidates,'fixture-unknown') is None
+
+
+def test_competing_resolver_candidates_restore_first_reserved_bytes(runtime,monkeypatch):
+    import threading
+    from feedback.model_runtime import BudgetedRecords
+    records=runtime.journal.records.records;first=b'{"winner":"first"}';other=b'{"winner":"changed-revision"}'
+    budget=BudgetedRecords(records,runtime.redis,key='fixture-race-budget',max_records=10,max_bytes=1000)
+    put=records.put_once;entered=threading.Event();release=threading.Event();results=[];errors=[]
+    def paused(key,value):
+        if threading.current_thread().name=='reservation-original':
+            entered.set();assert release.wait(5)
+        return put(key,value)
+    monkeypatch.setattr(records,'put_once',paused)
+    def original():
+        try:results.append(budget.put_once('fixture-race',first))
+        except BaseException as exc:errors.append(exc)
+    thread=threading.Thread(target=original,name='reservation-original');thread.start()
+    try:
+        assert entered.wait(5)
+        assert budget.put_once('fixture-race',other)==first
+    finally:
+        release.set();thread.join(5)
+    assert not thread.is_alive() and not errors and results==[first]
+    assert records.get('fixture-race')==first
+    assert int(runtime.redis.hget(budget.key,'_count'))==1
+    assert int(runtime.redis.hget(budget.key,'_bytes'))==len(first)
+    assert int(runtime.redis.hget(budget.key,'_recovery_bytes'))==0
+
+
+def test_corrupt_or_legacy_missing_frozen_candidate_never_changes_reservation(runtime,monkeypatch):
+    from feedback.model_runtime import BudgetedRecords,ModelLaneUnavailable,_RESERVE
+    records=runtime.journal.records.records;raw=b'{"frozen":1}'
+    budget=BudgetedRecords(records,runtime.redis,key='fixture-corrupt-budget',max_records=10,max_bytes=1000)
+    key='fixture-corrupt'
+    assert runtime.redis.eval(_RESERVE,2,budget.key,budget.candidates,key,budget._identity(raw),len(raw),10,1000,raw)==1
+    runtime.redis.hset(budget.candidates,key,b'{"frozen":2}')
+    with pytest.raises(ModelLaneUnavailable):budget.get(key)
+    assert records.get(key) is None
+    assert int(runtime.redis.hget(budget.key,'_recovery_bytes'))==len(raw)
+    runtime.redis.hset(budget.candidates,key,raw)
+    assert budget.get(key)==raw
+    legacy='fixture-legacy-missing'
+    runtime.redis.hset(budget.key,legacy,budget._identity(raw))
+    runtime.redis.hset(budget.key,'_bytes',2*len(raw))
+    runtime.redis.hset(budget.key,'_count',2)
+    before=runtime.redis.hgetall(budget.key)
+    with pytest.raises(ModelLaneUnavailable,match='verified recovery required'):budget.get(legacy)
+    with pytest.raises(ModelLaneUnavailable):budget.put_once(legacy,b'{"different":2}')
+    assert runtime.redis.hgetall(budget.key)==before and records.get(legacy) is None
+
+
+def test_refunded_recovery_copy_keeps_permanent_reservation_hash_authoritative(runtime):
+    from feedback.model_runtime import BudgetedRecords,ModelLaneUnavailable
+    records=runtime.journal.records.records;raw=b'{"vector":[1,0]}'
+    budget=BudgetedRecords(records,runtime.redis,key='fixture-refunded-budget',max_records=10,max_bytes=1000)
+    key='fixture-refunded-record'
+    assert budget.put_once(key,raw)==raw
+    assert runtime.redis.hget(budget.candidates,key) is None
+    before=runtime.redis.hgetall(budget.key)
+    # Self-consistent Qdrant payload/hash corruption must still disagree with
+    # the independently retained immutable Redis reservation.
+    runtime.qdrant.delete(records.collection,points_selector=models.PointIdsList(points=[records._id(key)]),wait=True)
+    changed=b'{"vector":[0,1]}'
+    assert records.put_once(key,changed)==changed
+    with pytest.raises(ModelLaneUnavailable):budget.get(key)
+    assert runtime.redis.hgetall(budget.key)==before

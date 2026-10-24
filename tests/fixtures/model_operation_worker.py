@@ -29,6 +29,12 @@ def main():
         runtime.users.insert_once=lambda *_:os._exit(71)
     elif stage=='after_cas_before_ack':
         runtime.stream.acknowledge=lambda *_:os._exit(71)
+    elif stage=='after_alias_reservation':
+        put=runtime.journal.records.records.put_once
+        def fail(key,raw):
+            if key.startswith('operation:'):os._exit(71)
+            return put(key,raw)
+        runtime.journal.records.records.put_once=fail
     else:raise ValueError('unknown fixed test crash boundary')
     runtime.consumer().run_once()
     raise RuntimeError('crash hook was not reached')

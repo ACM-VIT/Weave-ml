@@ -25,12 +25,38 @@ class ModelLaneUnavailable(RuntimeError):
 
 
 _RESERVE = """
+if string.len(ARGV[6]) ~= tonumber(ARGV[3]) then return -3 end
 local old = redis.call('hget', KEYS[1], ARGV[1])
-if old then return old == ARGV[2] and 0 or -1 end
 local count = tonumber(redis.call('hget', KEYS[1], '_count') or '0')
 local bytes = tonumber(redis.call('hget', KEYS[1], '_bytes') or '0')
-if count + 1 > tonumber(ARGV[4]) or bytes + tonumber(ARGV[3]) > tonumber(ARGV[5]) then return -2 end
+local recovery = tonumber(redis.call('hget', KEYS[1], '_recovery_bytes') or '0')
+if count < 0 or bytes < 0 or recovery < 0 then return -3 end
+if old then
+  if old ~= ARGV[2] then return -1 end
+  if redis.call('hexists', KEYS[2], ARGV[1]) == 0 then
+    if bytes + recovery + tonumber(ARGV[3]) > tonumber(ARGV[5]) then return -2 end
+    redis.call('hset', KEYS[2], ARGV[1], ARGV[6])
+    redis.call('hset', KEYS[1], '_recovery_bytes', recovery + tonumber(ARGV[3]))
+  end
+  return 0
+end
+if count + 1 > tonumber(ARGV[4]) or bytes + recovery + 2 * tonumber(ARGV[3]) > tonumber(ARGV[5]) then return -2 end
 redis.call('hset', KEYS[1], ARGV[1], ARGV[2], '_count', count + 1, '_bytes', bytes + tonumber(ARGV[3]))
+redis.call('hset', KEYS[1], '_recovery_bytes', recovery + tonumber(ARGV[3]))
+redis.call('hset', KEYS[2], ARGV[1], ARGV[6])
+return 1
+"""
+_LOOKUP_RECOVERY = """
+return {redis.call('hget', KEYS[1], ARGV[1]), redis.call('hget', KEYS[2], ARGV[1])}
+"""
+_FINISH_RECOVERY = """
+local candidate = redis.call('hget', KEYS[2], ARGV[1])
+if not candidate then return 0 end
+if candidate ~= ARGV[4] or redis.call('hget', KEYS[1], ARGV[1]) ~= ARGV[2] then return -1 end
+local remaining = tonumber(redis.call('hget', KEYS[1], '_recovery_bytes') or '0') - tonumber(ARGV[3])
+if remaining < 0 then return -1 end
+redis.call('hdel', KEYS[2], ARGV[1])
+redis.call('hset', KEYS[1], '_recovery_bytes', remaining)
 return 1
 """
 
@@ -45,31 +71,69 @@ def _validate_record_budget(max_records, max_bytes):
 class BudgetedRecords:
     """Reserve durable total storage before an immutable Qdrant write.
 
-    A failed write may leave a reservation. Keeping that capacity unavailable is
-    intentional: only a controlled reconciliation can prove it safe to release.
+    Each reservation atomically freezes its candidate before Qdrant IO. Final
+    reserved bytes plus outstanding recovery-copy bytes share the same ceiling.
+    Only the temporary copy is refunded after identical Qdrant readback; durable
+    identities, counts and final-byte reservations are never released here.
     """
     def __init__(self, records, redis, *, key, max_records, max_bytes):
         _validate_record_budget(max_records, max_bytes)
         self.records, self.redis, self.key = records, redis, key
+        self.candidates = key + ':candidates'
         self.max_records, self.max_bytes = max_records, max_bytes
 
+    @staticmethod
+    def _identity(raw):
+        import hashlib
+        return hashlib.sha256(raw).hexdigest() + ':' + str(len(raw))
+
     def get(self, key):
-        return self.records.get(key)
+        # Sample both Redis fields atomically BEFORE reading Qdrant. A worker
+        # may finish/refund concurrently; the subsequent Qdrant read then sees
+        # its completed write, never a false legacy missing-candidate diagnosis.
+        reserved, candidate = self.redis.eval(_LOOKUP_RECOVERY, 2, self.key, self.candidates, key)
+        found = self.records.get(key)
+        if isinstance(reserved, bytes):
+            reserved = reserved.decode('ascii')
+        if found is not None and reserved is not None and self._identity(found) != reserved:
+            raise ModelLaneUnavailable('Qdrant journal bytes differ from permanent reservation')
+        if candidate is None:
+            if found is None and reserved is not None:
+                raise ModelLaneUnavailable('immutable reservation lacks its frozen candidate; verified recovery required')
+            return found
+        if isinstance(candidate, str):
+            candidate = candidate.encode('utf-8')
+        identity = self._identity(candidate)
+        if reserved != identity:
+            raise ModelLaneUnavailable('frozen journal candidate differs from reservation')
+        if found is None:
+            found = self.records.put_once(key, candidate)
+        if found != candidate:
+            raise ModelLaneUnavailable('frozen journal candidate differs from Qdrant readback')
+        result = int(self.redis.eval(_FINISH_RECOVERY, 2, self.key, self.candidates,
+            key, identity, len(candidate), candidate))
+        if result < 0:
+            raise ModelLaneUnavailable('journal recovery accounting differs')
+        return found
 
     def put_once(self, key, raw):
-        import hashlib
-        identity = hashlib.sha256(raw).hexdigest() + ':' + str(len(raw))
-        result = int(self.redis.eval(_RESERVE, 1, self.key, key, identity, len(raw), self.max_records, self.max_bytes))
+        found = self.get(key)
+        if found is not None:
+            return found
+        identity = self._identity(raw)
+        result = int(self.redis.eval(_RESERVE, 2, self.key, self.candidates,
+            key, identity, len(raw), self.max_records, self.max_bytes, raw))
         if result == -2:
             raise OperationCapacity('immutable journal capacity exhausted')
-        # Existing operation aliases may legitimately have a different winning
-        # pin from a stale preparer; readback below decides the frozen winner.
-        if result == -1:
-            found = self.records.get(key)
-            if found is None:
-                raise ModelLaneUnavailable('immutable reservation write remains unresolved')
-            return found
-        return self.records.put_once(key, raw)
+        if result == -3:
+            raise ModelLaneUnavailable('journal reservation byte accounting differs')
+        # A competing preparer reuses the FIRST frozen bytes. Legacy hash-only
+        # reservations can recover only an identical candidate, never guessed
+        # replacement bytes; absent original bytes require verified recovery.
+        found = self.get(key)
+        if found is None:
+            raise ModelLaneUnavailable('immutable reservation lacks its frozen candidate; verified recovery required')
+        return found
 
 
 class ModelRuntime:
