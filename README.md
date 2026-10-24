@@ -47,8 +47,11 @@ fields set to `None`; string and batch output render that state as
 diagnostic contract does not change canonical V2 serving vectors or their
 versioned Qdrant payloads. Centroid topology is descriptive only and requires
 at least four finite, non-zero vectors across two categories, with matching
-dimensions and complete model, revision, embedding, and feature-spec provenance. Semantic groups, novelty thresholds, and any
-novelty-based admission decision remain unapproved human policy choices.
+dimensions and complete model, revision, embedding, and feature-spec provenance.
+Compatibility ingestion keeps corpus novelty as a diagnostic and applies no
+novelty-based admission rejection or penalty. This path does not produce a
+measured semantic novelty score. Introducing one later would require a separate
+versioned reference set and reviewed semantic definitions and thresholds.
 
 Local development downloads the configured SentenceTransformer on first use.
 The production image instead bakes an immutable model revision and starts with
