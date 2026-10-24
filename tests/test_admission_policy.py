@@ -10,9 +10,39 @@ from contracts.admission import (
     observe_repository_admission,
 )
 from embedding.repository_embedding import RepositoryEmbeddingConfig, build_vector_payload
-from ingestion.corpus import CorpusStore
-from ingestion.pipeline import ingest_repository
+from ingestion.corpus import CorpusStore, dynamic_cluster_discovery
+from ingestion.pipeline import ingest_repository, print_batch_summary
 from main import filter_enriched
+
+
+def _approved_compatibility_repo(repo_id="owner/example"):
+    return {
+        "id": repo_id,
+        "full_name": repo_id,
+        "readme_length": 3000,
+        "readme_to_codebase_ratio": 0.01,
+        "description": "An example project",
+        "languages": ["Python"],
+        "topics": ["api"],
+        "star_count": 100,
+        "pushed_days_ago": 0,
+        "open_issues_count": 0,
+        "fork_count": 1,
+        "extracted_paragraphs": [
+            "Installation, usage examples, API docs, contributing, license, and FAQ."
+        ],
+    }
+
+
+def _topology_node(category, vector):
+    return {
+        "category": category,
+        "vector": vector,
+        "embedding_model": "test-model",
+        "embedding_model_revision": "test-revision",
+        "embedding_version": "test-embedding-v1",
+        "feature_spec_version": "test-features-v1",
+    }
 
 
 @pytest.mark.parametrize(
@@ -63,6 +93,18 @@ def test_shared_observation_across_acquisition_compatibility_and_v2_vector_path(
     assert observation["content_candidate"] == candidate
     assert observation["reason_codes"] == reasons
     assert observation["quality_approval"] == "not_evaluated"
+    assert compatibility.novelty.measurement_status == "unmeasured"
+    assert (
+        compatibility.novelty.final,
+        compatibility.novelty.semantic_penalty,
+        compatibility.novelty.category_penalty,
+        compatibility.novelty.tech_stack_penalty,
+        compatibility.novelty.activity_penalty,
+    ) == (None, None, None, None, None)
+    rendered = str(compatibility)
+    assert "Corpus Novelty Measurement: UNMEASURED" in rendered
+    assert "Aggregate System Novelty Target Index" not in rendered
+    assert "SECURITY/INTEGRITY ANOMALY DETECTED" not in rendered
     # Existing gate divergence is explicit and remains a pending owner choice.
     if repo["star_count"] == 0:
         assert compatibility.decision == "REJECTED"
@@ -134,3 +176,107 @@ def test_real_v2_source_projection_recomputes_from_available_readme(readme):
     if readme is None:
         # V2 defaults absent length to zero; absent README never invents a pass.
         assert observation["reason_codes"] == ["readme_missing"]
+
+
+def test_compatibility_batch_summary_preserves_unmeasured_values(capsys):
+    store = CorpusStore()
+    approved = ingest_repository(_approved_compatibility_repo(), corpus_store=store)
+    rejected_repo = _approved_compatibility_repo("owner/rejected")
+    rejected_repo["star_count"] = 0
+    rejected = ingest_repository(rejected_repo, corpus_store=store)
+
+    assert approved.decision == "APPROVED"
+    assert rejected.decision == "REJECTED"
+    assert store.get_timeline() == [{
+        "growth_index": 1,
+        "repo_id": "owner/example",
+        "novelty_index_point": None,
+    }]
+
+    print_batch_summary([approved, rejected], store.get_timeline())
+    output = capsys.readouterr().out
+    assert "Corpus Novelty Measurements         : UNAVAILABLE" in output
+    assert output.count("No measured novelty values are available.") == 2
+    assert "Registered Novelty Tracking: UNMEASURED" in output
+    assert "owner/rejected" in output
+    assert "Matrix Evaluation Value: UNMEASURED" in output
+    assert "Total Flagged System Anomalies    : 0" in output
+    assert "Novelty Vector Index:" not in output
+
+
+def test_compatibility_placeholders_cannot_produce_topology():
+    store = CorpusStore()
+    for index in range(4):
+        result = ingest_repository(
+            _approved_compatibility_repo(f"owner/example-{index}"),
+            corpus_store=store,
+        )
+        assert result.decision == "APPROVED"
+
+    result = ingest_repository(
+        _approved_compatibility_repo("owner/topology-check"),
+        corpus_store=store,
+        auto_index=False,
+        compute_topology=True,
+    )
+    assert result.topological_metrics == {
+        "current_cluster": "Unavailable",
+        "nearest_cluster": "Unavailable",
+        "distance": None,
+        "measurement_status": "unmeasured",
+        "reason": "Fewer than four valid non-zero repository vectors are available.",
+    }
+    assert "Corpus Cluster Topology Structural Space Vector" not in str(result)
+
+
+@pytest.mark.parametrize(
+    "mutation,reason",
+    [
+        (
+            lambda nodes: nodes[-1].update(embedding_model_revision="other-revision"),
+            "Repository vectors use incompatible model or feature versions.",
+        ),
+        (
+            lambda nodes: nodes[-1].update(vector=[0.0, 1.0, 0.0]),
+            "Repository vectors use incompatible dimensions.",
+        ),
+        (
+            lambda nodes: nodes[-1].pop("embedding_model_revision"),
+            "Repository vector model and version provenance is incomplete.",
+        ),
+        (
+            lambda nodes: nodes[-1].update(vector=[float("nan"), 1.0]),
+            "Fewer than four valid non-zero repository vectors are available.",
+        ),
+    ],
+    ids=["mixed-provenance", "mixed-dimensions", "missing-provenance", "non-finite"],
+)
+def test_topology_rejects_incompatible_vector_contracts(mutation, reason):
+    nodes = [
+        _topology_node("alpha", [1.0, 0.0]),
+        _topology_node("alpha", [2.0, 0.0]),
+        _topology_node("beta", [0.0, 1.0]),
+        _topology_node("beta", [0.0, 2.0]),
+    ]
+    mutation(nodes)
+
+    topology = dynamic_cluster_discovery(nodes)
+    assert topology["measurement_status"] == "unmeasured"
+    assert topology["distance"] is None
+    assert topology["reason"] == reason
+
+
+def test_topology_measures_compatible_synthetic_centroids():
+    topology = dynamic_cluster_discovery([
+        _topology_node("alpha", [1.0, 0.0]),
+        _topology_node("alpha", [2.0, 0.0]),
+        _topology_node("beta", [0.0, 1.0]),
+        _topology_node("beta", [0.0, 2.0]),
+    ])
+
+    assert topology == {
+        "current_cluster": "alpha",
+        "nearest_cluster": "beta",
+        "distance": 1.0,
+        "measurement_status": "measured",
+    }

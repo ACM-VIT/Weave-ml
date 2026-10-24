@@ -39,6 +39,17 @@ handling. ML initialization never creates extensions, tables, columns, or indexe
 README chunking and the opt-in token-aware, section-weighted representation are documented in
 [README embedding aggregation](docs/README_EMBEDDING_AGGREGATION.md), including baseline evaluation and coordinated migration.
 
+Compatibility ingestion in `ingestion/` still stores a 384-dimensional zero
+placeholder instead of comparing repository embeddings. Its `NoveltyMatrix`
+therefore reports `measurement_status="unmeasured"`, with score and penalty
+fields set to `None`; string and batch output render that state as
+`UNMEASURED`. Legacy prefilters remain separate from novelty, and this
+diagnostic contract does not change canonical V2 serving vectors or their
+versioned Qdrant payloads. Centroid topology is descriptive only and requires
+at least four finite, non-zero vectors across two categories, with matching
+dimensions and complete model, revision, embedding, and feature-spec provenance. Semantic groups, novelty thresholds, and any
+novelty-based admission decision remain unapproved human policy choices.
+
 Local development downloads the configured SentenceTransformer on first use.
 The production image instead bakes an immutable model revision and starts with
 Hugging Face/Transformers offline mode enabled; runtime downloads are refused.
