@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+from types import SimpleNamespace
+from unittest.mock import Mock
 import uuid
 
 import pytest
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
+from qdrant_client.http.exceptions import UnexpectedResponse
+
+from config import QDRANT_PAYLOAD_INDEX_SCHEMA, QDRANT_VECTOR_NAME
+from embedding.corpus_revision import CorpusRevisionAuthority
 
 from embedding.qdrant_store import QdrantRepositoryStore
 from embedding.repository_embedding import (
@@ -455,3 +461,115 @@ def test_projected_user_verification_preserves_conflicts_and_retry(writer, field
     fresh = read(USER_ID)
     assert fresh.payload[field] == competing_value
     assert write(fresh, dict(fresh.payload))
+
+
+def _bootstrap_store(monkeypatch):
+    # Local Qdrant does not implement payload-index metadata. Mock only the
+    # server/Redis boundaries while exercising the real bootstrap and fencing.
+    monkeypatch.setenv("CORPUS_AUTHORITY_ENABLED", "false")
+    info = SimpleNamespace(
+        config=SimpleNamespace(params=SimpleNamespace(vectors={
+            QDRANT_VECTOR_NAME: models.VectorParams(
+                size=VECTOR_SIZE, distance=models.Distance.COSINE,
+            ),
+        })),
+        payload_schema={
+            field: SimpleNamespace(data_type=models.PayloadSchemaType(schema))
+            for field, schema in QDRANT_PAYLOAD_INDEX_SCHEMA.items()
+        },
+    )
+    client = Mock()
+    client.collection_exists.return_value = True
+    client.get_collection.return_value = info
+    authority = CorpusRevisionAuthority(
+        None, key="test:bootstrap", scope="bootstrap", managed_boundary_attested=True,
+    )
+    monkeypatch.setattr(authority, "_call", Mock(return_value=["OK"]))
+    store = QdrantRepositoryStore(client=client, corpus_authority=authority)
+    return store, client, info, authority
+
+
+def test_repository_bootstrap_ready_schema_performs_no_mutations(monkeypatch):
+    store, client, _, authority = _bootstrap_store(monkeypatch)
+    store.ensure_collection()
+    store.ensure_collection()
+
+    client.create_collection.assert_not_called()
+    client.create_payload_index.assert_not_called()
+    authority._call.assert_not_called()
+    assert client.get_collection.call_count == 2
+
+
+def test_repository_bootstrap_creates_only_missing_index_and_rechecks(monkeypatch):
+    store, client, info, authority = _bootstrap_store(monkeypatch)
+    del info.payload_schema["repo_id"]
+
+    def provision(**kwargs):
+        info.payload_schema[kwargs["field_name"]] = SimpleNamespace(
+            data_type=kwargs["field_schema"],
+        )
+        return models.UpdateResult(operation_id=1, status=models.UpdateStatus.COMPLETED)
+
+    client.create_payload_index.side_effect = provision
+    store.ensure_collection()
+    store.ensure_collection()
+
+    client.create_collection.assert_not_called()
+    client.create_payload_index.assert_called_once_with(
+        collection_name=store.collection_name, field_name="repo_id",
+        field_schema=models.PayloadSchemaType.KEYWORD, wait=True,
+    )
+    assert client.get_collection.call_count == 4
+    begin, finish = authority._call.call_args_list
+    assert begin.args == ("begin",)
+    assert finish.args == ("finish",)
+    assert begin.kwargs["token"] == finish.kwargs["token"]
+
+
+@pytest.mark.parametrize("incompatible", ["identity", "size", "distance", "payload"])
+def test_repository_bootstrap_rejects_incompatible_schema_before_mutation(monkeypatch, incompatible):
+    store, client, info, authority = _bootstrap_store(monkeypatch)
+    # A missing early field must not be created before a later error is found.
+    del info.payload_schema["repo_id"]
+    vector = info.config.params.vectors[store.vector_name]
+    if incompatible == "identity":
+        info.config.params.vectors.clear()
+    elif incompatible == "size":
+        vector.size = 1
+    elif incompatible == "distance":
+        vector.distance = models.Distance.DOT
+    else:
+        info.payload_schema["pushed_at"].data_type = models.PayloadSchemaType.KEYWORD
+
+    with pytest.raises(ValueError):
+        store.ensure_collection()
+    client.create_collection.assert_not_called()
+    client.create_payload_index.assert_not_called()
+    authority._call.assert_not_called()
+
+
+@pytest.mark.parametrize("outcome", ["valid_winner", "invalid_winner", "server_error"])
+def test_repository_bootstrap_creation_race_preserves_authority_token(monkeypatch, outcome):
+    store, client, info, authority = _bootstrap_store(monkeypatch)
+    client.collection_exists.return_value = False
+    if outcome == "invalid_winner":
+        info.config.params.vectors[store.vector_name].size = 1
+
+    def concurrent_create(**kwargs):
+        assert [call.args[0] for call in authority._call.call_args_list] == ["begin"]
+        raise UnexpectedResponse(500 if outcome == "server_error" else 409, "conflict", b"", {})
+
+    client.create_collection.side_effect = concurrent_create
+    if outcome == "valid_winner":
+        store.ensure_collection()
+        begin, finish = authority._call.call_args_list
+        assert finish.args == ("finish",)
+        assert begin.kwargs["token"] == finish.kwargs["token"]
+        assert client.get_collection.call_count == 2
+    else:
+        with pytest.raises(UnexpectedResponse if outcome == "server_error" else ValueError):
+            store.ensure_collection()
+        # Unverified completion must retain the writer token; no finish call.
+        assert [call.args[0] for call in authority._call.call_args_list] == ["begin"]
+    client.create_collection.assert_called_once()
+    client.create_payload_index.assert_not_called()
