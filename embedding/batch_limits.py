@@ -1,6 +1,8 @@
 """Bound structured offline inputs before copying or serializing their text."""
 
 from collections.abc import Mapping
+from datetime import date, datetime
+import math
 from typing import Any
 
 
@@ -33,8 +35,18 @@ def check_field_budget(values: list[Any], *, max_bytes: int, label: str) -> None
             for item in value:
                 measure(item, depth + 1)
                 remaining -= 1
+        elif value is None or type(value) in (bool, date, datetime):
+            remaining -= 32
+        elif type(value) is int:
+            if value.bit_length() > 64:
+                raise ValueError(f"{label} integer exceeds the 64-bit scalar budget")
+            remaining -= 32
+        elif type(value) is float and math.isfinite(value):
+            remaining -= 32
         else:
-            remaining -= 32  # bounded primitive/metadata allowance
+            # Bytes and arbitrary objects can expand without bound when tower
+            # preparation calls str(). Reject them before making any copies.
+            raise TypeError(f"{label} contains an unsupported scalar type")
         if remaining < 0:
             raise ValueError(f"{label} exceeds the {max_bytes} byte field budget")
 

@@ -6,6 +6,7 @@ import json
 import logging
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from copy import deepcopy
 from itertools import islice
 from typing import Any
 
@@ -124,6 +125,10 @@ class RepositoryEmbeddingPipeline:
         self, source: Any, *, deadline: float | None = None, max_texts: int | None = None,
     ) -> _EmbeddingPlan:
         repo = coerce_payload(source)
+        if max_texts is not None:
+            # Lazy callers may reuse nested lists/dicts on the next yield.
+            # Keep each bounded offline plan's payload tied to its tower text.
+            repo = deepcopy(repo)
         repo_id, full_name = resolve_repository_identity(repo)
         repo["repo_id"] = repo_id
         repo["full_name"] = full_name
@@ -296,7 +301,12 @@ class RepositoryEmbeddingPipeline:
         source_iterator = iter(sources)
         while True:
             plans = []
-            for source in islice(source_iterator, MAX_OFFLINE_REPOSITORIES):
+            for _ in range(MAX_OFFLINE_REPOSITORIES):
+                check_deadline()
+                try:
+                    source = next(source_iterator)
+                except StopIteration:
+                    break
                 check_deadline()
                 _validate_offline_source(source)
                 plan = self._prepare_repository(source, max_texts=MAX_OFFLINE_REPOSITORY_TEXTS)
