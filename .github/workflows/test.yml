@@ -193,3 +193,61 @@ jobs:
       with:
         name: benchmark-results
         path: .benchmarks/
+
+    # Only trusted main pushes can populate the release cache or publish images.
+    # BuildKit also hashes individual COPY/RUN inputs; source-only changes retain
+    # the locked dependency, pinned model and trust-store layers (mode=max).
+    - name: Set up release builder
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+    - name: Prepare exact committed build context
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/release-context"
+        git archive --format=tar "${{ github.sha }}" | tar -xf - -C "$RUNNER_TEMP/release-context"
+
+    - name: Build verified release image
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+      with:
+        context: ${{ runner.temp }}/release-context
+        platforms: linux/amd64
+        load: true
+        tags: gh-social-ml:${{ github.sha }}
+        build-args: ML_RELEASE_ID=${{ github.sha }}
+        cache-from: type=gha,scope=release-main-amd64-${{ hashFiles('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock') }}
+        cache-to: type=gha,mode=max,ignore-error=true,scope=release-main-amd64-${{ hashFiles('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock') }}
+
+    - name: Bind release archive to verified source and immutable image digest
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: |
+        set -euo pipefail
+        docker save gh-social-ml:${{ github.sha }} | gzip > gh-social-ml.tar.gz
+        python scripts/release_artifact.py create --sha "${{ github.sha }}"
+        docker image inspect --format '{{.Size}}' gh-social-ml:${{ github.sha }} > deployment.image-size
+        sha256sum gh-social-ml.tar.gz deployment.image-size deployment.image-id deployment.release.json \
+          deploy/systemd/gh-social-ml.service deploy/systemd/gh-social-ml-feedback.service \
+          scripts/validate_production_config.py scripts/production_smoke.py > deployment.sha256
+
+    - name: Publish verified release archive
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: release-${{ github.sha }}-${{ github.run_attempt }}
+        if-no-files-found: error
+        retention-days: 3
+        compression-level: 0
+        path: |
+          gh-social-ml.tar.gz
+          deployment.image-size
+          deployment.image-id
+          deployment.release.json
+          deployment.sha256
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/deploy.yml
+    secrets: inherit
