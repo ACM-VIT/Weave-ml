@@ -237,6 +237,38 @@ def test_legacy_status_stays_read_only_and_is_indexed_on_its_next_commit():
     assert f.coordinator.rebuild(checkpoint,f.users.snapshot.head,expected_user_id=uid(1))==f.users.snapshot
 
 
+def test_raised_history_horizon_can_verify_retained_operations_before_the_index():
+    f=status_history(100,legacy_until=100)
+    f.journal.limits=replace(f.journal.limits,history_operations=10);f.append()
+    frontier=f.journal.get(f.users.snapshot.head,'prepare')['status_index']
+    assert frontier['first_version']==91
+    f.journal.limits=replace(f.journal.limits,history_operations=100)
+    for advance in (False,True):
+        if advance:f.append()
+        before=f.records.writes
+        proof=f.coordinator.original_status(f.users.snapshot,f.headers[50])
+        assert proof['status']=='applied' and proof['operation_head']==f.snapshots[50].head
+        assert f.records.writes==before,'an expanded horizon must not turn status into a backfill writer'
+
+
+def test_user_point_adapter_stops_initialization_guards_after_cancelled_dependencies(monkeypatch):
+    from utils.deadline import RequestDeadline,deadline_scope,CooperativeDeadlineExceeded
+    p=policy();guards=[];reads=[];deadline=RequestDeadline(10)
+    def missing(**kwargs):reads.append(kwargs);deadline.cancel();return []
+    users=QdrantAtomicUsers(SimpleNamespace(retrieve=missing),None,None,collection='cancelled-user-read',
+        combined_user_bytes=1048576,policy=p,refuse_missing=lambda owner:guards.append(owner))
+    with deadline_scope(deadline),pytest.raises(CooperativeDeadlineExceeded):users.read_optional(uid(1))
+    assert len(reads)==1 and not guards
+    point,users,p,_=serving_point_fixture(0);deadline=RequestDeadline(10)
+    users.client=SimpleNamespace(retrieve=lambda **kwargs:[point]);users.ensure_initialized=lambda owner:guards.append(owner)
+    original=users.journal.records.get;head_reads=[]
+    def last_head_read(key):
+        result=original(key);head_reads.append(key);deadline.cancel();return result
+    monkeypatch.setattr(users.journal.records,'get',last_head_read)
+    with deadline_scope(deadline),pytest.raises(CooperativeDeadlineExceeded):users.read_optional(uid(1))
+    assert len(head_reads)==1 and not guards
+
+
 def test_indexed_status_refuses_missing_corrupt_foreign_and_uncommitted_proofs(monkeypatch):
     from feedback.model_journal import JournalMissing,CasConflict,OriginalIdentityConflict,HistoryBudget
     from utils.deadline import RequestDeadline,deadline_scope,CooperativeDeadlineExceeded

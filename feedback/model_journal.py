@@ -437,11 +437,15 @@ class Coordinator:
             if version<operation_version:raise reducer.OperationGap('requested original operation is not applied')
             if head==snapshot.head and 'status_index' in row:
                 index=_StatusIndex(self.journal,snapshot.user_id,self.policy.sha256)
-                indexed_head=index.lookup(row['status_index'],version-1,operation_version)
-                indexed=self.journal.get(indexed_head,'prepare')
-                if indexed.get('user_id')!=snapshot.user_id or indexed.get('operation_version')!=operation_version:
-                    raise JournalConflict('indexed committed operation differs')
-                return result(indexed_head,indexed)
+                frontier=index.validate(row['status_index'],version-1)
+                if operation_version>=frontier['first_version']:
+                    indexed_head=index.lookup(frontier,version-1,operation_version)
+                    indexed=self.journal.get(indexed_head,'prepare')
+                    if indexed.get('user_id')!=snapshot.user_id or indexed.get('operation_version')!=operation_version:
+                        raise JournalConflict('indexed committed operation differs')
+                    return result(indexed_head,indexed)
+                # A raised proof horizon can expose retained history predating
+                # an earlier conversion. Verify its original chain read-only.
             head,expected,version=row['previous_head'],row['previous_state_sha256'],version-1
         raise HistoryBudget('bounded original-operation proof exhausted')
 
@@ -780,6 +784,7 @@ class QdrantAtomicUsers:
     def read_optional(self, user_id):
         check_deadline()
         rows = self.client.retrieve(collection_name=self.collection, ids=[_uuid(user_id)], with_payload=True, with_vectors=True)
+        check_deadline()
         if not rows:
             if self.refuse_missing is not None:
                 self.refuse_missing(user_id)
@@ -831,6 +836,7 @@ class QdrantAtomicUsers:
         if not isinstance(state, reducer.BootstrapState) and self.ensure_initialized is not None:
             # Negative guard must become durable before a basis is observable
             # as ready, not only before the first worker ACK.
+            check_deadline()
             self.ensure_initialized(user_id)
         return _DecodedPoint(snapshot,state_digest,base_view,body['legacy']['payload'])
     def insert_once(self, desired):
