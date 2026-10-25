@@ -108,6 +108,9 @@ class BudgetedRecords:
             raise ModelLaneUnavailable('frozen journal candidate differs from reservation')
         if found is None:
             found = self.records.put_once(key, candidate)
+        return self._finish_candidate(key, candidate, identity, found)
+
+    def _finish_candidate(self, key, candidate, identity, found):
         if found != candidate:
             raise ModelLaneUnavailable('frozen journal candidate differs from Qdrant readback')
         result = int(self.redis.eval(_FINISH_RECOVERY, 2, self.key, self.candidates,
@@ -127,6 +130,12 @@ class BudgetedRecords:
             raise OperationCapacity('immutable journal capacity exhausted')
         if result == -3:
             raise ModelLaneUnavailable('journal reservation byte accounting differs')
+        if result == 1:
+            # This exact candidate was just frozen atomically. The insert-only
+            # adapter still reads back the durable winner; another recovery
+            # lookup/probe cannot add authority on this uncontended path.
+            found = self.records.put_once(key, raw)
+            return self._finish_candidate(key, raw, identity, found)
         # A competing preparer reuses the FIRST frozen bytes. Legacy hash-only
         # reservations can recover only an identical candidate, never guessed
         # replacement bytes; absent original bytes require verified recovery.
