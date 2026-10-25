@@ -29,6 +29,70 @@ REPO_ID = "00000000-0000-4000-8000-000000000001"
 OTHER_REPO_ID = "00000000-0000-4000-8000-000000000002"
 
 
+def test_offline_lookahead_snapshots_mutable_topics():
+    import hashlib
+    from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
+
+    class Encoder:
+        def embed_texts(self, texts):
+            vectors = []
+            for text in texts:
+                vector = [0.0] * REPOSITORY_EMBEDDING_DIM
+                vector[int.from_bytes(hashlib.sha256(text.encode()).digest()[:2]) % len(vector)] = 1.0
+                vectors.append(vector)
+            return vectors
+
+    pipeline = RepositoryEmbeddingPipeline(embedder=Encoder())
+    sources = [
+        {"repo_id": REPO_ID, "full_name": "owner/first", "topics": ["search"]},
+        {"repo_id": OTHER_REPO_ID, "full_name": "owner/second", "topics": ["storage"]},
+    ]
+    expected = [pipeline.embed_repository(source) for source in sources]
+    shared_topics = []
+
+    def reused_rows():
+        for source in sources:
+            shared_topics[:] = source["topics"]
+            yield {**source, "topics": shared_topics}
+
+    actual = list(pipeline.iter_embed(reused_rows()))
+    assert [result.payload["topics"] for result in actual] == [["search"], ["storage"]]
+    assert [result.source_hash for result in actual] == [result.source_hash for result in expected]
+    assert [result.final_embedding for result in actual] == [result.final_embedding for result in expected]
+
+
+@pytest.mark.parametrize(
+    "value", [b"x" * 1_100_000, bytearray(b"large"), object(), 1 << 10000],
+    ids=["large-bytes", "bytearray", "object", "large-integer"],
+)
+def test_offline_budget_rejects_unbounded_values_before_preparing_text(value, monkeypatch):
+    from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
+
+    pipeline = RepositoryEmbeddingPipeline()
+    monkeypatch.setattr(pipeline, "_prepare_repository", lambda *args, **kwargs: pytest.fail("prepared rejected source"))
+    with pytest.raises((TypeError, ValueError), match="scalar"):
+        next(pipeline.iter_embed([{
+            "repo_id": REPO_ID, "full_name": "owner/repo", "extracted_paragraphs": [value],
+        }]))
+
+
+def test_cancelled_offline_job_does_not_advance_lazy_source():
+    from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
+    from utils.deadline import CooperativeDeadlineExceeded, RequestDeadline, deadline_scope
+
+    fetched = []
+
+    def sources():
+        fetched.append(True)
+        yield {"repo_id": REPO_ID, "full_name": "owner/repo"}
+
+    deadline = RequestDeadline(30)
+    deadline.cancel()
+    with deadline_scope(deadline), pytest.raises(CooperativeDeadlineExceeded):
+        next(RepositoryEmbeddingPipeline().iter_embed(sources()))
+    assert fetched == []
+
+
 def test_repository_collection_contract_matches_central_config():
     assert REPOSITORY_COLLECTION_CONTRACT.collection_name == QDRANT_COLLECTION_NAME
     assert REPOSITORY_COLLECTION_CONTRACT.vector_name == QDRANT_VECTOR_NAME

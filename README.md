@@ -256,6 +256,38 @@ replace the runtime model/cache rather than mutating them in place. Bump
 `TOWER_PREPROCESSING_VERSION` when changing tower projection/chunk/aggregation
 semantics. Direct pipelines without a supplied model-owned cache stay uncached.
 
+Offline corpus helpers support `pipeline.iter_embed(sources)` and
+`pipeline.iter_index(sources)` (also exported as `iter_embed_repositories` and
+`iter_index_repositories`). Pass a lazy source iterator and consume results
+without collecting them to retain bounded memory. `embed_batch`/`index_batch`
+and their existing convenience functions still return lists and deliberately
+retain the requested output. Iterator execution begins on first advancement.
+
+Offline lookahead is eight repositories. Each source has a 1 MiB UTF-8 field
+budget (including README fields on enrichment objects, nesting at most 64), and
+at most 2,048 prepared encoder inputs. Oversized sources fail explicitly; split
+or prevalidate offline inputs instead of silently truncating a reserved vector
+identity. Encoder groups independently cap eight texts, 2,048 padded tokens and
+256 KiB of UTF-8 text, with the original per-input tokenizer truncation. Groups
+can cross repository boundaries; tower composition, ordering, summary/source
+identity and cache ownership remain repository-local. Floating-point encoder
+batch effects should be qualified against the intended frozen model before a
+corpus migration; aggregation itself is unchanged.
+
+`store.iter_upsert(results, max_points=64, max_request_bytes=1048576)` streams
+acknowledged results. Limits count the exact Qdrant REST JSON serialization,
+including UTF-8 payloads and the request envelope; a point larger than its byte
+budget fails before its request. Every chunk retains corpus-authority fencing,
+eligibility validation and synchronous writes. `iter_index` uses eight-point
+chunks and yields each acknowledged write before admitting another window.
+There is no producer queue. Exceptions and interruption stop new work; completed
+chunks remain committed, while an ambiguous write is not yielded. Checkpoint
+repository IDs only after consuming acknowledged results, or replay the input
+using deterministic point IDs after a failure. Acknowledgement is at least once,
+not a transaction over the corpus. These are offline helper APIs; online
+canonical content writes continue to require per-repository content CAS. No
+production reindex or deployment is performed by adopting these helpers.
+
 Numeric boundary correction (#148): `trend_velocity` is a growth-only [0, 1]
 feature. Nonpositive weighted growth maps to zero; signed raw deltas remain
 unchanged, so declining and missing observations remain distinguishable in the

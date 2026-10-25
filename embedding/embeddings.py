@@ -12,6 +12,7 @@ import numpy as np
 
 from config import README_CHUNK_CHARS, README_CHUNK_OVERLAP_CHARS, REPOSITORY_EMBEDDING_MODEL
 from .vector_contract import validate_embedding_vector
+from utils.deadline import check_deadline
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 Vector = list[float]
 MAX_ENCODER_BATCH_TEXTS = 8
 MAX_ENCODER_BATCH_TOKENS = 2048
+MAX_ENCODER_BATCH_BYTES = 256 * 1024
 
 
 @dataclass(slots=True)
@@ -80,8 +82,23 @@ class SentenceTransformerEmbedder:
             MAX_ENCODER_BATCH_TEXTS, MAX_ENCODER_BATCH_TOKENS // sequence_limit
         )
         result: list[Vector] = []
-        for start in range(0, len(texts), group_size):
-            group = list(texts[start:start + group_size])
+        start = 0
+        while start < len(texts):
+            check_deadline()
+            group = []
+            byte_count = 0
+            for text in texts[start:start + group_size]:
+                if not isinstance(text, str):
+                    raise TypeError("encoder inputs must be strings")
+                if len(text) > MAX_ENCODER_BATCH_BYTES:
+                    raise ValueError("encoder input exceeds the 256 KiB text budget")
+                size = len(text.encode("utf-8"))
+                if size > MAX_ENCODER_BATCH_BYTES:
+                    raise ValueError("encoder input exceeds the 256 KiB text budget")
+                if byte_count + size > MAX_ENCODER_BATCH_BYTES:
+                    break
+                group.append(text)
+                byte_count += size
             vectors = model.encode(
                 group,
                 convert_to_numpy=True,
@@ -91,6 +108,7 @@ class SentenceTransformerEmbedder:
             if len(vectors) != len(group):
                 raise ValueError("encoder must return exactly one vector per input")
             result.extend(np.asarray(vector, dtype=np.float32).tolist() for vector in vectors)
+            start += len(group)
         return result
 
     def embed_text(self, text: str, *, normalize: bool = True) -> Vector:
@@ -104,8 +122,13 @@ def chunk_text(
     *,
     max_chars: int = README_CHUNK_CHARS,
     overlap_chars: int = README_CHUNK_OVERLAP_CHARS,
+    max_chunks: int | None = None,
 ) -> list[TextChunk]:
     """Split text into overlapping chunks suitable for README embeddings."""
+    if max_chunks is not None and (
+        isinstance(max_chunks, bool) or not isinstance(max_chunks, Integral) or max_chunks <= 0
+    ):
+        raise ValueError("max_chunks must be a positive integer or None")
     if max_chars <= 0:
         raise ValueError("max_chars must be greater than 0")
     if overlap_chars < 0:
@@ -129,6 +152,8 @@ def chunk_text(
         end = _best_chunk_boundary(clean, start, hard_end)
         chunk = clean[start:end].strip()
         if chunk:
+            if max_chunks is not None and len(chunks) >= max_chunks:
+                raise ValueError("offline repository exceeds its encoder input budget")
             chunks.append(TextChunk(text=chunk, index=index, start_char=start, end_char=end))
             index += 1
         if end >= len(clean):

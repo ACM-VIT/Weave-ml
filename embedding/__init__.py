@@ -1,4 +1,7 @@
-from .embedding_pipeline import RepositoryEmbeddingPipeline, embed_repositories, index_repositories
+from .embedding_pipeline import (
+    RepositoryEmbeddingPipeline, embed_repositories, index_repositories,
+    iter_embed_repositories, iter_index_repositories,
+)
 from .repository_embedding import RepositoryEmbeddingConfig, RepositoryEmbeddingResult
 from .qdrant_store import QdrantRepositoryStore
 from .user_profile_store import QdrantUserProfileStore
@@ -26,6 +29,8 @@ __all__ = [
     "QdrantUserProfileStore",
     "embed_repositories",
     "index_repositories",
+    "iter_embed_repositories",
+    "iter_index_repositories",
     "VectorCollectionContract",
     "canonical_backend_uuid",
     "REPOSITORY_COLLECTION_CONTRACT",

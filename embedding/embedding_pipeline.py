@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass
+from copy import deepcopy
+from itertools import islice
 from typing import Any
+
+from utils.deadline import check_deadline
 
 from config import TOKEN_SECTION_EMBEDDING_VERSION, ZERO_RECENCY_EMBEDDING_VERSION
 from summarization.contracts import CardSummaryArtifact
 from summarization.pipeline import CardSummaryPipeline
 
+from .batch_limits import check_field_budget
 from .embeddings import SentenceTransformerEmbedder, aggregate_vectors, chunk_text
 from .qdrant_store import QdrantRepositoryStore
 from .readme_embedding import README_STRATEGY_VERSION, prepare_readme_chunks, readme_source
@@ -29,6 +35,53 @@ from .tower_cache import TowerEmbeddingCache
 from .vector_contract import resolve_repository_identity, validate_embedding_vector
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _EmbeddingPlan:
+    repo: dict[str, Any]
+    repo_id: str
+    legacy_readme: bool
+    readme_text: str
+    metadata_text: str
+    topic_text: str
+    readme_chunks: list
+    readme_weights: list[float] | None
+    card_summary: CardSummaryArtifact
+    cache: TowerEmbeddingCache | None
+    fingerprints: dict
+    vectors: dict
+    missing: list[str]
+    inputs: dict[str, list[str]]
+
+    @property
+    def texts(self) -> list[str]:
+        return [text for tower in self.missing for text in self.inputs[tower]]
+
+
+# Bounds apply to the offline iterator, without changing online admission.
+MAX_OFFLINE_REPOSITORIES = 8
+MAX_OFFLINE_SOURCE_BYTES = 1024 * 1024
+MAX_OFFLINE_REPOSITORY_TEXTS = 2048
+
+
+def _validate_offline_source(source: Any) -> None:
+    """Reject oversized inputs without truncating their embedding identity.
+
+    Walk fields without building a JSON copy. EnrichmentResult README fields
+    live outside its payload and count against the same repository budget.
+    """
+    payload = source if isinstance(source, Mapping) else getattr(source, "payload", None)
+    if not isinstance(payload, Mapping):
+        raise TypeError("repository source must be a payload dict or an object with a payload dict")
+    values = [payload]
+    readme = getattr(source, "readme", None)
+    if readme is not None:
+        values.extend(getattr(readme, field, None) for field in (
+            "raw_markdown", "readme_md", "clean_text",
+        ))
+
+    check_field_budget(values, max_bytes=MAX_OFFLINE_SOURCE_BYTES, label="offline repository")
 
 
 class RepositoryEmbeddingPipeline:
@@ -63,7 +116,19 @@ class RepositoryEmbeddingPipeline:
 
     def embed_repository(self, source: Any, deadline: float | None = None) -> RepositoryEmbeddingResult:
         """Embed one approved repository payload or EnrichmentResult."""
+        plan = self._prepare_repository(source, deadline=deadline)
+        texts = plan.texts
+        encoded = self.embedder.embed_texts(texts) if texts else []
+        return self._finish_repository(plan, encoded)
+
+    def _prepare_repository(
+        self, source: Any, *, deadline: float | None = None, max_texts: int | None = None,
+    ) -> _EmbeddingPlan:
         repo = coerce_payload(source)
+        if max_texts is not None:
+            # Lazy callers may reuse nested lists/dicts on the next yield.
+            # Keep each bounded offline plan's payload tied to its tower text.
+            repo = deepcopy(repo)
         repo_id, full_name = resolve_repository_identity(repo)
         repo["repo_id"] = repo_id
         repo["full_name"] = full_name
@@ -90,6 +155,7 @@ class RepositoryEmbeddingPipeline:
                 readme_text,
                 max_chars=self.config.readme_chunk_chars,
                 overlap_chars=self.config.readme_chunk_overlap_chars,
+                max_chunks=max_texts - 2 if max_texts is not None else None,
             )
         else:
             model = self.embedder.model
@@ -132,9 +198,21 @@ class RepositoryEmbeddingPipeline:
             else:
                 vectors[tower] = vector
 
-        # Fill the same bounded encoder groups with only the missing towers.
-        texts_to_encode = [text for tower in missing for text in inputs[tower]]
-        encoded = self.embedder.embed_texts(texts_to_encode) if texts_to_encode else []
+        return _EmbeddingPlan(
+            repo, repo_id, legacy_readme, readme_text, metadata_text, topic_text,
+            readme_chunks, readme_weights, card_summary, cache, fingerprints,
+            vectors, missing, inputs,
+        )
+
+    def _finish_repository(self, plan: _EmbeddingPlan, encoded: list) -> RepositoryEmbeddingResult:
+        repo, repo_id = plan.repo, plan.repo_id
+        legacy_readme, readme_text = plan.legacy_readme, plan.readme_text
+        metadata_text, topic_text = plan.metadata_text, plan.topic_text
+        readme_chunks, readme_weights = plan.readme_chunks, plan.readme_weights
+        card_summary, cache = plan.card_summary, plan.cache
+        fingerprints, vectors, missing = plan.fingerprints, plan.vectors, plan.missing
+        inputs = plan.inputs
+        texts_to_encode = plan.texts
         if len(encoded) != len(texts_to_encode):
             raise ValueError("encoder must return exactly one vector per tower input")
         offset = 0
@@ -212,20 +290,74 @@ class RepositoryEmbeddingPipeline:
             card_summary=card_summary,
         )
 
-    def embed_batch(self, sources: Iterable[Any]) -> list[RepositoryEmbeddingResult]:
-        """Embed multiple approved repositories."""
-        return [self.embed_repository(source) for source in sources]
+    def iter_embed(self, sources: Iterable[Any]) -> Iterator[RepositoryEmbeddingResult]:
+        """Embed an ordered, bounded window with cross-repository encoder groups.
 
-    def index_batch(self, sources: Iterable[Any]) -> list[RepositoryEmbeddingResult]:
-        """Embed repositories and upsert them to Qdrant."""
-        # The below lazy store initialization is for allowing embedding-only
-        # callers to run without a Qdrant instance.
+        No background producer is started. At most eight source plans and their
+        bounded texts/vectors are retained; advancing the consumer admits the
+        next window. A failure aborts this window and leaves earlier results
+        available to a caller that checkpoints completed repository IDs.
+        """
+        source_iterator = iter(sources)
+        while True:
+            plans = []
+            for _ in range(MAX_OFFLINE_REPOSITORIES):
+                check_deadline()
+                try:
+                    source = next(source_iterator)
+                except StopIteration:
+                    break
+                check_deadline()
+                _validate_offline_source(source)
+                plan = self._prepare_repository(source, max_texts=MAX_OFFLINE_REPOSITORY_TEXTS)
+                if sum(len(texts) for texts in plan.inputs.values()) > MAX_OFFLINE_REPOSITORY_TEXTS:
+                    raise ValueError("offline repository exceeds the 2048 encoder input budget")
+                plans.append(plan)
+            if not plans:
+                return
+            texts = [text for plan in plans for text in plan.texts]
+            encoded = self.embedder.embed_texts(texts) if texts else []
+            if len(encoded) != len(texts):
+                raise ValueError("encoder must return exactly one vector per tower input")
+            offset = 0
+            for plan in plans:
+                check_deadline()
+                count = len(plan.texts)
+                yield self._finish_repository(plan, encoded[offset:offset + count])
+                offset += count
+            # Release the completed window before pulling the next one.
+            del plans, texts, encoded, plan, source
+
+    def embed_batch(self, sources: Iterable[Any]) -> list[RepositoryEmbeddingResult]:
+        """Materialized compatibility API; use iter_embed for bounded memory."""
+        return list(self.iter_embed(sources))
+
+    def iter_index(self, sources: Iterable[Any]) -> Iterator[RepositoryEmbeddingResult]:
+        """Yield only stored results, with backpressure and bounded writes.
+
+        A failed/ambiguous write propagates. Completed chunks remain stored;
+        deterministic point IDs make an offline rerun safe. This helper must
+        not be used for online canonical writes, which require content CAS.
+        """
         if self.store is None:
             self.store = QdrantRepositoryStore(vector_size=self.config.embedding_dim)
         self.store.ensure_collection()
-        results = self.embed_batch(sources)
-        self.store.upsert(results)
-        return results
+        results = iter(self.iter_embed(sources))
+        while chunk := list(islice(results, MAX_OFFLINE_REPOSITORIES)):
+            check_deadline()
+            # Drain byte-split writes before resuming the embedding iterator:
+            # otherwise its next window can be prepared while the last small
+            # chunk of this window is still waiting for a write.
+            if isinstance(self.store, QdrantRepositoryStore):
+                yield from self.store.iter_upsert(chunk, max_points=MAX_OFFLINE_REPOSITORIES)
+            else:
+                # Preserve injected stores implementing the existing protocol.
+                self.store.upsert(chunk)
+                yield from chunk
+
+    def index_batch(self, sources: Iterable[Any]) -> list[RepositoryEmbeddingResult]:
+        """Materialized compatibility API; use iter_index for large corpora."""
+        return list(self.iter_index(sources))
 
     def search(self, query: str, *, limit: int = 5, exact: bool = True) -> list[dict]:
         """Embed a text query and search the configured Qdrant collection."""
@@ -262,3 +394,17 @@ def index_repositories(
     """Convenience function for embedding and storing repositories in Qdrant."""
     active_pipeline = pipeline or RepositoryEmbeddingPipeline()
     return active_pipeline.index_batch(sources)
+
+
+def iter_embed_repositories(
+    sources: Iterable[Any], *, pipeline: RepositoryEmbeddingPipeline | None = None,
+) -> Iterator[RepositoryEmbeddingResult]:
+    """Stream repository embeddings with bounded lookahead."""
+    yield from (pipeline or RepositoryEmbeddingPipeline()).iter_embed(sources)
+
+
+def iter_index_repositories(
+    sources: Iterable[Any], *, pipeline: RepositoryEmbeddingPipeline | None = None,
+) -> Iterator[RepositoryEmbeddingResult]:
+    """Stream acknowledged offline indexing progress."""
+    yield from (pipeline or RepositoryEmbeddingPipeline()).iter_index(sources)
