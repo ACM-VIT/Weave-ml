@@ -130,6 +130,16 @@ the image. This idempotently creates or validates both collections and waits
 for every required repository payload index; incompatible index types fail the
 deployment before traffic moves.
 
+Repository bootstrap inspects live collection metadata on every call. A fully
+indexed collection receives no payload-index creation requests; only missing
+fields are provisioned with synchronous writes and a final metadata check.
+Existing incompatible field types require an explicit migration and are never
+deleted or recreated automatically. `QdrantRepositoryStore.validate_collection()`
+is the read-only path and now requires the complete repository index contract.
+Run bootstrap explicitly before using that path against a legacy collection.
+Provisioning still uses the configured corpus-authority mutation fences;
+interrupted or unconfirmed writes require the existing recovery procedure.
+
 The image bakes
 `sentence-transformers/all-MiniLM-L6-v2` at immutable revision
 `c9745ed1d9f207416be6d2e6f8de32d1f16199bf`. Production sets Hugging Face and

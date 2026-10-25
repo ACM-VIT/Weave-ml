@@ -96,27 +96,51 @@ class QdrantRepositoryStore:
         # The below check is for safe startup: existing collections are
         # validated instead of recreated, so stored vectors are not dropped.
         if not self._collection_exists():
-            distance = self._distance()
-            self._mutate(lambda: self.client.create_collection(
-                collection_name=self.collection_name,
-                vectors_config={
-                    self.vector_name: self.models.VectorParams(
-                        size=self.vector_size,
-                        distance=distance,
-                    )
-                },
-            ), synchronous_boolean=True)
-            logger.info("Created Qdrant collection: %s", self.collection_name)
-        self._validate_collection()
+            def create():
+                from qdrant_client.http.exceptions import UnexpectedResponse
 
-        for field_name in QDRANT_PAYLOAD_INDEX_FIELDS:
+                try:
+                    return self.client.create_collection(
+                        collection_name=self.collection_name,
+                        vectors_config={
+                            self.vector_name: self.models.VectorParams(
+                                size=self.vector_size,
+                                distance=self._distance(),
+                            )
+                        },
+                    )
+                except UnexpectedResponse as exc:
+                    if exc.status_code != 409:
+                        raise
+                    # A concurrent creator won. Only an explicit conflict is
+                    # known not to have dispatched our creation; lost replies
+                    # and other errors still retain the authority writer token.
+                    self._validate_collection()
+                    return True
+            self._mutate(create, synchronous_boolean=True)
+        info = self._validate_collection()
+        missing = self._missing_payload_indexes(info)
+        for field_name in missing:
+            # Another bootstrap may have provisioned this field, or an admin
+            # may have replaced the collection since the initial inspection.
+            current_missing = self._missing_payload_indexes(self._validate_collection())
+            if field_name not in current_missing:
+                continue
             self._create_payload_index(field_name)
+        if missing:
+            remaining = self._missing_payload_indexes(self._validate_collection())
+            if remaining:
+                raise RuntimeError(
+                    f"Qdrant payload indexes are missing after provisioning: {remaining}"
+                )
 
     def validate_collection(self) -> None:
         """Validate the configured collection without creating indexes."""
         if not self._collection_exists():
             raise ValueError(f"Qdrant collection {self.collection_name!r} does not exist.")
-        self._validate_collection()
+        missing = self._missing_payload_indexes(self._validate_collection())
+        if missing:
+            raise ValueError(f"Qdrant payload indexes are missing: {missing}")
 
     def upsert(self, results: Iterable[RepositoryEmbeddingResult]) -> None:
         """Upsert embedding results into Qdrant."""
@@ -573,10 +597,14 @@ class QdrantRepositoryStore:
         try:
             self.client.get_collection(self.collection_name)
             return True
-        except Exception:
-            return False
+        except Exception as exc:
+            from qdrant_client.http.exceptions import UnexpectedResponse
 
-    def _validate_collection(self) -> None:
+            if isinstance(exc, UnexpectedResponse) and exc.status_code == 404:
+                return False
+            raise
+
+    def _validate_collection(self) -> Any:
         info = self.client.get_collection(self.collection_name)
         vectors = info.config.params.vectors
         vector_config = vectors.get(self.vector_name) if isinstance(vectors, Mapping) else None
@@ -596,6 +624,31 @@ class QdrantRepositoryStore:
                 f"Qdrant collection {self.collection_name!r} vector {self.vector_name!r} "
                 f"uses distance {vector_config.distance}, expected {expected_distance}."
             )
+        return info
+
+    def _missing_payload_indexes(self, info: Any) -> list[str]:
+        """Validate authoritative metadata before issuing any schema mutation."""
+        schema = getattr(info, "payload_schema", None)
+        if not isinstance(schema, Mapping):
+            raise ValueError("Qdrant repository payload index schema is unavailable")
+        missing = []
+        for field in QDRANT_PAYLOAD_INDEX_FIELDS:
+            if field not in schema:
+                missing.append(field)
+                continue
+            actual = schema[field]
+            if isinstance(actual, Mapping):
+                actual = actual.get("data_type")
+            else:
+                actual = getattr(actual, "data_type", actual)
+            actual = getattr(actual, "value", actual)
+            expected = QDRANT_PAYLOAD_INDEX_SCHEMA[field]
+            if not isinstance(actual, str) or actual.casefold() != expected:
+                raise ValueError(
+                    f"Qdrant payload index {field!r} has type {actual!r}, "
+                    f"expected {expected!r}; explicit schema migration is required"
+                )
+        return missing
 
     def _validate_store_config(self) -> None:
         for field_name, value in (
