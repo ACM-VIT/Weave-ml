@@ -218,7 +218,7 @@ jobs:
         tags: gh-social-ml:${{ github.sha }}
         build-args: ML_RELEASE_ID=${{ github.sha }}
         cache-from: type=gha,scope=release-main-amd64-${{ hashFiles('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock') }}
-        cache-to: type=gha,mode=max,scope=release-main-amd64-${{ hashFiles('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock') }}
+        cache-to: type=gha,mode=max,ignore-error=true,scope=release-main-amd64-${{ hashFiles('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock') }}
 
     - name: Bind release archive to verified source and immutable image digest
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
