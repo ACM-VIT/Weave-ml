@@ -18,10 +18,19 @@ def measure(action, repeats):
     # of CPU so fast rejection does not misleadingly report zero cost.
     started = time.process_time()
     iterations = 0
-    while iterations < repeats or (time.process_time() - started < 0.1 and iterations < 100_000):
-        action()
-        iterations += 1
-    cpu = (time.process_time() - started) / iterations
+    batch_size = repeats
+    while iterations < 100_000:
+        batch_size = min(batch_size, 100_000 - iterations)
+        for _ in range(batch_size):
+            action()
+        iterations += batch_size
+        # Read the clock between batches, amortizing clock overhead even for
+        # microsecond rejection paths. Keep a hard cap for coarse/stalled clocks.
+        elapsed = time.process_time() - started
+        if elapsed >= 0.1:
+            break
+        batch_size = min(batch_size * 2, 4_096)
+    cpu = elapsed / iterations
     gc.collect()
     tracemalloc.start()
     try:
@@ -29,7 +38,8 @@ def measure(action, repeats):
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
-    return result, {'cpu_seconds_per_call': cpu, 'cpu_iterations': iterations, 'traced_peak_bytes': peak}
+    return result, {'cpu_seconds_per_call': cpu, 'cpu_iterations': iterations,
+                    'cpu_target_reached': elapsed >= 0.1, 'traced_peak_bytes': peak}
 
 
 def main():
