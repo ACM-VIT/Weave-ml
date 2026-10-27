@@ -118,11 +118,10 @@ ENV PYTHONPATH="/app"
 
 EXPOSE 8000
 
-# The check reads the secret from the running container environment; no secret
-# is embedded in an image layer or command. The feedback systemd unit disables
-# this API-specific image healthcheck.
+# Secret-free process liveness only. Authenticated readiness/deployment smoke
+# remains the release authority. The feedback unit disables this API-only probe.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-  CMD ["python", "-m", "scripts.production_smoke", "--readiness-only", "--timeout", "8"]
+  CMD ["python", "-c", "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=8); assert r.status==200 and json.load(r)=={'status':'ok'}"]
 
 # Start the ML API server
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

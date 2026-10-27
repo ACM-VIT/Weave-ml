@@ -582,3 +582,108 @@ def test_sampled_stages_report_remaining_budget_without_expiring_it():
     assert deadline.expires_at == 105 and not deadline.cancelled.is_set()
     assert all("expires_at" not in span for span in spans)
     assert all(span["ended_at_unix_seconds"] > 0 for span in spans)
+
+
+def test_public_liveness_is_static_and_only_exact_get_bypasses_auth(monkeypatch):
+    monkeypatch.delenv("INTERNAL_API_SECRET", raising=False)
+    monkeypatch.setattr("api.v2.health_diagnostics", lambda: pytest.fail("public liveness probed dependencies"))
+    client = TestClient(api_main.app)
+    response = client.get("/healthz")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert response.headers["x-request-id"]
+    for method, path in [("post", "/healthz"), ("get", "/healthz/"),
+                         ("get", "/api/v2/health/live"), ("get", "/api/v2/health/ready")]:
+        assert client.request(method, path, follow_redirects=False).status_code == 503
+
+
+def test_feedback_auth_rotation_keeps_rejections_outside_enqueue(monkeypatch, caplog):
+    import json
+    from api import v2
+    secret, rotated = "old-private-boundary-secret", "rotated-private-boundary-secret"
+    monkeypatch.setenv("INTERNAL_API_HEADER", "x-ml-service-secret")
+    monkeypatch.setenv("INTERNAL_API_SECRET", secret)
+    caplog.set_level("INFO", logger="pipeline.api")
+    accepted = []
+    async def enqueue(operation, function, events):
+        assert operation == "feedback"
+        accepted.extend(events)
+        return len(events), 0
+    monkeypatch.setattr(v2, "run_service_job", enqueue)
+    client = TestClient(api_main.app)
+    payload = {"schema_version": 2, "events": [{
+        "event_id": str(uuid.uuid4()), "user_id": str(uuid.uuid4()), "repo_id": str(uuid.uuid4()),
+        "event_type": "like", "occurred_at": "2026-10-27T00:00:00Z", "feedback_version": 1,
+    }]}
+    for headers in ({}, {"x-ml-service-secret": "wrong"}, {"x-internal-secret": secret},
+                    [("x-ml-service-secret", secret), ("x-ml-service-secret", "wrong")],
+                    [(b"x-ml-service-secret", b"\xff")]):
+        assert client.post("/api/v2/feedback/batch", headers=headers, json=payload).status_code == 401
+    assert not accepted
+    monkeypatch.delenv("INTERNAL_API_SECRET")
+    assert client.post("/api/v2/feedback/batch", json=payload).status_code == 503
+    monkeypatch.setenv("INTERNAL_API_SECRET", rotated)
+    assert client.post("/api/v2/feedback/batch", headers={"x-ml-service-secret": secret}, json=payload).status_code == 401
+    response = client.post("/api/v2/feedback/batch", headers={"x-ml-service-secret": rotated}, json=payload)
+    assert response.status_code == 202
+    assert response.json()["acknowledged_event_ids"] == [payload["events"][0]["event_id"]]
+    assert len(accepted) == 1
+    oversized = client.post("/api/v2/feedback/batch", headers={"x-ml-service-secret": rotated},
+                            content=b"x" * (api_main.MAX_REQUEST_BODY_BYTES + 1))
+    assert oversized.status_code == 413 and len(accepted) == 1
+    for events in ([{**payload["events"][0], "user_id": "not-a-uuid"}], payload["events"] * 51):
+        assert client.post("/api/v2/feedback/batch", headers={"x-ml-service-secret": rotated},
+                           json={"schema_version": 2, "events": events}).status_code == 422
+    assert len(accepted) == 1
+    assert secret not in caplog.text and rotated not in caplog.text
+
+
+def test_feedback_rate_window_and_safe_audit_precede_durable_admission(monkeypatch, caplog):
+    from api import v2
+    clock = [10.0]
+    limiter = api_main.FeedbackRequestLimiter(2, 2, clock=lambda: clock[0])
+    monkeypatch.setattr(api_main, "feedback_request_limiter", lambda: limiter)
+    secret = "private-rate-audit-secret"
+    monkeypatch.setenv("INTERNAL_API_SECRET", secret)
+    monkeypatch.delenv("INTERNAL_API_HEADER", raising=False)
+    calls = []
+    async def enqueue(operation, function, events):
+        calls.append(events)
+        return len(events), 0
+    monkeypatch.setattr(v2, "run_service_job", enqueue)
+    payload = {"schema_version": 2, "events": [{
+        "event_id": str(uuid.uuid4()), "user_id": str(uuid.uuid4()), "repo_id": str(uuid.uuid4()),
+        "event_type": "like", "occurred_at": "2026-10-27T00:00:00Z", "feedback_version": 1,
+    }]}
+    client = TestClient(api_main.app)
+    with caplog.at_level("INFO", logger="pipeline.api"):
+        assert client.post("/api/v2/feedback/batch", json=payload).status_code == 401
+        statuses = [client.post("/api/v2/feedback/batch", headers={"x-internal-secret": secret}, json=payload).status_code for _ in range(2)]
+        assert statuses == [202, 202]
+        denied = client.post("/api/v2/feedback/batch", headers={"x-internal-secret": secret}, json=payload)
+        assert denied.status_code == 429 and denied.headers["retry-after"] == "1"
+        assert len(calls) == 2
+        clock[0] += .5
+        assert client.post("/api/v2/feedback/batch", headers={"x-internal-secret": secret}, json=payload).status_code == 202
+    audits = [record.feedback_boundary for record in caplog.records if hasattr(record, "feedback_boundary")]
+    assert [entry["status"] for entry in audits] == [401, 202, 202, 429, 202]
+    assert [entry["outcome"] for entry in audits] == ["not_acknowledged", "acknowledged", "acknowledged", "not_acknowledged", "acknowledged"]
+    assert all(set(entry) == {"status", "outcome"} for entry in audits)
+    assert secret not in caplog.text and payload["events"][0]["user_id"] not in caplog.text
+
+
+def test_feedback_rate_budget_is_shared_across_threads_and_invalid_config_fails_closed(monkeypatch):
+    limiter = api_main.FeedbackRequestLimiter(1, 2, clock=lambda: 10.0)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        outcomes = list(pool.map(lambda _: limiter.retry_after(), range(20)))
+    assert outcomes.count(0) == 2 and outcomes.count(1) == 18
+    monkeypatch.setenv("INTERNAL_API_SECRET", "test-internal-secret")
+    monkeypatch.setenv("V2_FEEDBACK_REQUESTS_PER_SECOND", "0")
+    api_main.feedback_request_limiter.cache_clear()
+    try:
+        response = TestClient(api_main.app).post("/api/v2/feedback/batch",
+            headers={"x-internal-secret": "test-internal-secret"}, json={})
+        assert response.status_code == 503
+        assert response.json()["code"] == "RATE_LIMIT_NOT_CONFIGURED"
+    finally:
+        api_main.feedback_request_limiter.cache_clear()
