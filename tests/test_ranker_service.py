@@ -647,6 +647,89 @@ def test_train_preserves_small_cpu_training_path(tmp_path, monkeypatch):
     assert np.isfinite(manifest["offline_metrics"]["final_train_loss"])
     assert np.isfinite(manifest["offline_metrics"]["final_validation_loss"])
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_cuda_training_aggregates_weighted_loss_once_per_epoch(tmp_path, monkeypatch):
+    class TinyTrainableRanker(torch.nn.Module):
+        def __init__(self, input_dim):
+            super().__init__()
+            self.logits = torch.nn.Parameter(
+                torch.tensor([-1.0, -0.4, 0.2, -0.8, 0.7])
+            )
+
+        def forward(self, features):
+            probabilities = torch.sigmoid(self.logits)
+            return tuple(
+                probabilities[index].expand(features.shape[0])
+                for index in range(5)
+            )
+
+    row_count = 11
+    labels = np.zeros(row_count, dtype=np.float32)
+    data_path = tmp_path / "training.npz"
+    np.savez(
+        data_path,
+        user_embs=np.zeros((row_count, EMBEDDING_DIM), dtype=np.float32),
+        repo_embs=np.zeros((row_count, EMBEDDING_DIM), dtype=np.float32),
+        dense_features=np.zeros((row_count, FEATURE_COUNT), dtype=np.float32),
+        y_ctr=labels,
+        y_save=labels,
+        y_gh=labels,
+        y_dwell=labels,
+        y_follow=labels,
+    )
+
+    observed_train_batches = []
+    original_compute_batch_loss = train_ranker.compute_batch_loss
+
+    def record_real_training_loss(model, batch, device, bce_loss, mse_loss):
+        loss, count = original_compute_batch_loss(
+            model, batch, device, bce_loss, mse_loss
+        )
+        if model.training:
+            observed_train_batches.append((loss.detach(), count))
+        return loss, count
+
+    monkeypatch.setattr(train_ranker, "MMoEHeavyRanker", TinyTrainableRanker)
+    monkeypatch.setattr(
+        train_ranker, "compute_batch_loss", record_real_training_loss
+    )
+    item_calls = _track_training_module_items(monkeypatch)
+    epochs = 2
+    manifest = train_ranker.train(
+        data_path=data_path,
+        epochs=epochs,
+        lr=1e-2,
+        batch_size=3,
+        output_dir=tmp_path / "artifacts",
+    )
+
+    # 80% of 11 rows gives eight training examples: two full batches and a tail.
+    assert len(observed_train_batches) == epochs * 3
+    final_epoch = observed_train_batches[-3:]
+    batch_sizes = [count for _, count in final_epoch]
+    assert sorted(batch_sizes) == [2, 3, 3]
+
+    # Derive the expected metric from the real pre-update batch losses in the
+    # final epoch, weighting each batch mean by its example count.
+    batch_losses = torch.stack([loss for loss, _ in final_epoch]).cpu().tolist()
+    weighted_loss = sum(
+        loss * count for loss, count in zip(batch_losses, batch_sizes)
+    ) / sum(batch_sizes)
+    unweighted_batch_mean = sum(batch_losses) / len(batch_losses)
+    assert not math.isclose(
+        weighted_loss, unweighted_batch_mean, rel_tol=1e-8, abs_tol=1e-8
+    )
+    assert manifest["offline_metrics"]["final_train_loss"] == pytest.approx(
+        weighted_loss, rel=1e-6, abs=1e-6
+    )
+
+    # The trainer extracts one scalar for train and one for validation per epoch.
+    assert item_calls.count("train") == epochs
+    assert item_calls.count("evaluate") == epochs
+    assert len(item_calls) == epochs * 2
+
+
 def test_score_batch_empty_candidates_returns_empty(loaded_ranker_service):
     assert loaded_ranker_service.score_batch(
         np.zeros(384, dtype=np.float32),
