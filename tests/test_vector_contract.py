@@ -93,6 +93,144 @@ def test_cancelled_offline_job_does_not_advance_lazy_source():
     assert fetched == []
 
 
+@pytest.fixture
+def offline_embedding_pipeline():
+    import hashlib
+    import numpy as np
+    from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
+    from embedding.embeddings import SentenceTransformerEmbedder
+    from embedding.tower_cache import TowerEmbeddingCache
+    from config import EMBEDDING_MODEL_REVISION
+    from summarization.pipeline import CardSummaryPipeline
+    from summarization.settings import SummarySettings
+
+    class Model:
+        max_seq_length = 256
+        def __init__(self):
+            self.calls = []
+        def encode(self, texts, **kwargs):
+            self.calls.append(tuple(texts))
+            vectors = np.zeros((len(texts), REPOSITORY_EMBEDDING_DIM), dtype=np.float32)
+            for index, text in enumerate(texts):
+                vectors[index, int.from_bytes(hashlib.sha256(text.encode()).digest()[:2]) % REPOSITORY_EMBEDDING_DIM] = 1
+            return vectors
+
+    model = Model()
+    pipeline = RepositoryEmbeddingPipeline(
+        embedder=SentenceTransformerEmbedder(model=model),
+        tower_cache=TowerEmbeddingCache(model=model, model_revision=EMBEDDING_MODEL_REVISION),
+        card_summarizer=CardSummaryPipeline(settings=SummarySettings(api_key=None)),
+    )
+    return pipeline, model
+
+
+def _offline_sources(count):
+    import uuid
+    for number in range(1, count + 1):
+        yield dict(repo_id=str(uuid.UUID(int=number)), full_name=f"diagnostic/repo{number}",
+            description=f"Repository {number} helps search local documents.",
+            topics=["search"] if number % 2 else [],
+            readme=("# Search\nLocal document retrieval. " * number) if number % 3 else "")
+
+
+def test_streamed_towers_match_serial_empty_mixed_sources_and_cache(offline_embedding_pipeline):
+    import math
+    pipeline, model = offline_embedding_pipeline
+    sources = list(_offline_sources(9))
+    serial = [pipeline.embed_repository(row) for row in sources]
+    # The exact model is warmed, but summaries/payloads must still be rebuilt.
+    model.calls.clear()
+    streamed = list(pipeline.iter_embed(iter(sources)))
+    materialized = pipeline.embed_batch(iter(sources))
+    assert model.calls == []
+    assert [row.repo_id for row in streamed] == [row["repo_id"] for row in sources]
+    for expected, actual, compatible in zip(serial, streamed, materialized):
+        assert actual.final_embedding == pytest.approx(expected.final_embedding, abs=1e-7)
+        assert compatible.final_embedding == actual.final_embedding
+        assert actual.source_hash == expected.source_hash == compatible.source_hash
+        assert actual.card_summary == expected.card_summary == compatible.card_summary
+        # Each execution stamps its real indexing time; all semantic/provenance fields match.
+        payloads = [{key: value for key, value in row.payload.items() if key != "indexed_at"}
+                    for row in (actual, expected, compatible)]
+        assert payloads[0] == payloads[1] == payloads[2]
+        assert math.fsum(value * value for value in actual.final_embedding) == pytest.approx(1)
+    assert serial[2].readme_embedding == [] and serial[0].readme_embedding
+    assert serial[0].card_summary.source == "description_fallback"
+    # Cold streaming exercises grouping rather than merely cached outputs.
+    pipeline.tower_cache = None
+    cold = list(pipeline.iter_embed(iter(sources)))
+    assert [row.final_embedding for row in cold] == [row.final_embedding for row in serial]
+    assert all(len(group) <= 8 and len(group) * model.max_seq_length <= 2048 for group in model.calls)
+    assert any(len(group) == 8 for group in model.calls)
+
+
+def test_stream_index_ambiguous_chunk_resumes_from_acknowledged_progress(offline_embedding_pipeline, monkeypatch):
+    from contextlib import closing
+    from qdrant_client import QdrantClient, models
+    from embedding.embedding_pipeline import MAX_OFFLINE_REPOSITORIES
+    pipeline, _ = offline_embedding_pipeline
+    with closing(QdrantClient(":memory:")) as client:
+        client.create_collection("offline", vectors_config={QDRANT_VECTOR_NAME: models.VectorParams(
+            size=384, distance=models.Distance.COSINE)})
+        store = QdrantRepositoryStore(client=client, collection_name="offline", corpus_authority=None)
+        # Embedded Qdrant has no payload indexes; this case covers actual point writes,
+        # validation and replay. Server bootstrap/index behavior has separate coverage.
+        monkeypatch.setattr(store, "ensure_collection", store._validate_collection)
+        pipeline.store = store
+        original_upsert = client.upsert
+        writes, pulled, acknowledged = [], [], []
+        def write_then_lose_reply(**kwargs):
+            writes.append([str(point.id) for point in kwargs["points"]])
+            response = original_upsert(**kwargs)
+            if len(writes) == 2:
+                raise ConnectionError("controlled lost reply after stored chunk")
+            return response
+        monkeypatch.setattr(client, "upsert", write_then_lose_reply)
+        def sources():
+            for row in _offline_sources(17):
+                pulled.append(row["repo_id"])
+                yield row
+        iterator = pipeline.iter_index(sources())
+        acknowledged.append(next(iterator))
+        assert len(pulled) == MAX_OFFLINE_REPOSITORIES
+        with pytest.raises(ConnectionError, match="lost reply"):
+            acknowledged.extend(iterator)
+        assert len(acknowledged) == 8 and len(pulled) == 16
+        assert client.count("offline", exact=True).count == 16
+        assert all(len(chunk) <= 8 for chunk in writes)
+        monkeypatch.setattr(client, "upsert", original_upsert)
+        remaining = list(_offline_sources(17))[len(acknowledged):]
+        resumed = list(pipeline.iter_index(iter(remaining)))
+        assert [row.repo_id for row in acknowledged + resumed] == [row["repo_id"] for row in _offline_sources(17)]
+        assert client.count("offline", exact=True).count == 17
+        records = client.retrieve("offline", ids=[row.repo_id for row in resumed], with_vectors=True)
+        by_id = {str(row.id): row for row in records}
+        for result in resumed:
+            assert by_id[result.repo_id].vector[QDRANT_VECTOR_NAME] == pytest.approx(result.final_embedding, abs=1e-7)
+            assert by_id[result.repo_id].payload["source_hash"] == result.source_hash
+
+
+def test_stream_store_bounds_actual_utf8_requests_with_skewed_payloads(offline_embedding_pipeline):
+    from types import SimpleNamespace
+    from qdrant_client.http.api.points_api import jsonable_encoder
+    from qdrant_client import models
+    pipeline, _ = offline_embedding_pipeline
+    results = list(pipeline.iter_embed(_offline_sources(5)))
+    results[1].payload["diagnostic_unicode"] = "界" * 1500
+    requests = []
+    def upsert(**kwargs):
+        requests.append(kwargs["points"])
+        return SimpleNamespace(status="completed")
+    store = QdrantRepositoryStore(client=SimpleNamespace(upsert=upsert), corpus_authority=None)
+    progress = list(store.iter_upsert(iter(results), max_points=64, max_request_bytes=16000))
+    assert progress == results
+    # Five points fit the count cap; only their actual encoded byte size splits them.
+    assert len(requests) >= 2
+    assert [str(point.id) for chunk in requests for point in chunk] == [row.repo_id for row in results]
+    assert all(len(chunk) <= 64 and len(jsonable_encoder(models.PointsList(points=chunk)).encode("utf-8")) <= 16000
+               for chunk in requests)
+
+
 def test_repository_collection_contract_matches_central_config():
     assert REPOSITORY_COLLECTION_CONTRACT.collection_name == QDRANT_COLLECTION_NAME
     assert REPOSITORY_COLLECTION_CONTRACT.vector_name == QDRANT_VECTOR_NAME
