@@ -21,7 +21,13 @@ from contextvars import copy_context
 from functools import lru_cache, wraps
 from typing import Any, Callable, TypeVar
 
-from config import EMBEDDING_MODEL_REVISION, REPOSITORY_EMBEDDING_DIM, REPOSITORY_EMBEDDING_MODEL
+from config import (
+    EMBEDDING_MODEL_REVISION,
+    REPOSITORY_EMBEDDING_DIM,
+    REPOSITORY_EMBEDDING_MODEL,
+    REPOSITORY_EMBEDDING_VERSION,
+    STABLE_METADATA_EMBEDDING_VERSION,
+)
 from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
 from embedding.tower_cache import TowerEmbeddingCache
 from embedding.embeddings import SentenceTransformerEmbedder
@@ -46,6 +52,13 @@ class EmbeddingCapacityError(RuntimeError):
 
 class EmbeddingDeadlineExceeded(RuntimeError):
     """Raised when the bounded embedding deadline was exceeded."""
+
+
+def _require_online_repository_recipe() -> None:
+    if REPOSITORY_EMBEDDING_VERSION == STABLE_METADATA_EMBEDDING_VERSION:
+        raise ValueError(
+            "stable metadata candidate embeddings are export-only and cannot initialize the online pipeline"
+        )
 
 
 def embedding_timeout_seconds() -> float:
@@ -305,6 +318,7 @@ def shared_embedding_model() -> BoundedEmbeddingModel:
 
 @lru_cache(maxsize=1)
 def repository_embedding_pipeline() -> RepositoryEmbeddingPipeline:
+    _require_online_repository_recipe()
     model = shared_embedding_model()
     return RepositoryEmbeddingPipeline(
         embedder=SentenceTransformerEmbedder(
@@ -417,6 +431,7 @@ async def _run_embedding_job(
 
 def warm_embedding_runtime(stop: threading.Event | None = None) -> dict[str, Any]:
     """Validate pipelines and execute real inference using local artifacts only."""
+    _require_online_repository_recipe()
     previous = getattr(_warmup_loading, "local_files_only", False)
     _warmup_loading.local_files_only = True
     try:

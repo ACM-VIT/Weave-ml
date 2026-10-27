@@ -42,6 +42,7 @@ from config import (
     REPOSITORY_EMBEDDING_MODEL,
     REPOSITORY_EMBEDDING_VERSION,
     REPOSITORY_FEATURE_SPEC_VERSION,
+    STABLE_METADATA_EMBEDDING_VERSION,
 )
 from .embeddings import Vector, aggregate_vectors
 from .vector_contract import (
@@ -210,6 +211,58 @@ def build_metadata_text(repo: Mapping[str, Any], *, preserve_legacy_zero_recency
         f"Discovery band: {repo.get('discovery_band') or ''}",
     ]
     return "\n".join(lines)
+
+
+def build_stable_metadata_text(repo: Mapping[str, Any]) -> str:
+    """Project only descriptive repository metadata for the v3 candidate."""
+    lines = [
+        f"Repository: {repo.get('full_name') or repo.get('id', '')}",
+        f"Description: {repo.get('description') or ''}",
+        f"Primary language: {repo.get('primary_language') or 'Unknown'}",
+        f"Topics: {', '.join(_parse_list_field(repo.get('topics')))}",
+        f"Languages: {', '.join(_parse_list_field(repo.get('languages')))}",
+    ]
+    semantic_category = repo.get("category")
+    if isinstance(semantic_category, str) and semantic_category.strip():
+        lines.append(f"Semantic category: {semantic_category.strip()}")
+    return "\n".join(lines)
+
+
+def stable_metadata_source_fingerprint(
+    config: RepositoryEmbeddingConfig,
+    *,
+    readme_chunks: Sequence[str],
+    metadata_text: str,
+    topic_text: str,
+    max_seq_length: int,
+) -> str:
+    """Fingerprint the complete, explicitly versioned stable-metadata recipe."""
+    if config.version != STABLE_METADATA_EMBEDDING_VERSION:
+        raise ValueError("stable metadata fingerprint requires its candidate recipe version")
+    recipe = {
+        "schema": "stable-metadata-source-fingerprint-v1",
+        "recipe_id": STABLE_METADATA_EMBEDDING_VERSION,
+        "embedding_model": config.model_name,
+        "embedding_model_revision": EMBEDDING_MODEL_REVISION,
+        "embedding_dim": int(config.embedding_dim),
+        "tower_weights": {
+            name: config.tower_weights[name] for name in sorted(config.tower_weights)
+        },
+        "readme_chunk_chars": int(config.readme_chunk_chars),
+        "readme_chunk_overlap_chars": int(config.readme_chunk_overlap_chars),
+        "max_seq_length": int(max_seq_length),
+        "readme_chunks": list(readme_chunks),
+        "metadata_text": metadata_text,
+        "topic_text": topic_text,
+    }
+    encoded = json.dumps(
+        recipe,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def build_topic_text(repo: Mapping[str, Any]) -> str:

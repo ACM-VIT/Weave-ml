@@ -407,6 +407,34 @@ def test_embedding_runtime_loads_one_shared_model_for_both_pipelines(monkeypatch
         embedding_runtime.reset_embedding_runtime_for_tests()
 
 
+@pytest.mark.parametrize("initializer", ["pipeline", "startup"])
+def test_online_embedding_initialization_rejects_candidate_before_runtime_work(
+    monkeypatch, initializer,
+) -> None:
+    embedding_runtime.reset_embedding_runtime_for_tests()
+    monkeypatch.setattr(
+        embedding_runtime,
+        "REPOSITORY_EMBEDDING_VERSION",
+        "repo-embedding-v3-stable-metadata-v1",
+    )
+    model_loader = MagicMock()
+    summary_factory = MagicMock()
+    monkeypatch.setattr(embedding_runtime, "_load_sentence_transformer", model_loader)
+    monkeypatch.setattr(embedding_runtime, "card_summary_pipeline", summary_factory)
+    initialize = (
+        embedding_runtime.repository_embedding_pipeline
+        if initializer == "pipeline"
+        else embedding_runtime.warm_embedding_runtime
+    )
+    try:
+        with pytest.raises(ValueError, match="export-only"):
+            initialize()
+        model_loader.assert_not_called()
+        summary_factory.assert_not_called()
+    finally:
+        embedding_runtime.reset_embedding_runtime_for_tests()
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("anyio_backend", ["asyncio"])
 @pytest.mark.parametrize("job_class", ["repository", "onboarding"])

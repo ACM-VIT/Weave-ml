@@ -23,6 +23,7 @@ from config import (
     QDRANT_URL,
     QDRANT_VECTOR_NAME,
     REPOSITORY_EMBEDDING_DIM,
+    STABLE_METADATA_EMBEDDING_VERSION,
 )
 from .batch_limits import check_field_budget
 from .corpus_revision import (
@@ -432,6 +433,13 @@ class QdrantRepositoryStore:
         *,
         point_id: str,
     ) -> Any:
+        if (
+            result.embedding_version == STABLE_METADATA_EMBEDDING_VERSION
+            or result.payload.get("embedding_version") == STABLE_METADATA_EMBEDDING_VERSION
+        ):
+            raise ValueError(
+                "stable metadata candidate embeddings cannot be written to a Qdrant collection"
+            )
         vector = validate_embedding_vector(
             result.final_embedding,
             expected_size=self.vector_size,

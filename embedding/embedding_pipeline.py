@@ -12,7 +12,11 @@ from typing import Any
 
 from utils.deadline import check_deadline
 
-from config import TOKEN_SECTION_EMBEDDING_VERSION, ZERO_RECENCY_EMBEDDING_VERSION
+from config import (
+    STABLE_METADATA_EMBEDDING_VERSION,
+    TOKEN_SECTION_EMBEDDING_VERSION,
+    ZERO_RECENCY_EMBEDDING_VERSION,
+)
 from summarization.contracts import CardSummaryArtifact
 from summarization.pipeline import CardSummaryPipeline
 
@@ -24,12 +28,14 @@ from .repository_embedding import (
     RepositoryEmbeddingConfig,
     RepositoryEmbeddingResult,
     build_metadata_text,
+    build_stable_metadata_text,
     build_readme_text,
     build_topic_text,
     build_vector_payload,
     coerce_payload,
     combine_repo_tower,
     source_fingerprint,
+    stable_metadata_source_fingerprint,
 )
 from .tower_cache import TowerEmbeddingCache
 from .vector_contract import resolve_repository_identity, validate_embedding_vector
@@ -140,9 +146,12 @@ class RepositoryEmbeddingPipeline:
         readme_text = (
             build_readme_text(source) if legacy_readme else readme_source(source, repo)
         )
-        metadata_text = build_metadata_text(
-            repo, preserve_legacy_zero_recency=self.config.version != ZERO_RECENCY_EMBEDDING_VERSION,
-        )
+        if self.config.version == STABLE_METADATA_EMBEDDING_VERSION:
+            metadata_text = build_stable_metadata_text(repo)
+        else:
+            metadata_text = build_metadata_text(
+                repo, preserve_legacy_zero_recency=self.config.version != ZERO_RECENCY_EMBEDDING_VERSION,
+            )
         topic_text = build_topic_text(repo)
         card_summary = self.summarize_repository(source, repo, deadline=deadline)
 
@@ -245,20 +254,32 @@ class RepositoryEmbeddingPipeline:
             field_name=f"embedding for {repo_id}",
         )
 
-        source_hash = source_fingerprint(
-            self.config.model_name,
-            self.config.version,
-            readme_text,
-            metadata_text,
-            topic_text,
-        )
-        if not legacy_readme:
-            source_hash = source_fingerprint(source_hash, README_STRATEGY_VERSION, json.dumps({
-                "chunks": [(chunk.text, chunk.section_class, chunk.weight) for chunk in readme_chunks],
-                "overlap_tokens": self.config.readme_chunk_overlap_tokens,
-                "max_seq_length": self.embedder.model.max_seq_length,
-                "tower_weights": self.config.tower_weights,
-            }, sort_keys=True, separators=(",", ":")))
+        if self.config.version == STABLE_METADATA_EMBEDDING_VERSION:
+            max_seq_length = getattr(
+                getattr(self.embedder, "model", None), "max_seq_length", 256
+            )
+            source_hash = stable_metadata_source_fingerprint(
+                self.config,
+                readme_chunks=[chunk.text for chunk in readme_chunks],
+                metadata_text=metadata_text,
+                topic_text=topic_text,
+                max_seq_length=max_seq_length,
+            )
+        else:
+            source_hash = source_fingerprint(
+                self.config.model_name,
+                self.config.version,
+                readme_text,
+                metadata_text,
+                topic_text,
+            )
+            if not legacy_readme:
+                source_hash = source_fingerprint(source_hash, README_STRATEGY_VERSION, json.dumps({
+                    "chunks": [(chunk.text, chunk.section_class, chunk.weight) for chunk in readme_chunks],
+                    "overlap_tokens": self.config.readme_chunk_overlap_tokens,
+                    "max_seq_length": self.embedder.model.max_seq_length,
+                    "tower_weights": self.config.tower_weights,
+                }, sort_keys=True, separators=(",", ":")))
         payload = build_vector_payload(
             repo,
             repo_id=repo_id,
@@ -339,6 +360,10 @@ class RepositoryEmbeddingPipeline:
         deterministic point IDs make an offline rerun safe. This helper must
         not be used for online canonical writes, which require content CAS.
         """
+        if self.config.version == STABLE_METADATA_EMBEDDING_VERSION:
+            raise ValueError(
+                "stable metadata candidate embeddings are export-only and cannot be indexed"
+            )
         if self.store is None:
             self.store = QdrantRepositoryStore(vector_size=self.config.embedding_dim)
         self.store.ensure_collection()
@@ -361,6 +386,10 @@ class RepositoryEmbeddingPipeline:
 
     def search(self, query: str, *, limit: int = 5, exact: bool = True) -> list[dict]:
         """Embed a text query and search the configured Qdrant collection."""
+        if self.config.version == STABLE_METADATA_EMBEDDING_VERSION:
+            raise ValueError(
+                "stable metadata candidate embeddings cannot search the serving collection"
+            )
         # The below query embedding is for searching with the same model/config
         # used during repository indexing.
         if not isinstance(query, str) or not query.strip():
