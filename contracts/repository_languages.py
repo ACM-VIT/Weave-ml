@@ -41,7 +41,8 @@ class RepositoryLanguageObservation(BaseModel):
             raise ValueError("language breakdown names must be unique")
         if rows is not None:
             # Each published row may be rounded independently to two decimals.
-            if sum(row.percentage or 0 for row in rows) > 100 + len(rows) * PERCENTAGE_ROUNDING_TOLERANCE + PERCENTAGE_EPSILON:
+            percentages = [row.percentage for row in rows if row.percentage is not None]
+            if sum(percentages) > 100 + len(percentages) * PERCENTAGE_ROUNDING_TOLERANCE + PERCENTAGE_EPSILON:
                 raise ValueError("language percentages exceed the full repository")
             if self.language_total_size is not None and sum(row.size or 0 for row in rows) > self.language_total_size:
                 raise ValueError("language byte sizes exceed the observed total")

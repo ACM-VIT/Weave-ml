@@ -254,3 +254,11 @@ def test_language_percentage_accepts_rounded_rows_without_inventing_unknowns():
                        (0, dict(name="Python", size=0, percentage=None))]:
         result = language_observation(dict(language_total_size=total, language_breakdown=[row]))
         assert result["language_breakdown"] == [row]
+
+
+def test_unknown_language_percentages_do_not_expand_rounding_allowance():
+    from contracts.repository_languages import language_observation
+    unknown = [dict(name=f"unknown{number}", percentage=None) for number in range(98)]
+    with pytest.raises(ValueError, match="percentages exceed"):
+        language_observation(dict(language_breakdown=unknown + [
+            dict(name="Python", percentage=50.4), dict(name="Rust", percentage=50.4)]))
