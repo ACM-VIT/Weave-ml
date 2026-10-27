@@ -202,3 +202,33 @@ def test_current_payload_builder_publishes_the_frozen_contract():
         if field_name == REPOSITORY_SERVING_ELIGIBILITY_FIELD:
             continue
         assert isinstance(payload[field_name], expected_type), field_name
+
+
+def test_language_numeric_metadata_does_not_change_semantic_towers_or_source_hash():
+    import hashlib
+    from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
+    class Encoder:
+        def embed_texts(self, texts):
+            result = []
+            for text in texts:
+                vector = [0.] * 384
+                vector[hashlib.sha256(text.encode()).digest()[0]] = 1.
+                result.append(vector)
+            return result
+    pipeline = RepositoryEmbeddingPipeline(embedder=Encoder())
+    source = dict(repo_id=REPO_ID, full_name="owner/repo", languages=["Python"], primary_language="Python",
+        readme="A search project.", topics=["search"], language_total_size=1000,
+        language_breakdown_complete=False,
+        language_breakdown=[dict(name="Python", color="#3572A5", size=300, percentage=30.)])
+    first = pipeline.embed_repository(source)
+    changed = {**source, "language_breakdown": [dict(name="Python", color="#FFFFFF", size=500, percentage=50.)]}
+    second = pipeline.embed_repository(changed)
+    assert first.payload["language_breakdown"] == source["language_breakdown"]
+    assert second.payload["language_breakdown"] == changed["language_breakdown"]
+    assert first.source_hash == second.source_hash
+    for tower in ("readme_embedding", "metadata_embedding", "topic_embedding", "final_embedding"):
+        assert getattr(first, tower) == getattr(second, tower)
+    # Old provider model dumps include optional nulls; those are unknown, not new evidence.
+    from contracts.repository_languages import language_observation
+    assert language_observation(dict(language_breakdown=None, language_total_size=None,
+                                    language_breakdown_complete=None)) == {}

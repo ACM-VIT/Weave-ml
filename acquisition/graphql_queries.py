@@ -98,7 +98,8 @@ def build_batch_metadata_query(repos: list[tuple[str, str]], *, projection: str 
       nodes {{ topic {{ name }} }}
     }}
     languages(first: 10, orderBy: {{field: SIZE, direction: DESC}}) {{
-      edges {{ size node {{ name }} }}
+      totalSize
+      edges {{ size node {{ name color }} }}
     }}
     defaultBranchRef {{
       name
@@ -177,10 +178,12 @@ query GetRepository($owner: String!, $name: String!) {
     }
     
     languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
+      totalSize
       edges {
         size
         node {
           name
+          color
         }
       }
     }

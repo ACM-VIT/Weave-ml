@@ -19,6 +19,7 @@ from pydantic import (
     model_validator,
 )
 
+from contracts.repository_languages import RepositoryLanguageObservation
 from ingestion.lifecycle import RepositoryLifecycleObservation
 from feedback.v2_settings import V2FeedbackSettings
 from embedding.vector_contract import validate_diversity_metadata
@@ -303,7 +304,7 @@ class FeedbackBatch(StrictModel):
         return value
 
 
-class RepositorySource(StrictModel):
+class RepositorySource(RepositoryLanguageObservation, StrictModel):
     lifecycle: RepositoryLifecycleObservation | None = None
     # These identity/source fields are supplied by the canonical Node v2
     # ingestion outbox. ``repo_id`` is checked against the job envelope below;
