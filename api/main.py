@@ -6,6 +6,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 import logging
+import json
 import math
 from functools import lru_cache
 import os
@@ -27,6 +28,15 @@ from utils.observability import authenticated_request_id, operation_for_path, sp
 load_dotenv()
 
 logger = logging.getLogger("pipeline.api")
+# Own only this audit channel: ordinary uvicorn logging does not enable the
+# pipeline logger or render LogRecord extras. JSON lives in the emitted message.
+feedback_audit_logger = logging.getLogger("pipeline.feedback.audit")
+feedback_audit_logger.setLevel(logging.INFO)
+feedback_audit_logger.propagate = False
+if not feedback_audit_logger.handlers:
+    audit_handler = logging.StreamHandler()
+    audit_handler.setFormatter(logging.Formatter("%(message)s"))
+    feedback_audit_logger.addHandler(audit_handler)
 MAX_REQUEST_BODY_BYTES = 256 * 1024
 REPOSITORY_EMBED_MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
 MAX_VALIDATION_ERROR_DETAILS = 50
@@ -447,9 +457,10 @@ async def observe_api_requests(request: Request, call_next):
         if request.method == "POST" and request.url.path == "/api/v2/feedback/batch":
             status_code = response.status_code if response is not None else 500
             # Fixed fields only: never log headers, identity, events or input IDs.
-            logger.info("Feedback boundary outcome", extra={"feedback_boundary": {
-                "status": status_code, "outcome": "acknowledged" if status_code == 202 else "not_acknowledged",
-            }})
+            feedback_audit_logger.info(json.dumps({
+                "event": "feedback_boundary", "status": status_code,
+                "outcome": "acknowledged" if status_code == 202 else "not_acknowledged",
+            }, separators=(",", ":")))
         if request.url.path.startswith("/api/v2/"):
             record_api_request(
                 path=request.url.path,

@@ -638,7 +638,10 @@ def test_feedback_auth_rotation_keeps_rejections_outside_enqueue(monkeypatch, ca
     assert secret not in caplog.text and rotated not in caplog.text
 
 
-def test_feedback_rate_window_and_safe_audit_precede_durable_admission(monkeypatch, caplog):
+def test_feedback_rate_window_and_safe_audit_precede_durable_admission(monkeypatch):
+    import io
+    import json
+    import logging
     from api import v2
     clock = [10.0]
     limiter = api_main.FeedbackRequestLimiter(2, 2, clock=lambda: clock[0])
@@ -655,21 +658,25 @@ def test_feedback_rate_window_and_safe_audit_precede_durable_admission(monkeypat
         "event_id": str(uuid.uuid4()), "user_id": str(uuid.uuid4()), "repo_id": str(uuid.uuid4()),
         "event_type": "like", "occurred_at": "2026-10-27T00:00:00Z", "feedback_version": 1,
     }]}
+    emitted_stream = io.StringIO()
+    assert api_main.feedback_audit_logger.getEffectiveLevel() == logging.INFO
+    monkeypatch.setattr(api_main.audit_handler, "stream", emitted_stream)
     client = TestClient(api_main.app)
-    with caplog.at_level("INFO", logger="pipeline.api"):
-        assert client.post("/api/v2/feedback/batch", json=payload).status_code == 401
-        statuses = [client.post("/api/v2/feedback/batch", headers={"x-internal-secret": secret}, json=payload).status_code for _ in range(2)]
-        assert statuses == [202, 202]
-        denied = client.post("/api/v2/feedback/batch", headers={"x-internal-secret": secret}, json=payload)
-        assert denied.status_code == 429 and denied.headers["retry-after"] == "1"
-        assert len(calls) == 2
-        clock[0] += .5
-        assert client.post("/api/v2/feedback/batch", headers={"x-internal-secret": secret}, json=payload).status_code == 202
-    audits = [record.feedback_boundary for record in caplog.records if hasattr(record, "feedback_boundary")]
+    assert client.post("/api/v2/feedback/batch", json=payload).status_code == 401
+    statuses = [client.post("/api/v2/feedback/batch", headers={"x-internal-secret": secret}, json=payload).status_code for _ in range(2)]
+    assert statuses == [202, 202]
+    denied = client.post("/api/v2/feedback/batch", headers={"x-internal-secret": secret}, json=payload)
+    assert denied.status_code == 429 and denied.headers["retry-after"] == "1"
+    assert len(calls) == 2
+    clock[0] += .5
+    assert client.post("/api/v2/feedback/batch", headers={"x-internal-secret": secret}, json=payload).status_code == 202
+    emitted = emitted_stream.getvalue()
+    audits = [json.loads(line) for line in emitted.splitlines()]
     assert [entry["status"] for entry in audits] == [401, 202, 202, 429, 202]
     assert [entry["outcome"] for entry in audits] == ["not_acknowledged", "acknowledged", "acknowledged", "not_acknowledged", "acknowledged"]
-    assert all(set(entry) == {"status", "outcome"} for entry in audits)
-    assert secret not in caplog.text and payload["events"][0]["user_id"] not in caplog.text
+    assert all(set(entry) == {"event", "status", "outcome"} for entry in audits)
+    assert all(entry["event"] == "feedback_boundary" for entry in audits)
+    assert secret not in emitted and payload["events"][0]["user_id"] not in emitted
 
 
 def test_feedback_rate_budget_is_shared_across_threads_and_invalid_config_fails_closed(monkeypatch):
@@ -685,5 +692,22 @@ def test_feedback_rate_budget_is_shared_across_threads_and_invalid_config_fails_
             headers={"x-internal-secret": "test-internal-secret"}, json={})
         assert response.status_code == 503
         assert response.json()["code"] == "RATE_LIMIT_NOT_CONFIGURED"
+    finally:
+        api_main.feedback_request_limiter.cache_clear()
+
+
+@pytest.mark.parametrize("setting", ["V2_FEEDBACK_REQUESTS_PER_SECOND", "V2_FEEDBACK_REQUEST_BURST"])
+def test_invalid_feedback_limits_fail_lifespan_before_runtime_initialization(monkeypatch, setting):
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("V2_FEEDBACK_REQUESTS_PER_SECOND", "20")
+    monkeypatch.setenv("V2_FEEDBACK_REQUEST_BURST", "40")
+    monkeypatch.setenv(setting, "0")
+    monkeypatch.setattr("api.v2.validate_v2_runtime_configuration",
+                        lambda: pytest.fail("initialized runtime before validating feedback limits"))
+    api_main.feedback_request_limiter.cache_clear()
+    try:
+        with pytest.raises(ValueError, match="Feedback rate and burst"):
+            with TestClient(api_main.app):
+                pytest.fail("invalid feedback limits allowed startup")
     finally:
         api_main.feedback_request_limiter.cache_clear()
