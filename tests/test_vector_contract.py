@@ -401,3 +401,298 @@ def test_unknown_language_percentages_do_not_expand_rounding_allowance():
     with pytest.raises(ValueError, match="percentages exceed"):
         language_observation(dict(language_breakdown=unknown + [
             dict(name="Python", percentage=50.4), dict(name="Rust", percentage=50.4)]))
+
+
+def _issue25_source():
+    return dict(
+        repo_id=REPO_ID,
+        full_name="owner/v2-index",
+        description="Parses protocol v2 with 384-dimensional embeddings.",
+        primary_language="Python",
+        languages=["Python", "Rust"],
+        topics=["search", "indexing"],
+        category="vector search",
+        readme="README documents v2 and 384-dimensional vectors.",
+        star_count=127,
+        fork_count=18,
+        open_issues_count=6,
+        pushed_days_ago=3,
+        delta_3d=2,
+        delta_7d=5,
+        delta_30d=13,
+        mentionable_users_count=42,
+        discovery_category="recent",
+        discovery_band="high",
+    )
+
+
+class _Issue25RecordingEncoder:
+    def __init__(self):
+        import hashlib
+        self._hashlib = hashlib
+        self.calls = []
+
+    def embed_texts(self, texts):
+        self.calls.append(list(texts))
+        vectors = []
+        for text in texts:
+            vector = [0.0] * 384
+            vector[int.from_bytes(self._hashlib.sha256(text.encode()).digest()[:2], "big") % 384] = 1.0
+            vectors.append(vector)
+        return vectors
+
+
+def _issue25_pipeline(version=None):
+    from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
+    from embedding.repository_embedding import RepositoryEmbeddingConfig
+    config = RepositoryEmbeddingConfig() if version is None else RepositoryEmbeddingConfig(version=version)
+    return RepositoryEmbeddingPipeline(
+        config=config,
+        embedder=_Issue25RecordingEncoder(),
+    )
+
+
+def _issue25_vector_hash(vector):
+    import hashlib
+    import json
+    return hashlib.sha256(json.dumps(vector, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+
+def test_default_v2_metadata_and_embedding_outputs_remain_exact():
+    from embedding.repository_embedding import RepositoryEmbeddingConfig, build_metadata_text
+    pipeline = _issue25_pipeline()
+    source = _issue25_source()
+    result = pipeline.embed_repository(source)
+
+    assert RepositoryEmbeddingConfig().version == "repo-embedding-v2"
+    assert build_metadata_text(source) == (
+        "Repository: owner/v2-index\n"
+        "Description: Parses protocol v2 with 384-dimensional embeddings.\n"
+        "Primary language: Python\n"
+        "Stars: 127\n"
+        "Forks: 18\n"
+        "Open issues: 6\n"
+        "Pushed days ago: 3\n"
+        "Star deltas: 3d=2, 7d=5, 30d=13\n"
+        "Contributor signal: mentionable_users_count=42\n"
+        "Discovery category: recent\n"
+        "Discovery band: high"
+    )
+    assert result.embedding_version == "repo-embedding-v2"
+    assert result.source_hash == "25d12c250331ee764c1b5e7485643e682aec97d4cb2067006569c2d3049607a2"
+    assert _issue25_vector_hash(result.metadata_embedding) == "dab2fb0e3dfb27b391df9a98e7838d09549dd4fe5f116038131fe8bb3bdbe57f"
+    assert _issue25_vector_hash(result.final_embedding) == "03313ab315bcf001167eb5edfa66cc6a613d5e91f03281db97551c777c7bbd6b"
+
+
+def test_stable_metadata_candidate_ignores_volatile_fields_but_preserves_content_and_payload():
+    candidate_version = "repo-embedding-v3-stable-metadata-v1"
+    source = _issue25_source()
+    changed_metrics = {
+        **source,
+        "star_count": 9001,
+        "fork_count": 701,
+        "open_issues_count": 88,
+        "pushed_days_ago": 27,
+        "delta_3d": 14,
+        "delta_7d": 72,
+        "delta_30d": 310,
+        "mentionable_users_count": 123,
+        "discovery_category": "popular",
+        "discovery_band": "low",
+    }
+    pipeline = _issue25_pipeline(candidate_version)
+    first = pipeline.embed_repository(source)
+    second = pipeline.embed_repository(changed_metrics)
+    encoded_texts = pipeline.embedder.calls[0]
+    metadata_text = next(text for text in encoded_texts if text.startswith("Repository:"))
+
+    assert first.embedding_version == candidate_version
+    assert first.payload["embedding_version"] == candidate_version
+    assert first.source_hash == second.source_hash
+    assert first.metadata_embedding == second.metadata_embedding
+    assert first.final_embedding == second.final_embedding
+    assert any("README documents v2 and 384-dimensional vectors." in text for text in encoded_texts)
+    assert "Description: Parses protocol v2 with 384-dimensional embeddings." in metadata_text
+    assert "Primary language: Python" in metadata_text
+    assert "search" in metadata_text and "Rust" in metadata_text and "vector search" in metadata_text
+    assert not any(label in metadata_text for label in (
+        "Stars:", "Forks:", "Open issues:", "Pushed days ago:", "Star deltas:",
+        "Contributor signal:", "Discovery category:", "Discovery band:",
+    ))
+    for field in (
+        "star_count", "fork_count", "open_issues_count", "pushed_days_ago", "delta_3d",
+        "delta_7d", "delta_30d", "mentionable_users_count", "discovery_category", "discovery_band",
+    ):
+        assert first.payload[field] == source[field]
+        assert second.payload[field] == changed_metrics[field]
+
+    changed_description = {**source, "description": "Parses protocol v2 with 768-dimensional embeddings."}
+    third = pipeline.embed_repository(changed_description)
+    assert third.source_hash != first.source_hash
+    assert third.metadata_embedding != first.metadata_embedding
+    assert third.final_embedding != first.final_embedding
+    third_texts = pipeline.embedder.calls[-1]
+    assert "768-dimensional" in next(text for text in third_texts if text.startswith("Repository:"))
+    assert any("README documents v2 and 384-dimensional vectors." in text for text in third_texts)
+    changed_readme = {**source, "readme": "README documents v3 and 384-dimensional vectors."}
+    fourth = pipeline.embed_repository(changed_readme)
+    assert fourth.source_hash != first.source_hash
+    assert fourth.readme_embedding != first.readme_embedding
+    assert fourth.final_embedding != first.final_embedding
+    assert first.source_hash != _issue25_pipeline().embed_repository(source).source_hash
+
+
+def test_stable_metadata_candidate_iter_index_rejects_before_qdrant_bootstrap(monkeypatch):
+    from embedding import embedding_pipeline as pipeline_module
+    pipeline = _issue25_pipeline("repo-embedding-v3-stable-metadata-v1")
+    store_calls = []
+
+    class LocalStore:
+        def __init__(self, **kwargs):
+            store_calls.append("construct")
+
+        def ensure_collection(self):
+            store_calls.append("ensure")
+
+        def iter_upsert(self, results, **kwargs):
+            store_calls.append("write")
+            yield from results
+
+    monkeypatch.setattr(pipeline_module, "QdrantRepositoryStore", LocalStore)
+    with pytest.raises(ValueError):
+        list(pipeline.iter_index([_issue25_source()]))
+    assert store_calls == []
+    assert pipeline.store is None
+
+    with pytest.raises(ValueError):
+        pipeline.search("a query for the candidate-only recipe")
+    assert store_calls == []
+    assert pipeline.store is None
+
+
+def test_stable_metadata_candidate_is_rejected_by_qdrant_point_validation():
+    from embedding.qdrant_store import QdrantRepositoryStore
+    candidate = _issue25_pipeline("repo-embedding-v3-stable-metadata-v1").embed_repository(_issue25_source())
+    store = QdrantRepositoryStore(client=object(), collection_name="isolated-test", corpus_authority=None)
+
+    with pytest.raises(ValueError):
+        store._validated_point(candidate, point_id=REPO_ID)
+
+
+def _issue25_write_snapshot(path, repositories):
+    import json
+    path.write_text(json.dumps({"repositories": repositories}), encoding="utf-8")
+    return path
+
+
+def test_stable_metadata_export_preserves_frozen_payload_and_computed_readme_chunks(
+    tmp_path,
+):
+    import json
+    from pathlib import Path
+
+    from config import EMBEDDING_MODEL_REVISION, STABLE_METADATA_EMBEDDING_VERSION
+    from scripts.export_stable_metadata_candidate import export_snapshot
+
+    fixture_path = Path(__file__).parent / "fixtures/recommendation_public_catalog/snapshot.json"
+    source_row = json.loads(fixture_path.read_text(encoding="utf-8"))["repositories"][0]
+    frozen_payload = dict(source_row["payload"])
+    assert not frozen_payload.get("readme")
+    input_path = _issue25_write_snapshot(tmp_path / "snapshot.json", [source_row])
+    output_path = tmp_path / "candidate.jsonl"
+
+    assert export_snapshot(
+        input_path, output_path,
+        pipeline=_issue25_pipeline(STABLE_METADATA_EMBEDDING_VERSION),
+    ) == 1
+    record = json.loads(output_path.read_text(encoding="utf-8"))
+    exported_payload = record["payload"]
+    expected_payload = dict(frozen_payload)
+    expected_payload.pop(REPOSITORY_SERVING_ELIGIBILITY_FIELD)
+    expected_payload["readme_chunks"] = 0
+    expected_payload.update({
+        "embedding_dim": REPOSITORY_EMBEDDING_DIM,
+        "embedding_model": REPOSITORY_EMBEDDING_MODEL,
+        "embedding_model_revision": EMBEDDING_MODEL_REVISION,
+        "embedding_version": STABLE_METADATA_EMBEDDING_VERSION,
+        "source_hash": record["source_hash"],
+    })
+
+    assert exported_payload == expected_payload
+    assert exported_payload["doc_quality"] == frozen_payload["doc_quality"]
+    assert exported_payload["category"] == frozen_payload["category"]
+    assert exported_payload["readme_chunks"] == 0
+    assert len(record["vector"]) == REPOSITORY_EMBEDDING_DIM
+    assert record["recipe_id"] == STABLE_METADATA_EMBEDDING_VERSION
+
+
+def test_stable_metadata_export_rejects_malformed_snapshot_without_output(tmp_path):
+    from scripts.export_stable_metadata_candidate import export_snapshot
+
+    input_path = tmp_path / "malformed.json"
+    input_path.write_text('{"repositories": null}', encoding="utf-8")
+    output_path = tmp_path / "candidate.jsonl"
+
+    with pytest.raises(ValueError, match="frozen JSON snapshot"):
+        export_snapshot(input_path, output_path, pipeline=_issue25_pipeline(
+            "repo-embedding-v3-stable-metadata-v1",
+        ))
+
+    assert not output_path.exists()
+
+
+def test_stable_metadata_export_does_not_overwrite_a_racing_destination(tmp_path, monkeypatch):
+    from scripts import export_stable_metadata_candidate as exporter
+
+    input_path = _issue25_write_snapshot(
+        tmp_path / "snapshot.json",
+        [{"repo_id": REPO_ID, "payload": _issue25_source()}],
+    )
+    output_path = tmp_path / "candidate.jsonl"
+    write_exclusive = exporter._write_jsonl_exclusive
+
+    def publish_racing_destination(path, records):
+        path.write_text("created concurrently", encoding="utf-8")
+        write_exclusive(path, records)
+
+    monkeypatch.setattr(exporter, "_write_jsonl_exclusive", publish_racing_destination)
+    with pytest.raises(FileExistsError):
+        exporter.export_snapshot(
+            input_path, output_path,
+            pipeline=_issue25_pipeline("repo-embedding-v3-stable-metadata-v1"),
+        )
+
+    assert output_path.read_text(encoding="utf-8") == "created concurrently"
+
+
+def test_stable_metadata_export_uses_configured_hf_cache_and_local_only(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+
+    from config import EMBEDDING_MODEL_REVISION
+    from scripts import export_stable_metadata_candidate as exporter
+
+    cache_root = tmp_path / "hf-cache"
+    monkeypatch.setattr(exporter, "HF_HUB_CACHE", str(cache_root))
+    model_snapshot = exporter._default_model_snapshot()
+    model_snapshot.mkdir(parents=True)
+    for name in ("modules.json", "config.json", "model.safetensors", "tokenizer.json"):
+        (model_snapshot / name).touch()
+
+    model = MagicMock()
+    model.get_embedding_dimension.return_value = REPOSITORY_EMBEDDING_DIM
+    constructor = MagicMock(return_value=model)
+    pipeline_factory = MagicMock(return_value=object())
+    monkeypatch.setattr("sentence_transformers.SentenceTransformer", constructor)
+    monkeypatch.setattr(exporter, "RepositoryEmbeddingPipeline", pipeline_factory)
+
+    exporter._build_local_pipeline(model_snapshot)
+
+    assert model_snapshot == (
+        cache_root
+        / "models--sentence-transformers--all-MiniLM-L6-v2"
+        / "snapshots"
+        / EMBEDDING_MODEL_REVISION
+    )
+    constructor.assert_called_once_with(
+        str(model_snapshot), device="cpu", local_files_only=True,
+    )
