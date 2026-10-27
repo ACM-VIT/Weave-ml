@@ -6,6 +6,9 @@ import asyncio
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 import logging
+import json
+import math
+from functools import lru_cache
 import os
 import re
 import time
@@ -25,9 +28,52 @@ from utils.observability import authenticated_request_id, operation_for_path, sp
 load_dotenv()
 
 logger = logging.getLogger("pipeline.api")
+# Own only this audit channel: ordinary uvicorn logging does not enable the
+# pipeline logger or render LogRecord extras. JSON lives in the emitted message.
+feedback_audit_logger = logging.getLogger("pipeline.feedback.audit")
+feedback_audit_logger.setLevel(logging.INFO)
+feedback_audit_logger.propagate = False
+if not feedback_audit_logger.handlers:
+    audit_handler = logging.StreamHandler()
+    audit_handler.setFormatter(logging.Formatter("%(message)s"))
+    feedback_audit_logger.addHandler(audit_handler)
 MAX_REQUEST_BODY_BYTES = 256 * 1024
 REPOSITORY_EMBED_MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
 MAX_VALIDATION_ERROR_DETAILS = 50
+
+
+class FeedbackRequestLimiter:
+    """Bound authenticated request rate per process, separately from worker slots.
+
+    Constant memory; shared by all backend callers, never keyed by attacker input.
+    Replicas each have their own budget; restart starts with one full burst.
+    """
+
+    def __init__(self, rate: int, burst: int, *, clock=time.monotonic):
+        if any(type(value) is not int or not 1 <= value <= 10_000 for value in (rate, burst)):
+            raise ValueError("Feedback rate and burst must be integers in 1..10000")
+        self.rate, self.burst, self.clock = rate, burst, clock
+        self.tokens, self.updated = float(burst), clock()
+        self.lock = threading.Lock()
+
+    def retry_after(self) -> int:
+        with self.lock:
+            now = self.clock()
+            self.tokens = min(self.burst, self.tokens + max(0, now - self.updated) * self.rate)
+            self.updated = now
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return 0
+            return max(1, math.ceil((1 - self.tokens) / self.rate))
+
+
+@lru_cache(maxsize=1)
+def feedback_request_limiter() -> FeedbackRequestLimiter:
+    return FeedbackRequestLimiter(
+        int(os.getenv("V2_FEEDBACK_REQUESTS_PER_SECOND", "20")),
+        int(os.getenv("V2_FEEDBACK_REQUEST_BURST", "40")),
+    )
+
 
 def _request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", "") or uuid.uuid4())
@@ -81,6 +127,7 @@ async def lifespan(app: FastAPI):
         if production_issues:
             issue_names = ", ".join(sorted({issue.name for issue in production_issues}))
             raise RuntimeError(f"Production configuration is invalid: {issue_names}")
+    feedback_request_limiter()  # Reject invalid rate configuration before serving.
     settings = validate_v2_runtime_configuration()
     secret = os.getenv("INTERNAL_API_SECRET", "")
     if settings.production and not re.fullmatch(r"[0-9a-f]{64}", secret):
@@ -200,6 +247,12 @@ app = FastAPI(
 )
 
 
+@app.get("/healthz", include_in_schema=False)
+async def public_liveness():
+    """Static process liveness only; never a dependency/readiness authority."""
+    return {"status": "ok"}
+
+
 @app.exception_handler(RequestValidationError)
 async def request_validation_error(request: Request, exc: RequestValidationError):
     validation_errors = exc.errors()
@@ -296,7 +349,7 @@ async def unhandled_service_error(request: Request, exc: Exception):
 
 @app.middleware("http")
 async def authenticate_non_health_routes(request: Request, call_next):
-    """Fail closed for every route, including all health tiers."""
+    """Fail closed except the exact static public liveness method and path."""
     # Preserve the existing response/error request-id contract. Legacy values
     # are never adopted by trace context or exported in diagnostic spans.
     supplied_request_id = request.headers.get("x-request-id", "").strip()
@@ -305,6 +358,10 @@ async def authenticate_non_health_routes(request: Request, call_next):
         if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", supplied_request_id)
         else str(uuid.uuid4())
     )
+    if request.method == "GET" and request.url.path == "/healthz":
+        response = await call_next(request)
+        response.headers["x-request-id"] = request.state.request_id
+        return response
     if request.method in {"POST", "PUT", "PATCH"}:
         raw_content_length = request.headers.get("content-length")
         if raw_content_length is None:
@@ -349,7 +406,8 @@ async def authenticate_non_health_routes(request: Request, call_next):
             message="Internal API authentication is not configured.",
             retryable=False,
         )
-    supplied = request.headers.get(internal_api_header_name())
+    credentials = request.headers.getlist(internal_api_header_name())
+    supplied = credentials[0] if len(credentials) == 1 else None
     if not constant_time_secret_matches(supplied, secret):
         return _error_response(
             request,
@@ -358,6 +416,16 @@ async def authenticate_non_health_routes(request: Request, call_next):
             message="Unauthorized.",
             retryable=False,
         )
+    if request.method == "POST" and request.url.path == "/api/v2/feedback/batch":
+        try:
+            retry_after = feedback_request_limiter().retry_after()
+        except ValueError:
+            return _error_response(request, status_code=503, code="RATE_LIMIT_NOT_CONFIGURED",
+                                   message="Feedback rate configuration is invalid.", retryable=False)
+        if retry_after:
+            return _error_response(request, status_code=429, code="RATE_LIMITED",
+                                   message="Feedback request rate exceeded; retry the unchanged batch.",
+                                   retryable=True, headers={"Retry-After": str(retry_after)})
     request_ids = request.headers.getlist("x-request-id")
     traceparents = request.headers.getlist("traceparent")
     correlation_request_id = authenticated_request_id(
@@ -386,6 +454,13 @@ async def observe_api_requests(request: Request, call_next):
         response = await call_next(request)
         return response
     finally:
+        if request.method == "POST" and request.url.path == "/api/v2/feedback/batch":
+            status_code = response.status_code if response is not None else 500
+            # Fixed fields only: never log headers, identity, events or input IDs.
+            feedback_audit_logger.info(json.dumps({
+                "event": "feedback_boundary", "status": status_code,
+                "outcome": "acknowledged" if status_code == 202 else "not_acknowledged",
+            }, separators=(",", ":")))
         if request.url.path.startswith("/api/v2/"):
             record_api_request(
                 path=request.url.path,

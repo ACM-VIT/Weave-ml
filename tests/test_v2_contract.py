@@ -465,5 +465,7 @@ def test_every_non_health_route_is_guarded(monkeypatch):
         if not path:
             continue
         method = "POST" if "POST" in methods else "GET"
+        if path == "/healthz" and method == "GET":
+            continue
         response = client.request(method, path)
         assert response.status_code == 401, path
