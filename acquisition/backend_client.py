@@ -317,6 +317,7 @@ def repository_upsert_record(source: Any) -> dict[str, Any]:
         else str(canonical_readme)
     )
     return {
+        **({"lifecycle": payload["lifecycle"]} if payload.get("lifecycle") is not None else {}),
         "github_id": github_id,
         "github_node_id": github_node_id,
         "owner_github_id": owner_github_id,

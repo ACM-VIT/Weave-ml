@@ -1,4 +1,3 @@
-"""Coverage equivalence, identity invalidation, memory and concurrency regressions."""
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from difflib import SequenceMatcher
@@ -8,27 +7,26 @@ import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
-
 import pytest
-
 from summarization import reuse
 from summarization.pipeline import CardSummaryPipeline
 from summarization.provider import SummaryProviderError
 from summarization.reuse import SummaryReuseCache, source_identity
 from summarization.settings import SummarySettings
-from summarization.validation import (
-    _near_copy, _words, analyze_comparison_texts, parse_summary_response,
-    validate_generated_summary,
-)
+from summarization.validation import _near_copy, _words, analyze_comparison_texts, parse_summary_response, validate_generated_summary
+import hashlib
+from copy import deepcopy
 
+
+# Summary reuse
 
 SUMMARY = (
     "A focused workspace gives engineering teams a clear view of proposed software changes. "
     "It brings ownership decisions and review history together so maintainers can coordinate their work."
 )
+
 REPO = {"repo_id": "repo-88", "full_name": "weave/review", "description": "Tools for reviewing changes.",
         "readme": "# Overview\nA collaborative tool supports maintainers working across shared projects."}
-
 
 class Provider:
     def __init__(self):
@@ -37,7 +35,6 @@ class Provider:
     def generate(self, *args, **kwargs):
         self.calls += 1
         return json.dumps({"summary": SUMMARY, "highlights": ["Shared review tools"]})
-
 
 def reference_near_copy(summary, source):
     """Pre-optimization algorithm kept as an independent detection oracle."""
@@ -60,7 +57,6 @@ def reference_near_copy(summary, source):
     return any(SequenceMatcher(None, words, source_words[i:i+len(words)], autojunk=False).ratio() >= .84
                for i in starts)
 
-
 def test_window_shortlist_matches_original_on_randomized_and_adversarial_inputs():
     rng = random.Random(88)
     for _ in range(400):
@@ -73,7 +69,6 @@ def test_window_shortlist_matches_original_on_randomized_and_adversarial_inputs(
                 candidate[i] = "replacement"
         source, candidate = " ".join(source), " ".join(candidate)
         assert _near_copy(candidate, source) == reference_near_copy(candidate, source)
-
 
 @pytest.mark.parametrize("length", [8, 9, 10, 11, 12, 36, 53])
 def test_tail_and_off_grid_copies_keep_detection_coverage(length):
@@ -89,11 +84,9 @@ def test_tail_and_off_grid_copies_keep_detection_coverage(length):
     assert reference_near_copy(candidate, source)
     assert _near_copy(candidate, source)
 
-
 def test_disjoint_source_skips_sequence_matcher():
     with patch("summarization.validation.SequenceMatcher", side_effect=AssertionError("impossible match")):
         assert not _near_copy(SUMMARY, "unrelated tokens only " * 2000)
-
 
 def test_analysis_is_shared_by_summary_highlights_and_repair():
     provider = Provider()
@@ -114,7 +107,6 @@ def test_analysis_is_shared_by_summary_highlights_and_repair():
     assert provider.calls == 2
     assert pipeline.reuse_cache.snapshot()["artifact_hits"] == 1
 
-
 @pytest.mark.parametrize("field,value", [
     ("repo_id", "another-repo"), ("github_id", "456"), ("full_name", "weave/another"),
     ("content_hash", "changed"), ("readme", REPO["readme"] + " New evidence."),
@@ -130,7 +122,6 @@ def test_source_changes_invalidate_artifact_reuse(field, value):
     changed = {**REPO, field: value}
     assert pipeline.summarize(changed, changed).source == "generated"
     assert provider.calls == 2
-
 
 @pytest.mark.parametrize("field,value", [
     ("model_id", "another/model"), ("prompt_version", "next-prompt"),
@@ -148,7 +139,6 @@ def test_model_prompt_and_format_changes_invalidate_reuse(field, value):
     pipeline.summarize(REPO, REPO)
     assert provider.calls == 2
 
-
 @pytest.mark.parametrize("version", ["SUMMARY_VALIDATION_VERSION", "SOURCE_ANALYSIS_VERSION"])
 def test_policy_versions_invalidate_artifact_reuse(monkeypatch, version):
     provider = Provider()
@@ -157,7 +147,6 @@ def test_policy_versions_invalidate_artifact_reuse(monkeypatch, version):
     monkeypatch.setattr(reuse, version, "next-version")
     pipeline.summarize(REPO, REPO)
     assert provider.calls == 2
-
 
 def test_unprompted_tail_and_object_evidence_invalidate_reuse():
     provider = Provider()
@@ -170,7 +159,6 @@ def test_unprompted_tail_and_object_evidence_invalidate_reuse():
     changed = {**repo, "readme": repo["readme"] + " Changed at the very end."}
     pipeline.summarize(source, changed)
     assert provider.calls == 3
-
 
 def test_transient_fallback_is_regenerated_and_returned_artifacts_are_isolated():
     provider = Provider()
@@ -191,7 +179,6 @@ def test_transient_fallback_is_regenerated_and_returned_artifacts_are_isolated()
     assert cached.summary == SUMMARY
     assert cached.highlights == ["Shared review tools"]
     assert provider.calls == 2
-
 
 def test_duplicate_work_coalesces_and_waiter_deadline_preserves_reserve():
     entered, release = threading.Event(), threading.Event()
@@ -216,7 +203,6 @@ def test_duplicate_work_coalesces_and_waiter_deadline_preserves_reserve():
     assert provider.calls == 1
     assert pipeline.reuse_cache.snapshot()["inflight"] == 0
 
-
 def test_flight_failure_releases_slot_and_next_call_can_regenerate():
     provider = Provider()
     pipeline = CardSummaryPipeline(provider=provider)
@@ -225,7 +211,6 @@ def test_flight_failure_releases_slot_and_next_call_can_regenerate():
             pipeline.summarize(REPO, REPO)
     assert pipeline.reuse_cache.snapshot()["inflight"] == 0
     assert pipeline.summarize(REPO, REPO).source == "generated"
-
 
 def test_cache_entry_byte_and_inflight_limits():
     cache = SummaryReuseCache(max_entries=2, max_bytes=6000, max_inflight=1)
@@ -248,7 +233,6 @@ def test_cache_entry_byte_and_inflight_limits():
     assert tiny.snapshot()["entries"] == 0
     assert tiny.snapshot()["provider_calls"] == 2
 
-
 def test_oversized_sources_bypass_cache_and_fail_closed():
     repo = {**REPO, "readme": "x" * 64001}
     provider = Provider()
@@ -258,14 +242,12 @@ def test_oversized_sources_bypass_cache_and_fail_closed():
     assert pipeline.reuse_cache.snapshot()["entries"] == 0
     assert provider.calls == 0
 
-
 def test_prepared_and_direct_validation_have_identical_results():
     content = parse_summary_response(json.dumps({"summary": SUMMARY}))
     texts = (REPO["readme"], "An extra source variant for validation.")
     assert validate_generated_summary(content, comparison_texts=texts) == validate_generated_summary(
         content, source_analysis=analyze_comparison_texts(texts),
     )
-
 
 def test_durable_provenance_survives_restart_without_changing_public_json(monkeypatch):
     from summarization.contracts import card_summary_from_payload, card_summary_payload
@@ -286,7 +268,6 @@ def test_durable_provenance_survives_restart_without_changing_public_json(monkey
     payload["card_summary_reuse_key"] = "0" * 64
     assert card_summary_from_payload(payload) is None
 
-
 def test_legacy_generated_artifact_requires_source_key_before_durable_reuse():
     from summarization.contracts import CardSummaryArtifact, card_summary_from_payload, card_summary_payload
 
@@ -299,7 +280,6 @@ def test_legacy_generated_artifact_requires_source_key_before_durable_reuse():
     # Revalidation must still protect a matching-key artifact after tampering.
     generated.summary = "Run npm install to start. This is a useful tool."
     assert not pipeline.is_current(generated, repo=REPO)
-
 
 def test_full_api_topic_and_language_limits_have_durable_provenance():
     provider = Provider()
@@ -314,3 +294,118 @@ def test_full_api_topic_and_language_limits_have_durable_provenance():
     assert not pipeline.is_current(artifact, repo=changed)
     pipeline.summarize(changed, changed)
     assert provider.calls == 2
+
+
+# Summary prefix
+
+def large_repo(tail='TAIL_NOT_FOR_PROVIDER'):
+    raw = '# Overview\n' + 'A collaborative workspace supports software maintainers.\n' * 1400 + tail
+    return {**REPO, 'readme': raw, 'clean_text': raw,
+            'extracted_paragraphs': ['stale derived content'] * 100,
+            'content_hash': hashlib.sha256(raw.encode()).hexdigest()}
+
+def test_explicit_prefix_mode_generates_replays_and_keeps_canonical_readme_unchanged():
+    repo = large_repo()
+    original = deepcopy(repo)
+    provider = Provider()
+    pipeline = CardSummaryPipeline(settings=SummarySettings(source_overflow_policy='prefix'), provider=provider)
+    artifact = pipeline.summarize(repo, repo)
+    assert artifact.source == 'generated'
+    assert pipeline.is_current(artifact, repo=repo)
+    assert pipeline.summarize(repo, repo).model_dump() == artifact.model_dump()
+    assert provider.calls == 1
+    assert repo == original
+    material = pipeline._analysis(repo, repo, pipeline._reuse_key(repo, repo)).material
+    assert material.analysis_limit is None
+    assert len(material.prompt_input) <= 12000
+    assert all(len(value) <= 64000 for value in material.comparison_texts)
+    assert 'TAIL_NOT_FOR_PROVIDER' not in material.prompt_input
+    changed = large_repo('A DIFFERENT UNSEEN TAIL')
+    assert not pipeline.is_current(artifact, repo=changed)
+    pipeline.summarize(changed, changed)
+    assert provider.calls == 2
+
+def test_prefix_mode_requires_full_canonical_content_hash():
+    provider = Provider()
+    pipeline = CardSummaryPipeline(settings=SummarySettings(source_overflow_policy='prefix'), provider=provider)
+    for content_hash in [None, '', 'not-a-canonical-hash']:
+        assert pipeline.summarize(large_repo() | {'content_hash': content_hash}, large_repo() | {'content_hash': content_hash}).source == 'description_fallback'
+    assert provider.calls == 0
+
+def test_prefix_policy_is_part_of_reuse_identity():
+    repo = REPO | {'content_hash': 'a' * 64}
+    strict = CardSummaryPipeline(settings=SummarySettings())
+    prefix = CardSummaryPipeline(settings=SummarySettings(source_overflow_policy='prefix'))
+    assert strict._reuse_key(repo, repo) != prefix._reuse_key(repo, repo)
+
+def test_prefix_mode_preserves_copy_detection():
+    copied = ('A focused workspace gives engineering teams a clear view of proposed software changes. '
+              'It brings ownership decisions and review history together so maintainers can coordinate their work.')
+    repo = large_repo()
+    repo['readme'] = copied + '\n' + repo['readme']
+    repo['content_hash'] = hashlib.sha256(repo['readme'].encode()).hexdigest()
+    provider = Provider()
+    pipeline = CardSummaryPipeline(settings=SummarySettings(source_overflow_policy='prefix'), provider=provider)
+    assert pipeline.summarize(repo, repo).source == 'description_fallback'
+    assert provider.calls == 2
+
+def test_prefix_setting_is_explicit_and_validated(monkeypatch):
+    monkeypatch.setenv('SUMMARY_SOURCE_OVERFLOW_POLICY', 'prefix')
+    assert SummarySettings.from_env().source_overflow_policy == 'prefix'
+    with pytest.raises(ValueError, match='SUMMARY_SOURCE_OVERFLOW_POLICY'):
+        SummarySettings(source_overflow_policy='ignore')
+
+@pytest.mark.parametrize('policy,valid', [('prefix', True), ('reject', True), ('ignore', False)])
+def test_production_preflight_checks_prefix_policy(policy, valid):
+    from scripts.validate_production_config import validate_production_config
+    from tests.test_production_config import valid_production_env
+    env = valid_production_env() | {'SUMMARY_SOURCE_OVERFLOW_POLICY': policy}
+    issues = validate_production_config(env)
+    assert any(issue.name == 'SUMMARY_SOURCE_OVERFLOW_POLICY' for issue in issues) is not valid
+
+@pytest.mark.parametrize('policy', ['', '   '])
+def test_production_preflight_rejects_explicit_blank_prefix_policy(policy, monkeypatch):
+    from scripts.validate_production_config import validate_production_config
+    from tests.test_production_config import valid_production_env
+
+    env = valid_production_env() | {'SUMMARY_SOURCE_OVERFLOW_POLICY': policy}
+    assert any(issue.name == 'SUMMARY_SOURCE_OVERFLOW_POLICY'
+               for issue in validate_production_config(env))
+    monkeypatch.setenv('SUMMARY_SOURCE_OVERFLOW_POLICY', policy)
+    with pytest.raises(ValueError, match='SUMMARY_SOURCE_OVERFLOW_POLICY'):
+        SummarySettings.from_env()
+
+def test_absent_prefix_policy_uses_reject_default_in_preflight_and_runtime(monkeypatch):
+    from scripts.validate_production_config import validate_production_config
+    from tests.test_production_config import valid_production_env
+
+    env = valid_production_env()
+    env.pop('SUMMARY_SOURCE_OVERFLOW_POLICY', None)
+    assert not any(issue.name == 'SUMMARY_SOURCE_OVERFLOW_POLICY'
+                   for issue in validate_production_config(env))
+    monkeypatch.delenv('SUMMARY_SOURCE_OVERFLOW_POLICY', raising=False)
+    assert SummarySettings.from_env().source_overflow_policy == 'reject'
+
+def test_prefix_mode_bounds_line_overflow_below_character_limit():
+    from summarization.source import MAX_SOURCE_ANALYSIS_LINES
+    from utils.readme_processor import MAX_PREPROCESS_CHARS
+
+    raw = '# Overview\nA collaborative workspace supports software maintainers.\n' + '- x\n' * 5000
+    assert len(raw) < MAX_PREPROCESS_CHARS
+    assert len(raw.splitlines()) > MAX_SOURCE_ANALYSIS_LINES
+    repo = {**REPO, 'readme': raw, 'clean_text': raw,
+            'content_hash': hashlib.sha256(raw.encode()).hexdigest()}
+    original = deepcopy(repo)
+    provider = Provider()
+    pipeline = CardSummaryPipeline(settings=SummarySettings(source_overflow_policy='prefix'), provider=provider)
+    artifact = pipeline.summarize(repo, repo)
+    assert artifact.source == 'generated'
+    assert provider.calls == 1
+    assert pipeline.is_current(artifact, repo=repo)
+    assert repo == original
+    material = pipeline._analysis(repo, repo, pipeline._reuse_key(repo, repo)).material
+    assert material.analysis_limit is None
+    assert len(material.prompt_input) <= pipeline.settings.input_max_chars
+    changed = {**repo, 'readme': raw + 'changed unseen tail',
+               'content_hash': hashlib.sha256((raw + 'changed unseen tail').encode()).hexdigest()}
+    assert not pipeline.is_current(artifact, repo=changed)

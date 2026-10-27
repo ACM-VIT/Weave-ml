@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ingestion.lifecycle import LIFECYCLE_FIELDS, merge_lifecycle
+
 import asyncio
 import copy
 import logging
@@ -9,13 +11,15 @@ import time
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 from api.contracts import (
-    RecommendationResponse, FeedbackResponse, RepositoryIndexResponse,
+    ModelOperationBatch, ModelOperationResponse, ModelAuthorityRequest, ModelAuthorityResponse,
+    ProfileWithdrawalBatch, ProfileWithdrawalResponse, ModelOperationStatusRequest, ModelOperationStatusResponse,
+    RecommendationResponse, RecommendationWireResponse, FeedbackResponse, RepositoryIndexResponse,
     RepositoryRefreshResponse, OnboardingResponse,
     FeedbackBatch,
     OnboardingJob,
@@ -37,6 +41,7 @@ from api.runtime import (
     service_runtime_drain_actions,
     validate_service_runtime,
 )
+from api.scoring_capture import CaptureWorkerError, CapturedRequest, authorized_capture_options, execute_captured_request
 from api.request_budget import run_read_only_request
 from api.health import HealthDiagnostics, HealthSettings
 from api.metrics import record_health_dependency, record_recommendation, render_prometheus
@@ -129,7 +134,7 @@ _REPOSITORY_FEATURE_DEPENDENCIES = {
         {"fork_count", "open_issues_count", "pushed_days_ago"}
     ),
     "activity_score": frozenset(
-        {"pushed_days_ago", "mentionable_users_count"}
+        {"pushed_days_ago"}
     ),
     "trend_velocity": frozenset({"delta_3d", "delta_7d", "delta_30d"}),
 }
@@ -283,12 +288,14 @@ def _is_temporary_dependency_error(exc: Exception) -> bool:
     non-retryable 500; treating all exceptions as temporary creates backend
     retry storms and can conceal stored-data corruption.
     """
+    from feedback.long_session import OperationGap
     if isinstance(
         exc,
         (
             ConnectionError,
             TimeoutError,
             RetrievalDependencyError,
+            OperationGap,
             LockAcquisitionError,
             LockLostError,
             EmbeddingCapacityError,
@@ -495,6 +502,10 @@ def _runtime_drain_actions():
 def _runtime_cleanup_actions():
     """Capture close methods before cache clears can discard failed resources."""
     actions = []
+    from feedback.model_runtime import model_runtime
+    if model_runtime.cache_info().currsize:
+        actions.append(("model_lane.close", model_runtime().close))
+    actions.append(("model_lane.cache.clear", model_runtime.cache_clear))
     if producer.cache_info().currsize:
         close = getattr(producer().redis, "close", None)
         if callable(close):
@@ -772,6 +783,8 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
                 error_code="REPOSITORY_CONTENT_HASH_CONFLICT",
                 retryable=False,
             )
+        expected_point = _apply_lifecycle_observation(expected_point, request.repository.lifecycle, lock)
+        stored_payload = dict(expected_point.payload or {})
         artifact = card_summary_from_payload(stored_payload)
         if artifact is None or not pipeline.card_summarizer.is_current(
             artifact, repo=summary_context(artifact)
@@ -839,12 +852,36 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any, deadline: fl
             if field in expected_payload:
                 result.payload[field] = copy.deepcopy(expected_payload[field])
 
+    # Lifecycle uses observation time, not content version. A stale content job
+    # must never erase a newer status or revive an archived repository.
+    for field in LIFECYCLE_FIELDS:
+        result.payload.pop(field, None)
+    result.payload.update(_validated_lifecycle_merge(
+        dict(expected_point.payload or {}) if expected_point is not None else {},
+        request.repository.lifecycle,
+    ))
+
     lock.assert_owned()
     stored = repository_store().compare_and_set_content(
         result,
         expected_point=expected_point,
     )
     lock.assert_owned()
+    # A competing content writer may win this CAS without the independent
+    # lifecycle observation. Never acknowledge content success until status
+    # survives too; retry applies it through the lifecycle-only replay path.
+    actual_payload = dict(stored.payload or {}) if stored is not None else {}
+    if request.repository.lifecycle is not None and any(
+        actual_payload.get(field) != result.payload[field]
+        for field in LIFECYCLE_FIELDS if field in result.payload
+    ):
+        raise V2ServiceHTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Repository lifecycle state changed during the write; retry the request.",
+            error_code="CONCURRENT_REPOSITORY_WRITE",
+            retryable=True,
+            headers={"Retry-After": "2"},
+        )
     final_status, final_version = _repository_cas_outcome(
         stored,
         version_field="content_version",
@@ -934,6 +971,34 @@ def _repository_embedding_payload(request: RepositoryJob) -> dict[str, Any]:
     return payload
 
 
+def _validated_lifecycle_merge(stored, observation):
+    try:
+        return merge_lifecycle(stored, observation)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _apply_lifecycle_observation(expected_point, observation, lock):
+    stored_payload = dict(expected_point.payload or {})
+    lifecycle_features = _validated_lifecycle_merge(stored_payload, observation)
+    if any(stored_payload.get(field) != value for field, value in lifecycle_features.items()):
+        lock.assert_owned()
+        stored = repository_store().compare_and_set_lifecycle(
+            expected_point=expected_point, lifecycle_payload=lifecycle_features,
+        )
+        lock.assert_owned()
+        actual = dict(stored.payload or {}) if stored is not None else {}
+        # A filtered CAS can be a no-op and still return a newer content point.
+        # Never adopt that winner as the old request's summary-repair snapshot.
+        if any(actual.get(field) != stored_payload.get(field)
+               for field in ("content_version", "content_job_id", "content_hash")):
+            raise HTTPException(status_code=503, detail="Repository content changed during lifecycle update; retry the request.")
+        if any(actual.get(field) != value for field, value in lifecycle_features.items()):
+            raise HTTPException(status_code=503, detail="Repository lifecycle state changed; retry the request.")
+        return stored
+    return expected_point
+
+
 def _refresh_repository_job(request: RepositoryRefreshJob) -> dict[str, Any]:
     repo_id = str(request.repo_id)
     try:
@@ -959,22 +1024,30 @@ def _refresh_repository_job_locked(
             status_code=404, detail=f"Repository {repo_id} is not indexed."
         )
     expected_point = _single_repository_point(points)
-    job_status, current = _repository_job_status(
-        points,
-        version_field="feature_version",
-        job_field="feature_job_id",
-        requested_version=request.feature_version,
-        job_id=job_id,
-    )
+    stored_payload = dict(expected_point.payload or {})
+    current = int(stored_payload.get("feature_version") or 0)
+    try:
+        job_status, current = _repository_job_status(
+            points, version_field="feature_version", job_field="feature_job_id",
+            requested_version=request.feature_version, job_id=job_id,
+        )
+    except HTTPException:
+        # A delayed authoritative status must not disappear behind a newer
+        # unrelated stats job. Preserve the old job-ID misuse check.
+        if (request.features.lifecycle is None or request.feature_version >= current
+                or stored_payload.get("feature_job_id") == job_id):
+            raise
+        job_status = "current"
     if job_status != "apply":
+        _apply_lifecycle_observation(expected_point, request.features.lifecycle, lock)
         return {
-            "accepted": True,
-            "status": job_status,
-            "repo_id": repo_id,
-            "feature_version": current,
+            "accepted": True, "status": job_status,
+            "repo_id": repo_id, "feature_version": current,
         }
 
     requested_features = request.features.model_dump(mode="json", exclude_none=True)
+    lifecycle = requested_features.pop("lifecycle", None)
+    lifecycle_features = _validated_lifecycle_merge(dict(expected_point.payload or {}), lifecycle)
     observed_features = {
         field: value
         for field, value in requested_features.items()
@@ -1049,7 +1122,7 @@ def _refresh_repository_job_locked(
                 for field in inconsistent
             ],
         )
-    features = {**observed_features, **derived_features}
+    features = {**observed_features, **derived_features, **lifecycle_features}
     updated = {
         **dict(expected_point.payload or {}),
         **features,
@@ -1072,6 +1145,20 @@ def _refresh_repository_job_locked(
         },
     )
     lock.assert_owned()
+    # A stats writer can advance the feature revision after our initial read,
+    # fencing out this independent status observation too. Do not acknowledge
+    # or permanently reject the job until its lifecycle has been persisted.
+    actual_payload = dict(stored.payload or {}) if stored is not None else {}
+    if lifecycle is not None and any(
+        actual_payload.get(field) != value for field, value in lifecycle_features.items()
+    ):
+        raise V2ServiceHTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Repository lifecycle state changed during the write; retry the request.",
+            error_code="CONCURRENT_REPOSITORY_WRITE",
+            retryable=True,
+            headers={"Retry-After": "2"},
+        )
     final_status, final_version = _repository_cas_outcome(
         stored,
         version_field="feature_version",
@@ -1173,13 +1260,35 @@ def _onboard_user_job(request: OnboardingJob) -> dict[str, Any]:
         ) from exc
 
 
+def _captured_recommendation_job(request: CapturedRequest):
+    return execute_captured_request(retriever(), request)
+
+
 @router.post(
-    "/recommendations/generate", response_model=RecommendationResponse, dependencies=[Depends(require_internal_secret)]
+    "/recommendations/generate", response_model=RecommendationWireResponse, response_model_exclude_unset=True, dependencies=[Depends(require_internal_secret)],
+    openapi_extra={"parameters": [{
+        "in": "header", "name": "x-scoring-capture-capability", "required": False,
+        "schema": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$"},
+        "description": "Additional scoped capability required when scoring_capture is provided. Ordinary requests require only the internal service credential.",
+    }]},
 )
 async def generate_recommendations(
     request: RecommendationRequest,
     http_request: Request,
 ):
+    model_context = None
+    if request.model_context is not None:
+        from feedback.model_serving import Context
+        context = request.model_context
+        model_context = Context(str(request.user_id), context.session_id, int(context.epoch), context.policy_sha256,
+            int(context.minimum_applied_operation_version), int(context.required_profile_version), int(context.as_of_ms))
+    capture_job = None
+    if request.scoring_capture is not None:
+        options = authorized_capture_options(http_request, request.feed_version)
+        capture_job = CapturedRequest(str(request.user_id), str(request.generation_id), request.feed_version,
+            request.limit, tuple(str(item) for item in request.exclude_repo_ids),
+            tuple(str(item) for item in request.social_repo_ids), tuple(request.social_candidates),
+            request.context.cold_start, request.context.locale, options, model_context)
     arguments = (
         str(request.user_id), request.limit,
         [str(item) for item in request.exclude_repo_ids], str(request.generation_id),
@@ -1190,10 +1299,12 @@ async def generate_recommendations(
     try:
         batch = await run_read_only_request(
             http_request, recommendation_timeout_seconds(),
-            lambda: run_recommendation_job(
-                retriever().recommend_batch,
-                *arguments,
-            ),
+            (lambda: run_recommendation_job(partial(_captured_recommendation_job, capture_job)))
+            if capture_job is not None else (lambda: run_recommendation_job(
+                partial(retriever().recommend_batch, *arguments, model_context=model_context)
+            )) if model_context is not None else (lambda: run_recommendation_job(
+                retriever().recommend_batch, *arguments,
+            )),
         )
     except HTTPException:
         raise
@@ -1209,12 +1320,22 @@ async def generate_recommendations(
             detail="Recommendation generation exceeded its bounded deadline.",
             headers={"Retry-After": "1"},
         ) from exc
+    except CaptureWorkerError:
+        raise V2ServiceHTTPException(status_code=503, error_code="SCORING_CAPTURE_UNAVAILABLE", retryable=True,
+            detail="Requested scoring capture is unavailable; retry after the provider is ready.",
+            headers={"Retry-After": "2"}) from None
     except Exception as exc:
         raise _operation_error(
             "recommendations",
             exc,
             request_id=str(http_request.state.request_id),
         ) from exc
+    if capture_job is not None:
+        if batch.failure_code is not None or batch.wire is None:
+            raise V2ServiceHTTPException(status_code=503, error_code="SCORING_CAPTURE_UNAVAILABLE", retryable=True,
+                detail="Requested scoring capture is unavailable; retry after the provider is ready.",
+                headers={"Retry-After": "2"})
+        return Response(content=batch.wire, media_type="application/json", headers={"Cache-Control": "no-store"})
     items = batch.items
     invalid_scores = any(not math.isfinite(item.score) for item in items)
     if len({item.repo_id for item in items}) != len(items) or invalid_scores:
@@ -1245,6 +1366,7 @@ async def generate_recommendations(
                 "cold_start_applied": request.context.cold_start,
                 "locale": "reserved_unused" if request.context.locale else "not_provided",
             },
+            **({"model_context": batch.model_context} if model_context is not None else {}),
             "items": [asdict(item) for item in items],
         }
 
@@ -1595,3 +1717,112 @@ async def repository_search(request: RepositorySearchRequest, http_request: Requ
         raise _operation_error(
             "repository_search", exc, request_id=str(request.search_id)
         ) from exc
+
+
+@router.post("/model-operations", response_model=ModelOperationResponse, response_model_exclude_unset=True, dependencies=[Depends(require_internal_secret)])
+async def submit_model_operations(request: ModelOperationBatch):
+    from feedback.model_runtime import model_runtime, ModelLaneUnavailable
+    from feedback.model_stream import OperationBytesConflict, OperationCapacity
+    from feedback.model_wire import WireError
+    try:
+        def enqueue():
+            runtime = model_runtime()
+            return {"schema_version": 1, "operations": runtime.stream.admit_batch(
+                [item.operation_json for item in request.operations])}
+        return await run_service_job("feedback", enqueue)
+    except WireError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except OperationBytesConflict:
+        raise HTTPException(status_code=409, detail="Model operation original bytes conflict.") from None
+    except (ModelLaneUnavailable, OperationCapacity, ServiceCapacityError, ServiceDeadlineExceeded):
+        raise HTTPException(status_code=503, detail="Model-operation acceptance unavailable; retry exact original bytes.",
+                            headers={"Retry-After": "2"}) from None
+    except Exception:
+        # Storage errors and uncertain admission remain retryable. No original
+        # feedback/profile text or credential-bearing dependency detail escapes.
+        raise HTTPException(status_code=503, detail="Model-operation storage unavailable; retry exact original bytes.",
+                            headers={"Retry-After": "2"}) from None
+
+
+@router.post("/model-authority", response_model=ModelAuthorityResponse, dependencies=[Depends(require_internal_secret)])
+async def read_model_authority(request: ModelAuthorityRequest):
+    from feedback.model_runtime import model_runtime
+    from feedback.model_serving import Context, owned_input, input_identity
+    try:
+        context = request.model_context
+        owned_context = Context(str(request.user_id), context.session_id, int(context.epoch), context.policy_sha256,
+            int(context.minimum_applied_operation_version), int(context.required_profile_version), int(context.as_of_ms))
+        def read():
+            runtime = model_runtime()
+            points = runtime.qdrant.retrieve(collection_name=runtime.settings.user_collection, ids=[str(request.user_id)],
+                with_vectors=True, with_payload=True, timeout=max(1, math.ceil(runtime.settings.qdrant_timeout_seconds)))
+            if len(points) != 1:
+                raise RuntimeError("applied user model is pending")
+            effective = owned_input(points[0], runtime.users, runtime.policy, owned_context)
+            return {"schema_version": 1, "model_context": input_identity(effective)}
+        return await run_service_job("feedback", read)
+    except Exception:
+        raise HTTPException(status_code=503, detail="Required applied model/profile/session state unavailable; retry.",
+                            headers={"Retry-After": "2"}) from None
+
+
+@router.post("/model-operation-withdrawals", response_model=ProfileWithdrawalResponse, dependencies=[Depends(require_internal_secret)])
+async def submit_profile_withdrawals(request: ProfileWithdrawalBatch):
+    from feedback.model_runtime import model_runtime
+    from feedback.model_stream import OperationBytesConflict
+    from feedback.model_wire import WireError, parse_withdrawal
+    try:
+        def enqueue():
+            runtime = model_runtime()
+            for item in request.withdrawals:
+                parse_withdrawal(item.withdrawal_json, maximum_bytes=runtime.stream.limits.input_bytes,
+                                 allowed_policies=runtime.stream.policies)
+            return {"schema_version": 1, "withdrawals": [runtime.stream.admit_withdrawal(item.withdrawal_json)
+                    for item in request.withdrawals]}
+        return await run_service_job("feedback", enqueue)
+    except WireError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except OperationBytesConflict:
+        raise HTTPException(status_code=409, detail="Withdrawal or original operation identity conflict.") from None
+    except Exception:
+        raise HTTPException(status_code=503, detail="Withdrawal acceptance unavailable; retry exact attestation bytes.",
+                            headers={"Retry-After": "2"}) from None
+
+
+@router.post("/model-operation-status", response_model=ModelOperationStatusResponse, response_model_exclude_unset=True,
+             dependencies=[Depends(require_internal_secret)])
+async def read_model_operation_status(request: ModelOperationStatusRequest, http_request: Request):
+    from feedback.model_runtime import model_runtime
+    from feedback.model_journal import OriginalIdentityConflict
+    from feedback.long_session import BootstrapState, WithdrawnProfile
+    try:
+        def read():
+            runtime = model_runtime()
+            snapshot = runtime.users.read_optional(str(request.user_id))
+            result = {"schema_version": 1, "user_id": str(request.user_id), "operation_id": str(request.operation_id),
+                "model_operation_version": request.model_operation_version,
+                "source_envelope_sha256": request.source_envelope_sha256, "status": "pending", "basis_status": "missing"}
+            if snapshot is None:
+                return result
+            result.update(basis_status="awaiting_profile" if isinstance(snapshot.state, BootstrapState) else "ready",
+                applied_operation_version=str(snapshot.state.operation_version),
+                applied_feedback_version=str(snapshot.state.feedback_version), current_head=snapshot.head)
+            if not isinstance(snapshot.state, BootstrapState):
+                result['applied_profile_version'] = str(snapshot.state.baseline.content_version)
+            if snapshot.state.operation_version < int(request.model_operation_version):
+                return result
+            proof = runtime.processor.coordinator.status_for_identity(snapshot, operation_id=str(request.operation_id),
+                operation_version=int(request.model_operation_version), source_sha256=request.source_envelope_sha256)
+            result.update(status=proof['status'], operation_head=proof['operation_head'])
+            if isinstance(proof['operation'], WithdrawnProfile):
+                result['withdrawal_sha256'] = proof['operation'].withdrawal_sha256
+            return result
+        return await run_read_only_request(http_request, service_timeout_seconds("feedback"),
+            lambda: run_service_job("feedback", read))
+    except HTTPException:
+        raise
+    except OriginalIdentityConflict:
+        raise HTTPException(status_code=409, detail="Original operation status identity conflict.") from None
+    except Exception:
+        raise HTTPException(status_code=503, detail="Required committed operation proof unavailable; retry.",
+                            headers={"Retry-After": "2"}) from None

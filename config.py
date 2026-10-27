@@ -148,6 +148,8 @@ QDRANT_DISTANCE = os.getenv("QDRANT_DISTANCE", "Cosine")
 QDRANT_PAYLOAD_INDEX_SCHEMA = {
     "repo_id": "keyword",
     "serving_eligibility_version": "keyword",
+    "lifecycle_archived": "bool",
+    "lifecycle_disabled": "bool",
     "embedding_model": "keyword",
     "embedding_model_revision": "keyword",
     "embedding_version": "keyword",

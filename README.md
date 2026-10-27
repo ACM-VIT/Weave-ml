@@ -23,8 +23,35 @@ Machine-learning and data-pipeline services for [gh-social](https://github.com/S
 - PostgreSQL only for offline acquisition and evaluation tooling
 - A GitHub personal access token for acquisition and trending ingestion
 
+Deprecated direct-SQL adapters do not provision or repair shared schemas.
+`PostgreSQLConnector.init_db()` and `TrendingStorage.init_schema()` retain their
+legacy names but only inspect PostgreSQL column metadata. Missing tables, missing
+columns, and incompatible types raise `SchemaCompatibilityError` and roll back;
+apply schema changes through the database owner's migration process before running
+these tools. Required legacy columns and accepted types are declared in
+`database/schema_readiness.py`. Extra columns are allowed, wider text columns and
+`bigint` counters are compatible. Unbounded `varchar` also satisfies required
+`text`, and explicit timestamp precision from 0 through 6 is accepted. Canonical V2 acquisition uses backend ingestion
+instead; online feedback writes durable ML events without mutating product counters.
+The backend owns product counter transactions, including duplicate and rollback
+handling. ML initialization never creates extensions, tables, columns, or indexes.
+
 README chunking and the opt-in token-aware, section-weighted representation are documented in
 [README embedding aggregation](docs/README_EMBEDDING_AGGREGATION.md), including baseline evaluation and coordinated migration.
+
+Compatibility ingestion in `ingestion/` still stores a 384-dimensional zero
+placeholder instead of comparing repository embeddings. Its `NoveltyMatrix`
+therefore reports `measurement_status="unmeasured"`, with score and penalty
+fields set to `None`; string and batch output render that state as
+`UNMEASURED`. Legacy prefilters remain separate from novelty, and this
+diagnostic contract does not change canonical V2 serving vectors or their
+versioned Qdrant payloads. Centroid topology is descriptive only and requires
+at least four finite, non-zero vectors across two categories, with matching
+dimensions and complete model, revision, embedding, and feature-spec provenance.
+Compatibility ingestion keeps corpus novelty as a diagnostic and applies no
+novelty-based admission rejection or penalty. This path does not produce a
+measured semantic novelty score. Introducing one later would require a separate
+versioned reference set and reviewed semantic definitions and thresholds.
 
 Local development downloads the configured SentenceTransformer on first use.
 The production image instead bakes an immutable model revision and starts with
@@ -229,6 +256,38 @@ replace the runtime model/cache rather than mutating them in place. Bump
 `TOWER_PREPROCESSING_VERSION` when changing tower projection/chunk/aggregation
 semantics. Direct pipelines without a supplied model-owned cache stay uncached.
 
+Offline corpus helpers support `pipeline.iter_embed(sources)` and
+`pipeline.iter_index(sources)` (also exported as `iter_embed_repositories` and
+`iter_index_repositories`). Pass a lazy source iterator and consume results
+without collecting them to retain bounded memory. `embed_batch`/`index_batch`
+and their existing convenience functions still return lists and deliberately
+retain the requested output. Iterator execution begins on first advancement.
+
+Offline lookahead is eight repositories. Each source has a 1 MiB UTF-8 field
+budget (including README fields on enrichment objects, nesting at most 64), and
+at most 2,048 prepared encoder inputs. Oversized sources fail explicitly; split
+or prevalidate offline inputs instead of silently truncating a reserved vector
+identity. Encoder groups independently cap eight texts, 2,048 padded tokens and
+256 KiB of UTF-8 text, with the original per-input tokenizer truncation. Groups
+can cross repository boundaries; tower composition, ordering, summary/source
+identity and cache ownership remain repository-local. Floating-point encoder
+batch effects should be qualified against the intended frozen model before a
+corpus migration; aggregation itself is unchanged.
+
+`store.iter_upsert(results, max_points=64, max_request_bytes=1048576)` streams
+acknowledged results. Limits count the exact Qdrant REST JSON serialization,
+including UTF-8 payloads and the request envelope; a point larger than its byte
+budget fails before its request. Every chunk retains corpus-authority fencing,
+eligibility validation and synchronous writes. `iter_index` uses eight-point
+chunks and yields each acknowledged write before admitting another window.
+There is no producer queue. Exceptions and interruption stop new work; completed
+chunks remain committed, while an ambiguous write is not yielded. Checkpoint
+repository IDs only after consuming acknowledged results, or replay the input
+using deterministic point IDs after a failure. Acknowledgement is at least once,
+not a transaction over the corpus. These are offline helper APIs; online
+canonical content writes continue to require per-repository content CAS. No
+production reindex or deployment is performed by adopting these helpers.
+
 Numeric boundary correction (#148): `trend_velocity` is a growth-only [0, 1]
 feature. Nonpositive weighted growth maps to zero; signed raw deltas remain
 unchanged, so declining and missing observations remain distinguishable in the
@@ -276,8 +335,8 @@ Useful focused commands:
 
 ```bash
 pytest -m unit
-pytest tests/test_feedback.py
-pytest tests/test_production_config.py tests/test_production_smoke.py
+pytest tests/test_v2_feedback.py tests/test_v2_feedback_hardening.py
+pytest tests/test_production_config.py tests/test_v2_api_hardening.py
 pytest --cov=. --cov-report=term-missing
 ```
 

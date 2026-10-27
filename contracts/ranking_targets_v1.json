@@ -1,0 +1,67 @@
+{
+  "version": "ranking-targets-v1-proposal",
+  "approval_status": "proposal_requires_product_and_data_owner_approval",
+  "production_effect": "none",
+  "exposure": {
+    "unit": "one eligible persisted impression event, not one served candidate",
+    "identity": "impression event_id; exact replays deduplicated; conflicting reuse rejected",
+    "attribution_key": ["user_id", "session_id", "serve_id", "repo_id", "position"],
+    "eligibility": "exporter attests foreground viewability threshold, consent, valid serve item, and snapshot prediction lineage",
+    "denominator": "mature eligible uniquely attributed impressions with head-specific complete observation coverage",
+    "repeated_exposure": "multiple distinct impression IDs with the same key are ambiguous; exclude labels rather than guess last touch",
+    "window_seconds": 86400,
+    "window_bounds": "[impression occurred_at, impression occurred_at + 24 hours)",
+    "watermark": "observation_cutoff attests client-time coverage after delivery-lag reconciliation, never wall clock alone",
+    "missing": "missing coverage, initial state or short dwell is unknown, never implicit zero",
+    "censored": "window ends after observation_cutoff; exclude all head labels even if a positive arrived early",
+    "identity_limit": "null serve/position and product actions without exact attribution must be quarantined by exporter; no user/repo-only join"
+  },
+  "heads": {
+    "ctr": {
+      "output": "p_ctr",
+      "target": "README/details-open rate per impression (proposed meaning of CTR)",
+      "event_types": ["readme_open"],
+      "label": "1 if at least one attributed open in window; otherwise 0 only with mature complete coverage",
+      "reversals": "closing details does not reverse an open",
+      "missing_censored": "exclude unknown/immature/ambiguous impressions",
+      "compatibility": "synthetic generic CTR is not established to mean README-open; retraining/requalification required"
+    },
+    "save": {
+      "output": "p_save",
+      "target": "new repository save retained at window end among initially unsaved items",
+      "event_types": ["save", "unsave"],
+      "label": "terminal attributed save state; initial_saved must be false; unknown or already saved excluded",
+      "reversals": "unsave cancels save; later save restores it; simultaneous conflicting transitions are ambiguous",
+      "missing_censored": "exclude missing baseline, incomplete coverage or unfinished window; require all membership-origin transitions in export"
+    },
+    "gh_open": {
+      "output": "p_gh",
+      "target": "explicit Open GitHub action per impression, not confirmed external page load",
+      "event_types": ["github_open"],
+      "label": "1 if any attributed event in window; otherwise 0 with mature complete coverage",
+      "reversals": "no reversal; repeated opens collapse to one positive",
+      "missing_censored": "exclude incomplete/immature/ambiguous observations"
+    },
+    "dwell": {
+      "output": "pred_dwell_fraction",
+      "target": "maximum reported visibility episode divided by 600 seconds",
+      "normalization_ms": 600000,
+      "event_types": ["dwell"],
+      "label": "max observed dwell_ms / 600000; v2 samples are thresholded at 3000ms and capped at 300000ms",
+      "reversals": "deduplicate event IDs; use maximum episode rather than sum repeated visibility",
+      "missing_censored": "no dwell sample is missing, not zero; incomplete/immature/ambiguous episodes excluded",
+      "compatibility": "retains synthetic head's 600-second units for diagnostics only; v2 truncation prevents full-duration calibration; no probability interpretation"
+    },
+    "follow": {
+      "output": "p_follow",
+      "target": "undecided: product owners must choose repository owner/account/other action",
+      "event_types": [],
+      "label": null,
+      "reversals": "future source must specify follow/unfollow state, target identity, baseline and causal exposure attribution",
+      "missing_censored": "always unsupported; never impute zeros, save proxies or account-follow table snapshots",
+      "proposed_alternative": "evaluate follow weight zero in a new value-function version only after owner approval and paired ranking evaluation; no serving change here"
+    }
+  },
+  "weights_snapshot": {"ctr": 1.0, "save": 5.0, "gh_open": 2.0, "dwell": 0.1, "follow": 20.0},
+  "approval_required": ["click surface and exposure denominator", "24-hour window and delivery-lag watermark", "save state and repeated exposure attribution", "dwell episode definition and units", "follow meaning/source or evaluated removal", "versioned model/value/output migration, evaluation and rollback"]
+}

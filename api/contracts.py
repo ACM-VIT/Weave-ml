@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timedelta
 from functools import lru_cache
 import os
-from typing import Annotated, Literal, get_args
+from typing import Annotated, Any, Literal, get_args
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -19,6 +19,7 @@ from pydantic import (
     model_validator,
 )
 
+from ingestion.lifecycle import RepositoryLifecycleObservation
 from feedback.v2_settings import V2FeedbackSettings
 from embedding.vector_contract import validate_diversity_metadata
 from summarization.contracts import CardSummaryArtifact
@@ -109,12 +110,117 @@ class RecommendationContext(StrictModel):
 from retrieval.social_candidates import SocialCandidate, validate_social_candidates
 
 
+class ScoringCaptureRequest(StrictModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    schema_version: Literal[1]
+    encoding: Literal["float32-le-v1"]
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def exact_schema(cls, value):
+        if type(value) is not int:
+            raise ValueError("Capture schema must be an integer")
+        return value
+
+
+def _bounded_decimal_pattern(maximum: int) -> str:
+    """Canonical positive decimal <= maximum, using portable digit ranges."""
+    digits = str(maximum)
+    alternatives = [rf"[1-9][0-9]{{0,{len(digits)-2}}}"] if len(digits) > 1 else []
+    for index, digit in enumerate(digits):
+        lower, upper = (1 if index == 0 else 0), int(digit) - 1
+        if lower <= upper:
+            choice = str(lower) if lower == upper else f"[{lower}-{upper}]"
+            remaining = len(digits) - index - 1
+            alternatives.append(digits[:index] + choice + (rf"[0-9]{{{remaining}}}" if remaining else ""))
+    alternatives.append(digits)
+    return "^(?:" + "|".join(alternatives) + ")$"
+
+
+_CAPTURE_FEED_VERSION_PATTERN = _bounded_decimal_pattern(2**63 - 1)
+
+
+def _recommendation_request_schema(schema: dict) -> None:
+    # The common properties still enforce the complete capture object schema.
+    # Branches express negotiation without changing the public Python model.
+    capture_reference = next(choice["$ref"] for choice in
+        schema["properties"]["scoring_capture"]["anyOf"] if "$ref" in choice)
+    schema["oneOf"] = [
+        {"required": ["feed_version"], "properties": {
+            "feed_version": {"type": "integer", "minimum": 1, "maximum": 2**53-1},
+            "scoring_capture": {"type": "null"}, "model_context": {"type": "null"}}},
+        {"required": ["feed_version", "scoring_capture"], "properties": {
+            "feed_version": {"type": "string", "minLength": 1, "maxLength": 19,
+                "pattern": _CAPTURE_FEED_VERSION_PATTERN,
+                "not": {"pattern": "[^0-9]"}},
+            "scoring_capture": {"$ref": capture_reference}}},
+        {"required": ["feed_version", "model_context"], "properties": {
+            "feed_version": {"type": "string", "minLength": 1, "maxLength": 19,
+                "pattern": _CAPTURE_FEED_VERSION_PATTERN, "not": {"pattern": "[^0-9]"}},
+            "scoring_capture": {"type": "null"},
+            "model_context": {"$ref": next(choice["$ref"] for choice in schema["properties"]["model_context"]["anyOf"] if "$ref" in choice)}}},
+    ]
+
+
+PositiveModelDecimal = Annotated[str, StringConstraints(strict=True, max_length=19, pattern=_CAPTURE_FEED_VERSION_PATTERN),
+                                 Field(json_schema_extra={"not": {"pattern": "[^0-9]"}})]
+NonnegativeModelDecimal = Annotated[str, StringConstraints(strict=True, max_length=19,
+    pattern=_CAPTURE_FEED_VERSION_PATTERN.replace("^(?:", "^(?:0|", 1)),
+    Field(json_schema_extra={"not": {"pattern": "[^0-9]"}})]
+
+
+class ModelRecommendationContext(StrictModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=False, hide_input_in_errors=True)
+    schema_version: Literal[1]
+    session_id: Annotated[str, StringConstraints(strict=True, min_length=36, max_length=36,
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")]
+    epoch: PositiveModelDecimal
+    policy_sha256: Annotated[str, StringConstraints(strict=True, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")]
+    minimum_applied_operation_version: PositiveModelDecimal
+    required_profile_version: PositiveModelDecimal
+    as_of_ms: NonnegativeModelDecimal
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def exact_schema(cls, value):
+        if type(value) is not int:
+            raise ValueError("Model context schema must be an integer")
+        return value
+
+    @model_validator(mode="after")
+    def exact_context(self):
+        from feedback.model_wire import decimal, digest, canonical_uuid
+        canonical_uuid(self.session_id)
+        decimal(self.epoch, 1); decimal(self.minimum_applied_operation_version, 1)
+        decimal(self.required_profile_version, 1); decimal(self.as_of_ms); digest(self.policy_sha256)
+        return self
+
+
 class RecommendationRequest(StrictModel):
+    model_config = ConfigDict(json_schema_extra=_recommendation_request_schema)
     schema_version: Literal[2]
     generation_id: uuid.UUID
     user_id: uuid.UUID
-    feed_version: int = Field(ge=1)
+    feed_version: Annotated[int, Field(strict=True, ge=1, le=2**53-1)] | Annotated[str, StringConstraints(strict=True, max_length=19, pattern=_CAPTURE_FEED_VERSION_PATTERN)]
+    scoring_capture: ScoringCaptureRequest | None = None
+    model_context: ModelRecommendationContext | None = None
     limit: int = Field(ge=1, le=100)
+
+    @field_validator("feed_version", mode="before")
+    @classmethod
+    def exact_feed_version(cls, value):
+        import re
+        if type(value) is int and 1 <= value <= 2**53-1:
+            return value
+        if type(value) is str and re.fullmatch(r"[1-9][0-9]{0,18}", value) and int(value) <= 2**63-1:
+            return value
+        raise ValueError("Feed version must be a safe integer or canonical int64 decimal")
+
+    @model_validator(mode="after")
+    def negotiated_feed_version(self):
+        if (self.scoring_capture is not None or self.model_context is not None) != (type(self.feed_version) is str):
+            raise ValueError("Captured requests require an exact decimal string; ordinary requests require an integer")
+        return self
     exclude_repo_ids: list[uuid.UUID] = Field(default_factory=list, max_length=500)
     social_repo_ids: list[uuid.UUID] = Field(default_factory=list, max_length=500)
     social_candidates: list[SocialCandidate] = Field(default_factory=list, max_length=100, json_schema_extra={"uniqueItems": True})
@@ -198,6 +304,7 @@ class FeedbackBatch(StrictModel):
 
 
 class RepositorySource(StrictModel):
+    lifecycle: RepositoryLifecycleObservation | None = None
     # These identity/source fields are supplied by the canonical Node v2
     # ingestion outbox. ``repo_id`` is checked against the job envelope below;
     # owner/name/node ID remain source metadata and are not used as Qdrant IDs.
@@ -341,6 +448,7 @@ class RepositoryFeaturePatch(StrictModel):
     source observations changes.
     """
 
+    lifecycle: RepositoryLifecycleObservation | None = None
     star_count: NonNegativeCount | None = None
     fork_count: NonNegativeCount | None = None
     open_issues_count: NonNegativeCount | None = None
@@ -479,11 +587,29 @@ class RecommendationContextStatus(StrictModel):
     locale: Literal["reserved_unused", "not_provided"]
 
 
+class AppliedModelContext(StrictModel):
+    schema_version: Literal[1]
+    user_id: uuid.UUID
+    session_id: uuid.UUID
+    epoch: PositiveModelDecimal
+    profile_version: PositiveModelDecimal
+    applied_operation_version: PositiveModelDecimal
+    applied_feedback_version: NonnegativeModelDecimal
+    state_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    head: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    policy_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    effective_vector_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    session_witness_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    as_of_ms: NonnegativeModelDecimal
+    valid_until_ms: PositiveModelDecimal
+    explicit_negative_repo_ids: list[uuid.UUID] = Field(max_length=256)
+
+
 class RecommendationResponse(StrictModel):
     schema_version: Literal[2]
     generation_id: uuid.UUID
     user_id: uuid.UUID
-    feed_version: int = Field(ge=1)
+    feed_version: int = Field(strict=True, ge=1, le=2**53-1)
     model_version: str = Field(min_length=1, max_length=512)
     # Retrieval supports eight compatible 128-character identities plus the
     # mixed-version prefix and seven separating commas.
@@ -504,6 +630,95 @@ class RecommendationResponse(StrictModel):
         if len({item.repo_id for item in value}) != len(value):
             raise ValueError("recommendation IDs must be unique")
         return value
+
+
+class ModelRecommendationResponse(RecommendationResponse):
+    feed_version: PositiveModelDecimal
+    model_context: AppliedModelContext
+
+
+from inference.scoring_provenance import ScoringContext, ScoredPacket, decode_owned_packet
+
+
+class CapturedRecommendationItem(RecommendationItem):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    raw_heavy_score: float = Field(allow_inf_nan=False)
+    scored_input: ScoredPacket = Field(repr=False)
+
+
+class CapturedScoringStatus(StrictModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    schema_version: Literal[1]
+    status: Literal["captured"]
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def exact_schema(cls, value):
+        if type(value) is not int:
+            raise ValueError("Capture schema must be an integer")
+        return value
+
+
+class EmptyScoringStatus(StrictModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    schema_version: Literal[1]
+    status: Literal["not_scored_empty"]
+
+    _exact_schema = field_validator("schema_version", mode="before")(CapturedScoringStatus.exact_schema.__func__)
+
+
+class CapturedRecommendationResponse(RecommendationResponse):
+    model_context: AppliedModelContext | None = None
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    feed_version: Annotated[str, StringConstraints(strict=True, pattern=r"^[1-9][0-9]{0,18}$")]
+    scoring_capture: CapturedScoringStatus
+    scoring_context: ScoringContext = Field(repr=False)
+    scoring_metadata_complete: bool = Field(strict=True)
+    served_ranker: Literal["heavy"]
+    heavy_ranker_selected: Literal[True]
+    ranker_applied: Literal[True]
+    fallback_code: None
+    fallback_reason: None
+    retrieval_mode: Literal["personalized", "cold_start_profile"]
+    items: list[CapturedRecommendationItem] = Field(min_length=1, max_length=150, repr=False)
+
+    @model_validator(mode="after")
+    def exact_captured_bindings(self):
+        context = self.scoring_context
+        if (context.user_id != str(self.user_id) or context.generation_id != str(self.generation_id)
+                or context.feed_version != self.feed_version or context.model_version != self.model_version
+                or self.scoring_metadata_complete != (context.user_embedding_version is not None)):
+            raise ValueError("Captured response context binding mismatch")
+        versions = []
+        for item in self.items:
+            decode_owned_packet(item.scored_input, context, owner_user_id=str(self.user_id),
+                                generation_id=str(self.generation_id), repo_id=str(item.repo_id))
+            versions.append(context.repository_embedding_versions[item.scored_input.snapshot.embedding_version_index])
+        versions = sorted(set(versions))
+        version = versions[0] if len(versions) == 1 else "compatible-mixed:" + ",".join(versions)
+        if self.embedding_versions != versions or self.embedding_version != version:
+            raise ValueError("Captured response embedding binding mismatch")
+        return self
+
+
+class UnscoredEmptyRecommendationResponse(RecommendationResponse):
+    model_context: AppliedModelContext | None = None
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    feed_version: Annotated[str, StringConstraints(strict=True, pattern=r"^[1-9][0-9]{0,18}$")]
+    scoring_capture: EmptyScoringStatus
+    fallback_code: None
+    fallback_reason: None
+    items: list[RecommendationItem] = Field(max_length=0)
+
+    @field_validator("feed_version")
+    @classmethod
+    def bounded_empty_version(cls, value):
+        if int(value) > 2**63-1:
+            raise ValueError("Captured feed version exceeds int64")
+        return value
+
+
+RecommendationWireResponse = RecommendationResponse | ModelRecommendationResponse | CapturedRecommendationResponse | UnscoredEmptyRecommendationResponse
 
 
 class FeedbackResponse(StrictModel):
@@ -546,3 +761,101 @@ class OnboardingResponse(StrictModel):
     status: Literal["applied", "duplicate", "current"]
     user_id: uuid.UUID
     profile_version: int = Field(ge=1)
+
+
+class ModelOperationInput(StrictModel):
+    # Whitespace and original Unicode are part of the immutable source hash.
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=False, hide_input_in_errors=True)
+    operation_json: str = Field(min_length=1, max_length=131072)
+
+
+class ModelOperationBatch(StrictModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    schema_version: Literal[1]
+    operations: list[ModelOperationInput] = Field(min_length=1, max_length=50)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def exact_schema(cls, value):
+        if type(value) is not int:
+            raise ValueError("Model operation schema must be an integer")
+        return value
+
+
+class ModelOperationAcknowledgement(StrictModel):
+    operation_id: uuid.UUID
+    model_operation_version: str
+    source_envelope_sha256: str
+    status: Literal["accepted", "duplicate", "withdrawal_accepted"]
+    withdrawal_sha256: str | None = None
+
+
+class ModelOperationResponse(StrictModel):
+    schema_version: Literal[1]
+    operations: list[ModelOperationAcknowledgement]
+
+
+class ModelAuthorityRequest(StrictModel):
+    schema_version: Literal[1]
+    user_id: uuid.UUID
+    model_context: ModelRecommendationContext
+
+
+class ModelAuthorityResponse(StrictModel):
+    schema_version: Literal[1]
+    model_context: AppliedModelContext
+
+
+class ProfileWithdrawalInput(StrictModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=False, hide_input_in_errors=True)
+    withdrawal_json: str = Field(min_length=1, max_length=131072)
+
+
+class ProfileWithdrawalBatch(StrictModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    schema_version: Literal[1]
+    withdrawals: list[ProfileWithdrawalInput] = Field(min_length=1, max_length=50)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def exact_schema(cls, value):
+        if type(value) is not int:
+            raise ValueError("Withdrawal schema must be an integer")
+        return value
+
+
+class ProfileWithdrawalAcknowledgement(StrictModel):
+    operation_id: uuid.UUID
+    model_operation_version: PositiveModelDecimal
+    source_envelope_sha256: str
+    withdrawal_sha256: str
+    status: Literal["accepted", "duplicate"]
+
+
+class ProfileWithdrawalResponse(StrictModel):
+    schema_version: Literal[1]
+    withdrawals: list[ProfileWithdrawalAcknowledgement]
+
+
+class ModelOperationStatusRequest(StrictModel):
+    schema_version: Literal[1]
+    user_id: uuid.UUID
+    operation_id: uuid.UUID
+    model_operation_version: PositiveModelDecimal
+    source_envelope_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+
+
+class ModelOperationStatusResponse(StrictModel):
+    schema_version: Literal[1]
+    user_id: uuid.UUID
+    operation_id: uuid.UUID
+    model_operation_version: PositiveModelDecimal
+    source_envelope_sha256: str
+    status: Literal["pending", "applied", "withdrawn_profile", "rejected_capacity", "rejected_session_dependency"]
+    basis_status: Literal["missing", "awaiting_profile", "ready"]
+    applied_operation_version: PositiveModelDecimal | None = None
+    applied_profile_version: PositiveModelDecimal | None = None
+    applied_feedback_version: NonnegativeModelDecimal | None = None
+    current_head: str | None = None
+    operation_head: str | None = None
+    withdrawal_sha256: str | None = None

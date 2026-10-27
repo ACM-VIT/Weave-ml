@@ -176,6 +176,13 @@ class RepositoryEnricher:
             )
             logger.warning("Metadata chunk failed: %s", error.safe_diagnostic)
 
+        def observed_rows(rows):
+            # Freeze provenance at each completed GitHub call, before fallback
+            # siblings/README processing can delay this response's application.
+            received_at = datetime.now(timezone.utc).isoformat()
+            return {name: ({**data, "_lifecycle_observed_at": received_at} if data else data)
+                    for name, data in rows.items()}
+
         # Pass 1: batch metadata (no readme — avoids 502 on large repos)
         for i in range(0, len(targets), self.metadata_batch_size):
             self._check_cancelled()
@@ -183,9 +190,9 @@ class RepositoryEnricher:
             batch_res = {}
             try:
                 if self.metadata_projection == "legacy":
-                    batch_res = self.graphql_client.get_repositories_batch(batch)
+                    batch_res = observed_rows(self.graphql_client.get_repositories_batch(batch))
                 else:
-                    batch_res = self.graphql_client.get_repositories_batch(batch, projection=self.metadata_projection)
+                    batch_res = observed_rows(self.graphql_client.get_repositories_batch(batch, projection=self.metadata_projection))
             except CancelledError:
                 raise
             except GitHubGraphQLClientError as exc:
@@ -202,7 +209,7 @@ class RepositoryEnricher:
                         retry_res = self.graphql_client.get_repositories_batch(
                             [(owner, name)], projection=self.metadata_projection,
                         )
-                        batch_res.update(retry_res)
+                        batch_res.update(observed_rows(retry_res))
                     except CancelledError:
                         raise
                     except GitHubGraphQLClientError as retry_exc:
@@ -295,6 +302,7 @@ class RepositoryEnricher:
         data = self.graphql_client.get_repository(owner, name)
         if not data:
             return None
+        data = {**data, "_lifecycle_observed_at": datetime.now(timezone.utc).isoformat()}
         return self._process_graphql_data(data, discovery_category, discovery_band)
 
     def _process_graphql_data(
@@ -370,7 +378,8 @@ class RepositoryEnricher:
                 "created_at": commit.get("committedDate")
             })
 
-        # Contributor data is not required downstream; returning an empty list as audited.
+        # Contributor/community evidence is not collected by this bounded query.
+        # Keep the compatibility list empty; never infer counts from its owner.
         contributors = []
 
         # Construct raw_repository (REST equivalent structure for downstream compatibility)
@@ -401,6 +410,13 @@ class RepositoryEnricher:
             "_discovery_band": discovery_band,
         }
         
+        if isinstance(data.get('isArchived'), bool) and isinstance(data.get('isDisabled'), bool):
+            raw_repository['lifecycle'] = {
+                'status': 'verified', 'source': 'github-graphql-repository',
+                'observed_at': data.get('_lifecycle_observed_at') or datetime.now(timezone.utc).isoformat(),
+                'archived': data['isArchived'], 'disabled': data['isDisabled'],
+            }
+
         if 'isFork' in data:
             lineage = lineage_from_graphql(data, observed_at=datetime.now(timezone.utc))
             raw_repository.update({
@@ -479,7 +495,6 @@ class RepositoryEnricher:
             "readme_default_branch": readme.default_branch,
             "readme_base_url": readme.base_url,
             "readme_to_codebase_ratio": self._readme_to_codebase_ratio(readme.readme_length, size_kb),
-            "mentionable_users_count": self._mentionable_users_count(contributors, repository),
             "delta_3d": deltas[3],
             "delta_7d": deltas[7],
             "delta_30d": deltas[30],
@@ -494,6 +509,7 @@ class RepositoryEnricher:
             "created_at": repository.get("created_at"),
             "updated_at": repository.get("updated_at"),
             "pushed_at": repository.get("pushed_at"),
+            **({"lifecycle": repository["lifecycle"]} if "lifecycle" in repository else {}),
             "observed_at": datetime.now(timezone.utc).isoformat(),
             "discovery_category": repository.get("_discovery_category"),
             "discovery_band": repository.get("_discovery_band"),
@@ -533,12 +549,6 @@ class RepositoryEnricher:
     def _readme_to_codebase_ratio(readme_length: int, size_kb: int) -> float:
         codebase_bytes = max(size_kb * 1024, 1)
         return round(readme_length / codebase_bytes, 8)
-
-    @staticmethod
-    def _mentionable_users_count(contributors: list[dict[str, Any]], repository: dict[str, Any]) -> int:
-        if contributors:
-            return min(len(contributors), 100)
-        return 1 if repository.get("owner") else 0
 
     def _estimate_star_deltas(
         self,

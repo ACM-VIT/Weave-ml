@@ -796,6 +796,7 @@ def test_v2_invalid_heavy_output_falls_back_for_only_that_request():
         heavy_ranker_enabled=True,
         heavy_ranker_required=False,
         heavy_ranker_traffic_percent=100,
+        minimum_eligible_repositories=len(client.repo_ids),
     )
 
     batch = retriever.recommend_batch(client.user_id, 2, [])
@@ -823,6 +824,7 @@ def test_required_v2_heavy_ranker_fails_closed_instead_of_serving_hybrid():
         heavy_ranker_enabled=True,
         heavy_ranker_required=True,
         heavy_ranker_traffic_percent=100,
+        minimum_eligible_repositories=len(client.repo_ids),
     )
 
     with pytest.raises(RetrievalDependencyError, match="required V2 heavy ranker"):
@@ -935,6 +937,7 @@ def test_default_recommendation_path_has_a_bounded_qdrant_call_budget() -> None:
         "embedding_dim",
         "embedding_model",
         "embedding_model_revision",
+        "model_policy_sha256",  # scalar guard; never fetch the full feedback ledger
     }
     assert len(client.query_calls) == 1  # semantic candidate query
     assert len(client.scroll_calls) == 4  # four bounded discovery channels
@@ -1050,6 +1053,7 @@ def test_required_v2_cold_start_waits_for_onboarding_vector_without_hybrid():
         heavy_ranker_enabled=True,
         heavy_ranker_required=True,
         heavy_ranker_traffic_percent=100,
+        minimum_eligible_repositories=len(client.repo_ids),
     )
 
     with pytest.raises(

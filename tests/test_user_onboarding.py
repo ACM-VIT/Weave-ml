@@ -77,6 +77,9 @@ class FakeQdrantClient:
     def upsert(self, **kwargs):
         self.upsert_call = kwargs
 
+    def retrieve(self, **kwargs):
+        return self.upsert_call["points"] if self.upsert_call else []
+
 
 class CollectionCreationRaceClient(FakeQdrantClient):
     def __init__(self):
@@ -128,6 +131,72 @@ def test_generate_interest_vector_is_finite_normalized_and_384_dimensional():
     assert all(math.isfinite(value) for value in vector)
     assert math.sqrt(sum(value * value for value in vector)) == pytest.approx(1.0)
     assert model.calls[0][1]["normalize_embeddings"] is True
+    vector[0] = 99.0
+    reused = pipeline.generate_interest_vector({"skills": ["Python"], "profile_version": 2, "username": "new"})
+    assert reused == _vector()
+    reused[0] = 77.0
+    assert pipeline.generate_interest_vector({"skills": ["Python"]}) == _vector()
+    assert len(model.calls) == 1
+
+
+@pytest.mark.parametrize("changed", ["bio", "skills", "revision", "sequence_length", "preprocessing", "model", "wrapped_encoder"])
+def test_baseline_reuse_requires_identical_semantics_and_encoder_identity(changed, monkeypatch):
+    import scripts.user_onboarding as onboarding
+    model = FakeModel()
+    model.query_embedding_revision = "revision-1"
+    model._model = object()
+    pipeline = UserOnboardingPipeline(model=model)
+    profile = {"skills": ["Python"], "bio": "Builds tools"}
+    pipeline.generate_interest_vector(profile)
+    assert pipeline.generate_interest_vector(profile) == _vector()
+    assert len(model.calls) == 1
+    if changed in {"bio", "skills"}:
+        profile[changed] = "changed"
+    elif changed == "revision":
+        model.query_embedding_revision = "revision-2"
+    elif changed == "sequence_length":
+        model.max_seq_length = 512
+    elif changed == "preprocessing":
+        monkeypatch.setattr(onboarding, "USER_BASELINE_PREPROCESSING_VERSION", "new-recipe")
+    elif changed == "model":
+        pipeline._model = FakeModel()
+    else:
+        model._model = object()
+    assert pipeline.generate_interest_vector(profile) == _vector()
+    assert len(model.calls) + (len(pipeline._model.calls) if pipeline._model is not model else 0) == 2
+
+
+def test_baseline_cache_bounds_and_invalid_unit_vector_recompute():
+    from array import array
+    from dataclasses import replace
+    model = FakeModel()
+    pipeline = UserOnboardingPipeline(model=model)
+    for index in range(129):
+        pipeline.generate_interest_vector({"bio": f"Profile {index}"})
+    cache = pipeline._baseline_cache
+    assert cache.snapshot()["entries"] == 128
+    assert cache.snapshot()["vector_bytes"] == 128 * VECTOR_DIMENSION * 8
+    pipeline.generate_interest_vector({"bio": "Profile 0"})
+    assert len(model.calls) == 130, "evicted baselines must be encoded again"
+    key = next(reversed(cache._entries))
+    entry = cache._entries[key]
+    cache._entries[key] = replace(entry, data=array("d", _vector(2.0)).tobytes())
+    assert pipeline.generate_interest_vector({"bio": "Profile 0"}) == _vector()
+    assert len(model.calls) == 131, "a finite but non-unit cached vector is unusable"
+
+
+def test_warm_baseline_does_not_skip_metadata_or_deadline_validation():
+    from utils.deadline import CooperativeDeadlineExceeded, RequestDeadline, deadline_scope
+    model = FakeModel()
+    pipeline = UserOnboardingPipeline(model=model)
+    pipeline.generate_interest_vector({"skills": ["Python"]})
+    with pytest.raises(ValueError, match="profile_version"):
+        pipeline.generate_interest_vector({"skills": ["Python"], "profile_version": True})
+    deadline = RequestDeadline(1)
+    deadline.cancel()
+    with deadline_scope(deadline), pytest.raises(CooperativeDeadlineExceeded):
+        pipeline.generate_interest_vector({"skills": ["Python"]})
+    assert len(model.calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -175,6 +244,11 @@ def test_pipeline_onboarding_stores_contract_metadata_and_feedback_accumulator()
     assert payload["embedding_model"] == EMBEDDING_MODEL
     assert payload["preference_accumulator"] == vector
     assert profile["topics"] == ["machine-learning"]
+    assert pipeline.onboard_user(USER_ID, {**profile, "profile_version": 4, "username": "renamed"}) is True
+    assert len(pipeline.model.calls) == 1
+    assert store.upsert_call[2]["profile_version"] == 4
+    assert store.upsert_call[2]["username"] == "renamed"
+    assert store.ensure_calls == 2, "vector reuse must not skip the current profile write"
 
 
 def test_profile_update_preserves_learned_vector_and_feedback_cursor():
@@ -206,6 +280,8 @@ def test_profile_update_preserves_learned_vector_and_feedback_cursor():
     store = ExistingUserStore()
     pipeline = UserOnboardingPipeline(model=FakeModel(), store=store)
     new_baseline = pipeline.generate_interest_vector({"topics": ["databases"]})
+    new_baseline = pipeline.generate_interest_vector({"topics": ["databases"], "profile_version": 4})
+    assert len(pipeline.model.calls) == 1
 
     pipeline.save_to_qdrant(
         USER_ID,

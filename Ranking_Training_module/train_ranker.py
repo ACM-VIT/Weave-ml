@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -51,16 +51,78 @@ DATA_KEYS = (
 )
 
 
+
+
+def training_array_sha256(arrays):
+    """Hash the exact validated arrays used, independent of NPZ compression."""
+    checksum = hashlib.sha256()
+    for key in DATA_KEYS:
+        value = arrays[key]
+        if value.dtype.hasobject:
+            raise ValueError("training source cannot contain object arrays")
+        header = json.dumps({"name": key, "dtype": value.dtype.str,
+                             "shape": list(value.shape)}, sort_keys=True,
+                            separators=(",", ":")).encode()
+        checksum.update(len(header).to_bytes(8, "big"))
+        checksum.update(header)
+        checksum.update(value.nbytes.to_bytes(8, "big"))
+        # Row slices preserve the canonical C-order byte stream for strided
+        # arrays too, without copying a complete NPZ member or memory map.
+        rows = max(1, (1024 * 1024) // max(1, value[0:1].nbytes))
+        for start in range(0, len(value), rows):
+            block = np.ascontiguousarray(value[start:start + rows])
+            checksum.update(memoryview(block).cast("B"))
+    return checksum.hexdigest()
+
+
+def training_source_identity():
+    """Local-only exact code identity; no remote fallback or symbolic revision."""
+    import os
+    import subprocess
+    environment = {**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0",
+                   "GIT_OPTIONAL_LOCKS": "0"}
+    def git(*arguments):
+        return subprocess.check_output(["git", "--no-lazy-fetch", "--no-pager", *arguments],
+            cwd=REPO_ROOT, env=environment, timeout=5)
+    try:
+        commit = git("rev-parse", "HEAD").decode().strip()
+        if len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
+            raise ValueError("training requires an exact Git commit")
+        names = git("ls-files", "-z", "--", "*.py", "pyproject.toml", "uv.lock").decode().split("\0")
+        hashes = {name: hashlib.sha256((REPO_ROOT / name).read_bytes()).hexdigest()
+                  for name in sorted(names) if name}
+        if not hashes:
+            raise ValueError("training source inventory is empty")
+        return {"code_commit": commit, "source_tree_dirty": bool(git("status", "--porcelain", "--untracked-files=normal")),
+                "source_sha256": hashes}
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("training provenance requires compatible local-only Git and readable source") from exc
+
+
 def load_training_data(data_path: str | Path) -> dict[str, np.ndarray]:
     """Load and validate the arrays required by the ranker trainer."""
-    with np.load(data_path) as data:
-        missing_keys = [key for key in DATA_KEYS if key not in data]
-        if missing_keys:
-            raise ValueError(
-                f"Training data is missing required arrays: {missing_keys}"
-            )
-        arrays = {key: np.asarray(data[key]) for key in DATA_KEYS}
+    data_path = Path(data_path)
+    if data_path.is_dir():
+        arrays = {
+            key: np.load(data_path / f"{key}.npy", mmap_mode="r", allow_pickle=False)
+            for key in DATA_KEYS
+        }
+    else:
+        with np.load(data_path, allow_pickle=False) as data:
+            arrays = _load_npz_arrays(data)
+    return _validate_training_arrays(arrays)
 
+
+def _load_npz_arrays(data):
+    missing_keys = [key for key in DATA_KEYS if key not in data]
+    if missing_keys:
+        raise ValueError(f"Training data is missing required arrays: {missing_keys}")
+    return {key: np.asarray(data[key]) for key in DATA_KEYS}
+
+
+def _validate_training_arrays(arrays):
+    if any(value.ndim == 0 or value.dtype.kind not in "fiub" for value in arrays.values()):
+        raise ValueError("Training arrays must have rows and real numeric dtypes")
     dense_features = arrays["dense_features"]
     if dense_features.ndim != 2 or dense_features.shape[1] != FEATURE_COUNT:
         actual_count = dense_features.shape[1] if dense_features.ndim == 2 else None
@@ -89,6 +151,9 @@ def load_training_data(data_path: str | Path) -> dict[str, np.ndarray]:
                 f"{embedding_key} must have shape (rows, {EMBEDDING_DIM})"
             )
 
+    for key in DATA_KEYS[3:]:
+        if arrays[key].shape not in {(row_count,), (row_count, 1)}:
+            raise ValueError(f"{key} must contain one label per row")
     return arrays
 
 
@@ -146,6 +211,56 @@ def build_dataloaders(
         shuffle=False,
     )
     return train_loader, val_loader
+
+
+class _FeatureRows(Dataset):
+    """Keep source arrays shared and materialize only the requested batch."""
+
+    def __init__(self, arrays, mean, scale, start, end):
+        self.arrays, self.mean, self.scale = arrays, mean, scale
+        self.start, self.end = start, end
+
+    def __len__(self):
+        return self.end - self.start
+
+    def __getitem__(self, index):
+        return self.start + index
+
+    def collate(self, indices):
+        x = np.empty((len(indices), INPUT_DIM), dtype=np.float32)
+        x[:, :EMBEDDING_DIM] = self.arrays["user_embs"][indices]
+        x[:, EMBEDDING_DIM:2 * EMBEDDING_DIM] = self.arrays["repo_embs"][indices]
+        x[:, 2 * EMBEDDING_DIM:] = transform_dense_features(
+            self.arrays["dense_features"][indices], self.mean, self.scale,
+        )
+        labels = [
+            torch.from_numpy(np.asarray(self.arrays[key][indices], dtype=np.float32).reshape(-1))
+            for key in DATA_KEYS[3:]
+        ]
+        return (torch.from_numpy(x), *labels)
+
+
+def build_feature_dataloaders(arrays, mean, scale, batch_size, *, split_index):
+    """Chronological partitions with the existing shuffle/BatchNorm policy."""
+    count = len(arrays["dense_features"])
+    if batch_size < 2 or not 2 <= split_index < count:
+        raise ValueError("Invalid training batch size or chronological split")
+    training = _FeatureRows(arrays, mean, scale, 0, split_index)
+    validation = _FeatureRows(arrays, mean, scale, split_index, count)
+    effective = min(batch_size, len(training))
+    return (
+        DataLoader(training, batch_size=effective, shuffle=True,
+                   drop_last=len(training) % effective == 1, collate_fn=training.collate),
+        DataLoader(validation, batch_size=batch_size, shuffle=False, collate_fn=validation.collate),
+    )
+
+
+def training_storage_identity(data_path):
+    """Detect file replacement as well as mutation of the loaded array buffers."""
+    path = Path(data_path)
+    if path.is_dir():
+        return {key: _sha256(path / f"{key}.npy") for key in DATA_KEYS}
+    return _sha256(path)
 
 
 def compute_batch_loss(
@@ -268,27 +383,16 @@ def train(
     if not isinstance(code_version, str) or not code_version.strip():
         raise ValueError("code_version must be a non-empty string")
 
+    storage_identity = training_storage_identity(data_path)
     arrays = load_training_data(data_path)
+    dataset_sha256 = training_array_sha256(arrays)
+    source_identity = training_source_identity()
     split_index = chronological_split_index(len(arrays["dense_features"]))
-    scaled_dense, scaler_mean, scaler_scale = standardize_dense_features(
-        arrays["dense_features"], fit_rows=split_index,
+    row_count = len(arrays["dense_features"])
+    scaler_mean, scaler_scale = fit_dense_features(arrays["dense_features"][:split_index])
+    train_loader, val_loader = build_feature_dataloaders(
+        arrays, scaler_mean, scaler_scale, batch_size, split_index=split_index,
     )
-    X = np.concatenate(
-        [
-            arrays["user_embs"].astype(np.float32, copy=False),
-            arrays["repo_embs"].astype(np.float32, copy=False),
-            scaled_dense,
-        ],
-        axis=1,
-    ).astype(np.float32, copy=False)
-    if X.shape[1] != INPUT_DIM:
-        raise ValueError(f"Training input has {X.shape[1]} columns; expected {INPUT_DIM}")
-
-    labels = tuple(
-        arrays[key].astype(np.float32, copy=False).reshape(-1)
-        for key in ("y_ctr", "y_save", "y_gh", "y_dwell", "y_follow")
-    )
-    train_loader, val_loader = build_dataloaders(X, labels, batch_size, split_index=split_index)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = MMoEHeavyRanker(INPUT_DIM).to(device)
@@ -332,6 +436,13 @@ def train(
             f"val_loss={final_val_loss:.6f}"
         )
 
+    calibration = calibration_metrics(model, val_loader, device)
+    if training_source_identity() != source_identity:
+        raise ValueError("training source changed before artifact export")
+    if training_array_sha256(arrays) != dataset_sha256:
+        raise ValueError("training input arrays changed during training")
+    if training_storage_identity(data_path) != storage_identity:
+        raise ValueError("training input files changed during training")
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     model_path = destination / "heavy_ranker.pt"
@@ -347,13 +458,15 @@ def train(
         + "\n",
         encoding="utf-8",
     )
-    calibration = calibration_metrics(model, val_loader, device)
     manifest = {
         "model_file": model_path.name,
         "scaler_file": scaler_path.name,
         "model_version": model_version,
         "embedding_version": REPOSITORY_EMBEDDING_VERSION,
         "embedding_model": REPOSITORY_EMBEDDING_MODEL,
+        "embedding_identity": {"model": REPOSITORY_EMBEDDING_MODEL, "revision": EMBEDDING_MODEL_REVISION,
+            "dimension": EMBEDDING_DIM, "pooling": "mean", "normalized": True,
+            "query_prompt": "", "document_prompt": "", "recipe": REPOSITORY_EMBEDDING_VERSION},
         "embedding_model_revision": EMBEDDING_MODEL_REVISION,
         "compatible_embedding_versions": [REPOSITORY_EMBEDDING_VERSION],
         "feature_spec_version": FEATURE_SPEC_VERSION,
@@ -365,15 +478,21 @@ def train(
         "scaler_sha256": _sha256(scaler_path),
         "value_function_version": "v2",
         "code_version": code_version.strip(),
+        **source_identity,
         "value_weights": VALUE_WEIGHTS,
         "training_data": {
             "identity": training_data_identity,
             "type": training_data_type,
+            "content_sha256": dataset_sha256,
+            "content_hash_scope": "validated ordered DATA_KEYS; dtype/shape and contiguous array bytes",
         },
+        "training_split_sha256": hashlib.sha256(json.dumps({"dataset_sha256": dataset_sha256,
+            "split": "input_order_80_20", "training_range": [0, split_index],
+            "validation_range": [split_index, row_count]}, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
         "preprocessing_fit": {
             "split": "input_order_80_20",
             "training_rows": split_index,
-            "validation_rows": len(X) - split_index,
+            "validation_rows": row_count - split_index,
         },
         "training_timestamp": datetime.now(timezone.utc).isoformat(),
         "offline_metrics": {
@@ -396,7 +515,8 @@ def train(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-path", default="training_data.npz")
+    parser.add_argument("--data-path", default="training_data.npz",
+                        help="NPZ archive or directory of DATA_KEYS .npy arrays (read-only memory maps)")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=4096)

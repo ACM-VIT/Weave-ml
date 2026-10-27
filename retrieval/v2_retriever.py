@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ingestion.lifecycle import POLICY_VERSION, lifecycle_excluded
+
 import hashlib
 import json
 import logging
@@ -13,7 +15,7 @@ import uuid
 from collections.abc import Mapping
 from concurrent.futures import Future
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -47,6 +49,7 @@ from embedding.vector_contract import (
 from inference.feed_assembly import FeedAssemblySystem, DiversityUnavailableError
 from inference.diversity import DiversityPolicy
 from inference.feature_spec import FEATURE_ORDER
+from inference.scoring_runtime import CaptureOptions, CapturedScoring, scoring_context_for, score_with_capture
 from inference.ranker_service import RankerService
 from inference.runtime import RecommendationDeadlineExceeded, recommendation_timeout_seconds
 from retrieval.candidate_vectors import InlineCandidateSnapshots
@@ -115,10 +118,12 @@ _USER_RETRIEVAL_PAYLOAD_FIELDS = [
     "embedding_dim",
     "embedding_model",
     "embedding_model_revision",
+    "model_policy_sha256",
 ]
 
 _REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS = [
     "repo_id",
+    "lifecycle_archived", "lifecycle_disabled",
     REPOSITORY_SERVING_ELIGIBILITY_FIELD,
     "content_version",
     "content_job_id",
@@ -174,6 +179,8 @@ class RecommendationBatch:
     heavy_ranker_selected: bool = False
     fallback_code: str | None = None
     retrieval_mode: str = "personalized"
+    captured_scoring: CapturedScoring | None = field(default=None, repr=False, compare=False)
+    model_context: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +253,9 @@ class QdrantV2Retriever:
         social_policy: SocialPolicy | None = None,
         candidate_vector_mode: str | None = None,
     ) -> None:
+        self.lifecycle_policy = os.getenv("V2_REPOSITORY_LIFECYCLE_POLICY", "disabled").strip()
+        if self.lifecycle_policy not in {"disabled", POLICY_VERSION}:
+            raise ValueError("V2_REPOSITORY_LIFECYCLE_POLICY must be disabled or verified-status-v1")
         validate_retrieval_runtime()
         self.qdrant_timeout_seconds = self._float_env(
             "QDRANT_TIMEOUT_SECONDS", default=10.0, minimum=1.0, maximum=120.0,
@@ -607,15 +617,19 @@ class QdrantV2Retriever:
         # _canonical_id rejects points whose payload and point ID disagree.
         # Exclude history before *every* channel's bounded selection so a
         # viewed top pool cannot hide eligible unseen repositories behind it.
+        lifecycle_exclusions = ([
+            models.FieldCondition(key=field, match=models.MatchValue(value=True))
+            for field in ("lifecycle_archived", "lifecycle_disabled")
+        ] if self.lifecycle_policy == POLICY_VERSION else [])
         return models.Filter(
             must=must,
-            must_not=(
+            must_not=(lifecycle_exclusions + (
                 [models.HasIdCondition(has_id=sorted(
                     exclude_repo_ids,
                     key=lambda value: (0, value) if isinstance(value, int) else (1, value),
                 ))]
-                if exclude_repo_ids else None
-            ),
+                if exclude_repo_ids else []
+            )) or None,
         )
 
     def _eligible_repository_point(
@@ -637,6 +651,8 @@ class QdrantV2Retriever:
                 raise ValueError("repository identity is not canonical")
             payload = dict(point.payload or {})
             validate_diversity_metadata(payload)
+            if self.lifecycle_policy == POLICY_VERSION and lifecycle_excluded(payload):
+                raise ValueError("repository lifecycle excludes new selection")
             revision = payload.get("embedding_model_revision")
             if (
                 payload.get(REPOSITORY_SERVING_ELIGIBILITY_FIELD)
@@ -712,6 +728,21 @@ class QdrantV2Retriever:
             **qdrant_timeout(self.qdrant_timeout_seconds),
         )
 
+    def _fetch_user_model(self, user_id: str) -> list[Any]:
+        # A single owned read supplies baseline, ledgers and every revision.
+        return self.client.retrieve(collection_name=self.user_collection, ids=[user_point_id(user_id)],
+                                    with_payload=True, with_vectors=True, **qdrant_timeout(self.qdrant_timeout_seconds))
+
+    def _fetch_user_profile_for_capture(self, user_id: str) -> list[Any]:
+        return self.client.retrieve(
+            collection_name=self.user_collection,
+            ids=[user_point_id(user_id)],
+            with_vectors=True,
+            with_payload=[*_USER_RETRIEVAL_PAYLOAD_FIELDS, "profile_version", "last_feedback_version",
+                          "feedback_state_revision", "embedding_version"],
+            **qdrant_timeout(self.qdrant_timeout_seconds),
+        )
+
     def _profile_from_points(
         self, user_id: str, points: list[Any],
     ) -> tuple[list[float] | None, dict[str, Any]]:
@@ -723,6 +754,8 @@ class QdrantV2Retriever:
         if not point:
             return None, {}
         payload = dict(point.payload or {})
+        if payload.get("model_policy_sha256") is not None:
+            raise RetrievalDependencyError("negotiated user state requires an applied session model context")
         try:
             vector = validate_embedding_vector(
                 self._vector(point.vector, TARGET_VECTOR_NAME),
@@ -823,6 +856,19 @@ class QdrantV2Retriever:
             with_vectors=False,
             **qdrant_timeout(self.qdrant_timeout_seconds),
         )
+
+    def _fetch_lifecycle_social_candidates(self, repo_ids: list[str], limit: int) -> list[Any]:
+        # The input contract bounds the complete identity set to 100. Apply
+        # lifecycle/compatibility before Qdrant's read limit; source-score caps
+        # are applied only after this eligible lookup, never before it.
+        eligible = self._eligible_filter()
+        eligible.must = [*(eligible.must or []), models.HasIdCondition(has_id=repo_ids)]
+        records, _ = self.client.scroll(
+            collection_name=self.repository_collection, scroll_filter=eligible,
+            limit=limit, with_payload=_REPOSITORY_RETRIEVAL_PAYLOAD_FIELDS,
+            with_vectors=False, **qdrant_timeout(self.qdrant_timeout_seconds),
+        )
+        return records
 
     def _hydrate_retained_candidates(
         self,
@@ -1198,7 +1244,10 @@ class QdrantV2Retriever:
         include_vectors: bool, exclude_repo_ids: set[str] | None,
     ) -> None:
         plan.budget = plan.budget or self._candidate_read_budget()
-        revision = None if include_vectors else self._discovery_revision()
+        # Status transitions must take effect at the completed refresh boundary,
+        # even when a shared cache still holds pre-transition payload snapshots.
+        revision = (None if include_vectors or self.lifecycle_policy == POLICY_VERSION
+                    else self._discovery_revision())
         if revision is not None:
             per_channel = min(self.max_candidates, max(
                 25, math.ceil((min(limit, self.max_candidates) * 2) / len(_DISCOVERY_SOURCES)),
@@ -1678,8 +1727,27 @@ class QdrantV2Retriever:
         cold_start: bool = False,
         social_repo_ids: list[str] | None = None,
         social_candidates: list[SocialCandidate] | None = None,
+        scoring_capture: CaptureOptions | None = None,
+        model_context=None,
     ) -> RecommendationBatch:
         check_deadline()
+        effective_input = None
+        def decode_profile(points):
+            nonlocal effective_input
+            if model_context is None:
+                return self._profile_from_points(user_id, points)
+            from feedback.model_runtime import model_runtime
+            from feedback.model_serving import owned_input
+            if len(points) != 1:
+                raise RetrievalDependencyError("required applied user model is unavailable")
+            runtime = model_runtime()
+            effective_input = owned_input(points[0], runtime.users, runtime.policy, model_context)
+            excluded.update(effective_input.explicit_negative_repo_ids)
+            vector, payload = self._profile_from_points(user_id, [SimpleNamespace(
+                id=user_id, vector=list(effective_input.vector), payload=effective_input.profile_payload)])
+            if vector is None:
+                raise RetrievalDependencyError("applied user model embedding identity differs")
+            return list(effective_input.vector), payload
         excluded = {str(uuid.UUID(item)) for item in exclude_repo_ids}
         candidates: dict[str, RankedRepository] = {}
         metadata: dict[str, dict[str, Any]] = {}
@@ -1693,9 +1761,14 @@ class QdrantV2Retriever:
         diversity_cohort = int.from_bytes(hashlib.sha256(str(uuid.UUID(user_id)).encode()).digest()[:8], 'big') % 10000
         diversity_selected = self.diversity_mode != 'disabled' and diversity_cohort < self.diversity_traffic_percent * 100
         social_rows = social_candidates or []
-        social_ids = lookup_social_ids(social_rows, social_policy, excluded)
+        lifecycle_social = self.lifecycle_policy == POLICY_VERSION
+        lookup_policy = replace(social_policy, max_lookup=100) if lifecycle_social else social_policy
+        social_ids = lookup_social_ids(social_rows, lookup_policy, excluded)
+        social_read_limit = 0
         if social_policy.injects and social_ids:
-            social_ids = social_ids[:budget.reserve(len(social_ids))]
+            social_read_limit = budget.reserve(len(social_ids))
+            if not lifecycle_social:
+                social_ids = social_ids[:social_read_limit]
         social_points: dict[str, _EligibleRepositoryPoint] = {}
         # Inline is an explicit high-RTT alternative only for required-heavy.
         # It never uses the shared discovery pool or a previous request's pair.
@@ -1715,15 +1788,19 @@ class QdrantV2Retriever:
         discovery_plan = _DiscoveryPlan(budget=budget)
         try:
             with RetrievalWork() as work:
-                profile_future = work.submit("profile", self._fetch_user_profile, user_id)
-                social_future = (work.submit("social", self._fetch_social_candidates, social_ids)
-                                 if social_policy.injects and social_ids else None)
+                profile_reader = (self._fetch_user_model if model_context is not None else
+                                  self._fetch_user_profile if scoring_capture is None else self._fetch_user_profile_for_capture)
+                profile_future = work.submit("profile", profile_reader, user_id)
+                def submit_social(read_limit):
+                    if lifecycle_social:
+                        return work.submit("social", self._fetch_lifecycle_social_candidates, social_ids, read_limit)
+                    return work.submit("social", self._fetch_social_candidates, social_ids)
+                social_future = (submit_social(social_read_limit)
+                                 if social_policy.injects and social_ids and social_read_limit else None)
                 # Validate the required profile before any vector-bearing
                 # repository RPC. Deferred mode retains its parallel overlap.
                 if inline_vectors:
-                    user_vector, user_profile = self._profile_from_points(
-                        user_id, work.result(profile_future),
-                    )
+                    user_vector, user_profile = decode_profile(work.result(profile_future))
                     if user_vector is None:
                         self._record_ranking_result(
                             heavy_selected=heavy_selected, ranker_applied=False,
@@ -1738,9 +1815,7 @@ class QdrantV2Retriever:
                     exclude_repo_ids=excluded,
                 )
                 if not inline_vectors:
-                    user_vector, user_profile = self._profile_from_points(
-                        user_id, work.result(profile_future),
-                    )
+                    user_vector, user_profile = decode_profile(work.result(profile_future))
                 if self.heavy_ranker_required and not heavy_selected:
                     raise RetrievalDependencyError(
                         "the required V2 heavy ranker was not selected"
@@ -1800,9 +1875,11 @@ class QdrantV2Retriever:
                 # Shadow evaluation cannot reserve reads needed by serving
                 # retrieval/refills. It may inspect only the remaining budget.
                 if social_policy.mode == 'shadow' and social_ids:
-                    social_ids = social_ids[:budget.reserve(len(social_ids))]
-                    if social_ids:
-                        social_future = work.submit("social", self._fetch_social_candidates, social_ids)
+                    social_read_limit = budget.reserve(len(social_ids))
+                    if not lifecycle_social:
+                        social_ids = social_ids[:social_read_limit]
+                    if social_ids and social_read_limit:
+                        social_future = submit_social(social_read_limit)
                 if social_future is not None:
                     try:
                         records = work.result(social_future)
@@ -1880,7 +1957,8 @@ class QdrantV2Retriever:
             )
         }
         selected_social = select_social_candidates(
-            social_rows, social_policy, eligible_repo_ids=compatible_social, excluded=excluded,
+            ([row for row in social_rows if row.repo_id in compatible_social] if lifecycle_social else social_rows),
+            social_policy, eligible_repo_ids=compatible_social, excluded=excluded,
         )[:self.max_candidates]
         reserved_social = set()
         if selected_social:
@@ -1978,14 +2056,29 @@ class QdrantV2Retriever:
                 )
                 fallback_code = "CANDIDATE_VECTORS_UNAVAILABLE"
                 fallback_reason = _FALLBACK_MESSAGES[fallback_code]
+        captured_scoring = None
         if heavy_selected and fallback_code is None:
-            heavy_ranked, fallback_code, fallback_reason = self._heavy_rank(
-                user_vector=user_vector,
-                user_profile=user_profile,
-                ranked=hybrid_ranked,
-                metadata=metadata,
-                vectors=vectors,
-            )
+            if scoring_capture is None:
+                heavy_ranked, fallback_code, fallback_reason = self._heavy_rank(
+                    user_vector=user_vector, user_profile=user_profile,
+                    ranked=hybrid_ranked, metadata=metadata, vectors=vectors,
+                )
+            elif hybrid_ranked:
+                context = scoring_context_for(ranker=self.ranker, user_id=user_id,
+                    generation_id=generation_seed, user_vector=user_vector, profile=user_profile,
+                    candidates=hybrid_ranked, metadata=metadata, options=scoring_capture)
+                result, captured_scoring = score_with_capture(context, lambda: self._heavy_rank(
+                    user_vector=user_vector, user_profile=user_profile,
+                    ranked=hybrid_ranked, metadata=metadata, vectors=vectors,
+                ))
+                heavy_ranked, fallback_code, fallback_reason = result
+            else:
+                # Keep the existing no-eligible heavy failure; no synthetic
+                # empty scoring result is created for capture requests.
+                heavy_ranked, fallback_code, fallback_reason = self._heavy_rank(
+                    user_vector=user_vector, user_profile=user_profile,
+                    ranked=hybrid_ranked, metadata=metadata, vectors=vectors,
+                )
         if self.heavy_ranker_required and heavy_ranked is None:
             self._record_ranking_result(
                 heavy_selected=heavy_selected,
@@ -1997,6 +2090,8 @@ class QdrantV2Retriever:
                 "the required V2 heavy ranker could not serve this request: "
                 f"{fallback_reason or 'unknown ranker failure'}"
             )
+        if scoring_capture is not None and captured_scoring is None and (heavy_ranked or hybrid_ranked or fallback_code):
+            raise RetrievalDependencyError("Requested scoring capture requires actual compatible heavy scoring")
         ranker_applied = heavy_ranked is not None
         ranked = heavy_ranked if heavy_ranked is not None else hybrid_ranked
         ranked = self._apply_social_boost(
@@ -2100,6 +2195,7 @@ class QdrantV2Retriever:
             ranker_applied=ranker_applied,
             fallback_code=fallback_code,
         )
+        from feedback.model_serving import input_identity
         return RecommendationBatch(
             items=items,
             model_version=model_version,
@@ -2111,6 +2207,8 @@ class QdrantV2Retriever:
             heavy_ranker_selected=heavy_selected,
             fallback_code=fallback_code,
             retrieval_mode=retrieval_mode,
+            captured_scoring=captured_scoring,
+            model_context=(None if effective_input is None else input_identity(effective_input)),
         )
 
     def recommend(
@@ -2186,11 +2284,13 @@ class QdrantV2Retriever:
             )
 
     @staticmethod
-    def _validate_repository_payload_indexes(info: Any) -> None:
+    def _validate_repository_payload_indexes(info: Any, *, lifecycle_policy: str = "disabled") -> None:
         payload_schema = getattr(info, "payload_schema", None)
         if not isinstance(payload_schema, Mapping):
             raise RuntimeError("Qdrant repository payload index schema is unavailable")
         for field, expected_type in QDRANT_PAYLOAD_INDEX_SCHEMA.items():
+            if field in {"lifecycle_archived", "lifecycle_disabled"} and lifecycle_policy == "disabled":
+                continue
             actual = payload_schema.get(field)
             if actual is None:
                 raise RuntimeError(
@@ -2229,7 +2329,7 @@ class QdrantV2Retriever:
             expected_size=REPOSITORY_COLLECTION_CONTRACT.vector_size,
             expected_distance=QDRANT_DISTANCE,
         )
-        self._validate_repository_payload_indexes(info)
+        self._validate_repository_payload_indexes(info, lifecycle_policy=self.lifecycle_policy)
         user_collection_contract = "not_required"
         if self.user_collection_required:
             user_info = self.client.get_collection(self.user_collection)

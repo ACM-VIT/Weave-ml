@@ -41,12 +41,22 @@ def validate_scaler(mean: np.ndarray, scale: np.ndarray) -> tuple[np.ndarray, np
 
 def fit_dense_features(training_rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Fit population statistics using only explicitly selected training rows."""
-    dense = _dense_values(training_rows)
-    if not len(dense):
+    count = len(training_rows)
+    if not count:
         raise ValueError("Cannot fit a feature scaler without training rows")
+    # Two passes retain population-variance semantics while bounding float64
+    # imputation and centering buffers, including for read-only memory maps.
+    chunk_rows = 8192
     with np.errstate(over="ignore", invalid="ignore"):
-        mean = dense.mean(axis=0)
-        scale = dense.std(axis=0)
+        total = np.zeros(FEATURE_COUNT, dtype=np.float64)
+        for start in range(0, count, chunk_rows):
+            total += _dense_values(training_rows[start:start + chunk_rows]).sum(axis=0)
+        mean = total / count
+        squared = np.zeros(FEATURE_COUNT, dtype=np.float64)
+        for start in range(0, count, chunk_rows):
+            centered = _dense_values(training_rows[start:start + chunk_rows]) - mean
+            squared += np.square(centered).sum(axis=0)
+        scale = np.sqrt(squared / count)
     scale = np.where(scale == 0.0, 1.0, scale)
     validate_scaler(mean, scale)
     return mean, scale

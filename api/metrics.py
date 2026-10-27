@@ -15,6 +15,10 @@ from summarization.runtime import summary_admission_metrics
 
 
 _ROUTES = {
+    "/api/v2/model-operations",
+    "/api/v2/model-authority",
+    "/api/v2/model-operation-withdrawals",
+    "/api/v2/model-operation-status",
     "/api/v2/search/repositories",
     "/api/v2/recommendations/generate",
     "/api/v2/feedback/batch",
@@ -46,6 +50,9 @@ _recommendations: Counter[tuple[str, str]] = Counter()
 _health_checks: Counter[tuple[str, str]] = Counter()
 _health_duration_sum: Counter[str] = Counter()
 _empty_recommendations = 0
+_SCORING_CAPTURE_FAILURE_STAGES = frozenset({"retrieval_scoring", "output_validation", "packet_binding",
+    "response_validation", "sealing", "completion", "other"})
+_scoring_capture_failures: Counter[str] = Counter()
 
 
 def _bounded_increment(counter: Counter, key, amount: int | float = 1) -> None:
@@ -91,6 +98,12 @@ def record_recommendation(
             _empty_recommendations = min(_COUNTER_LIMIT, _empty_recommendations + 1)
 
 
+def record_scoring_capture_failure(stage: str) -> None:
+    stage = stage if stage in _SCORING_CAPTURE_FAILURE_STAGES else "other"
+    with _lock:
+        _bounded_increment(_scoring_capture_failures, stage)
+
+
 def record_health_dependency(dependency: str, outcome: str, duration: float) -> None:
     """Count logical diagnostic checks, not underlying client RPCs."""
     if dependency not in {"qdrant", "redis"} or outcome not in {"healthy", "failed"}:
@@ -114,6 +127,7 @@ def render_prometheus(
         recommendations = dict(_recommendations)
         empty_recommendations = _empty_recommendations
         health_checks = dict(_health_checks)
+        capture_failures = dict(_scoring_capture_failures)
         health_duration_sum = dict(_health_duration_sum)
 
     lines = [
@@ -246,6 +260,12 @@ def render_prometheus(
             "ml_health_dependency_duration_seconds_sum"
             + _labels(dependency=dependency) + f" {duration:.9f}"
         )
+    lines.extend([
+        "# HELP ml_scoring_capture_failures_total Private capture failures by bounded worker stage.",
+        "# TYPE ml_scoring_capture_failures_total counter",
+    ])
+    for stage, count in sorted(capture_failures.items()):
+        lines.append("ml_scoring_capture_failures_total" + _labels(stage=stage) + f" {count}")
     lines.extend(render_stage_histograms())
     lines.extend(render_candidate_metrics())
     retrieval = retrieval_runtime_status()
@@ -284,5 +304,6 @@ def reset_metrics_for_tests() -> None:
         _duration_sum.clear()
         _recommendations.clear()
         _health_checks.clear()
+        _scoring_capture_failures.clear()
         _health_duration_sum.clear()
         _empty_recommendations = 0

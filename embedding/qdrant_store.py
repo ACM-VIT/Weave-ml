@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from ingestion.lifecycle import LIFECYCLE_FIELDS
+
 import logging
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+
+from utils.deadline import check_deadline
 from numbers import Integral, Real
 from typing import Any
 
@@ -20,9 +24,10 @@ from config import (
     QDRANT_VECTOR_NAME,
     REPOSITORY_EMBEDDING_DIM,
 )
+from .batch_limits import check_field_budget
 from .corpus_revision import (
     CorpusAuthorityUnavailable, CorpusRevisionAuthority, MaintenanceProof,
-    authority_from_environment,
+    authority_from_environment, operation_completed,
 )
 from .qdrant_cas import payload_matches, payload_snapshot_filter
 from .repository_embedding import RepositoryEmbeddingResult
@@ -94,48 +99,124 @@ class QdrantRepositoryStore:
         # The below check is for safe startup: existing collections are
         # validated instead of recreated, so stored vectors are not dropped.
         if not self._collection_exists():
-            distance = self._distance()
-            self._mutate(lambda: self.client.create_collection(
-                collection_name=self.collection_name,
-                vectors_config={
-                    self.vector_name: self.models.VectorParams(
-                        size=self.vector_size,
-                        distance=distance,
-                    )
-                },
-            ), synchronous_boolean=True)
-            logger.info("Created Qdrant collection: %s", self.collection_name)
-        self._validate_collection()
+            def create():
+                from qdrant_client.http.exceptions import UnexpectedResponse
 
-        for field_name in QDRANT_PAYLOAD_INDEX_FIELDS:
+                try:
+                    return self.client.create_collection(
+                        collection_name=self.collection_name,
+                        vectors_config={
+                            self.vector_name: self.models.VectorParams(
+                                size=self.vector_size,
+                                distance=self._distance(),
+                            )
+                        },
+                    )
+                except UnexpectedResponse as exc:
+                    if exc.status_code != 409:
+                        raise
+                    # A concurrent creator won. Only an explicit conflict is
+                    # known not to have dispatched our creation; lost replies
+                    # and other errors still retain the authority writer token.
+                    self._validate_collection()
+                    return True
+            self._mutate(create, synchronous_boolean=True)
+        info = self._validate_collection()
+        missing = self._missing_payload_indexes(info)
+        for field_name in missing:
+            # Another bootstrap may have provisioned this field, or an admin
+            # may have replaced the collection since the initial inspection.
+            current_missing = self._missing_payload_indexes(self._validate_collection())
+            if field_name not in current_missing:
+                continue
             self._create_payload_index(field_name)
+        if missing:
+            remaining = self._missing_payload_indexes(self._validate_collection())
+            if remaining:
+                raise RuntimeError(
+                    f"Qdrant payload indexes are missing after provisioning: {remaining}"
+                )
 
     def validate_collection(self) -> None:
         """Validate the configured collection without creating indexes."""
         if not self._collection_exists():
             raise ValueError(f"Qdrant collection {self.collection_name!r} does not exist.")
-        self._validate_collection()
+        missing = self._missing_payload_indexes(self._validate_collection())
+        if missing:
+            raise ValueError(f"Qdrant payload indexes are missing: {missing}")
 
-    def upsert(self, results: Iterable[RepositoryEmbeddingResult]) -> None:
-        """Upsert embedding results into Qdrant."""
-        points = []
-        for result in results:
-            # The below deterministic ID is for safe re-runs; the same repo is
-            # updated instead of inserted as a duplicate vector.
-            points.append(
-                self._validated_point(
-                    result,
-                    point_id=self._point_id(result.repo_id),
+    def iter_upsert(
+        self,
+        results: Iterable[RepositoryEmbeddingResult],
+        *,
+        max_points: int = 64,
+        max_request_bytes: int = 1024 * 1024,
+    ) -> Iterator[RepositoryEmbeddingResult]:
+        """Yield acknowledged offline writes bounded by points and REST bytes.
+
+        Earlier chunks stay committed when validation, iteration or a write
+        fails. The failed/ambiguous chunk is never yielded. Restart by replaying
+        deterministic IDs; this is deliberately separate from online CAS.
+        """
+        self._validate_limit(max_points)
+        self._validate_limit(max_request_bytes)
+        # Use the client's REST serializer, including UTF-8, escaping and the
+        # request envelope. Character counts/estimated vector sizes undercount
+        # multilingual payloads and float representations.
+        from qdrant_client.http.api.points_api import jsonable_encoder
+
+        envelope_bytes = len(jsonable_encoder(self.models.PointsList(points=[])).encode("utf-8"))
+        points, pending = [], []
+        request_bytes = envelope_bytes
+
+        def flush():
+            check_deadline()
+            response = self._mutate(lambda: self.client.upsert(
+                collection_name=self.collection_name, points=points, wait=True,
+            ))
+            if not operation_completed(response):
+                raise CorpusAuthorityUnavailable(
+                    "Qdrant chunk completion is not proven; replay before recording progress"
                 )
+            logger.info("Upserted %d repository vectors into %s (%d REST bytes)",
+                        len(points), self.collection_name, request_bytes)
+
+        for result in results:
+            check_deadline()
+            check_field_budget(
+                [result.payload], max_bytes=max_request_bytes, label="Qdrant point payload",
             )
-        if not points:
-            return
-        self._mutate(lambda: self.client.upsert(
-            collection_name=self.collection_name,
-            points=points,
-            wait=True,
-        ))
-        logger.info("Upserted %d repository vectors into %s", len(points), self.collection_name)
+            point = self._validated_point(result, point_id=self._point_id(result.repo_id))
+            size = len(jsonable_encoder(point).encode("utf-8"))
+            if size + envelope_bytes > max_request_bytes:
+                raise ValueError(f"repository {result.repo_id} exceeds the Qdrant request byte budget")
+            if points and (len(points) >= max_points or request_bytes + 1 + size > max_request_bytes):
+                flush()
+                yield from pending
+                points, pending = [], []
+                request_bytes = envelope_bytes
+            request_bytes += size + int(bool(points))
+            points.append(point)
+            pending.append(result)
+            if len(points) == max_points:
+                flush()
+                yield from pending
+                points, pending = [], []
+                request_bytes = envelope_bytes
+        if points:
+            flush()
+            yield from pending
+
+    def upsert(
+        self,
+        results: Iterable[RepositoryEmbeddingResult],
+        *,
+        max_points: int = 64,
+        max_request_bytes: int = 1024 * 1024,
+    ) -> None:
+        """Consume bounded offline writes; use iter_upsert for progress."""
+        for _ in self.iter_upsert(results, max_points=max_points, max_request_bytes=max_request_bytes):
+            pass
 
     def compare_and_set_content(
         self,
@@ -208,6 +289,7 @@ class QdrantRepositoryStore:
                         "content_job_id",
                         "feature_version",
                         "feature_job_id",
+                        *LIFECYCLE_FIELDS,
                     ),
                 ),
             )
@@ -243,7 +325,7 @@ class QdrantRepositoryStore:
             self.models,
             point_id=expected_point.id,
             payload=expected_payload,
-            fields=("feature_version", "feature_job_id"),
+            fields=("feature_version", "feature_job_id", *LIFECYCLE_FIELDS),
         )
         self._mutate(lambda: self.client.set_payload(
             collection_name=self.collection_name,
@@ -251,6 +333,25 @@ class QdrantRepositoryStore:
             points=selector,
             wait=True,
             ordering=self.models.WriteOrdering.STRONG,
+        ))
+        return self._retrieve_point(str(expected_point.id))
+
+    def compare_and_set_lifecycle(self, *, expected_point: Any, lifecycle_payload: Mapping[str, Any]) -> Any | None:
+        """Status observations can arrive after newer unrelated feature jobs.
+
+        Fence both the independent status snapshot and feature revision; never
+        rewind feature versions or overwrite counts while applying delayed status.
+        """
+        if not lifecycle_payload or any(field not in LIFECYCLE_FIELDS for field in lifecycle_payload):
+            raise ValueError("lifecycle CAS accepts only lifecycle observation fields")
+        expected_payload = dict(expected_point.payload or {})
+        selector = payload_snapshot_filter(
+            self.models, point_id=expected_point.id, payload=expected_payload,
+            fields=("content_version", "content_job_id", "feature_version", "feature_job_id", *LIFECYCLE_FIELDS),
+        )
+        self._mutate(lambda: self.client.set_payload(
+            collection_name=self.collection_name, payload=dict(lifecycle_payload),
+            points=selector, wait=True, ordering=self.models.WriteOrdering.STRONG,
         ))
         return self._retrieve_point(str(expected_point.id))
 
@@ -551,10 +652,14 @@ class QdrantRepositoryStore:
         try:
             self.client.get_collection(self.collection_name)
             return True
-        except Exception:
-            return False
+        except Exception as exc:
+            from qdrant_client.http.exceptions import UnexpectedResponse
 
-    def _validate_collection(self) -> None:
+            if isinstance(exc, UnexpectedResponse) and exc.status_code == 404:
+                return False
+            raise
+
+    def _validate_collection(self) -> Any:
         info = self.client.get_collection(self.collection_name)
         vectors = info.config.params.vectors
         vector_config = vectors.get(self.vector_name) if isinstance(vectors, Mapping) else None
@@ -574,6 +679,31 @@ class QdrantRepositoryStore:
                 f"Qdrant collection {self.collection_name!r} vector {self.vector_name!r} "
                 f"uses distance {vector_config.distance}, expected {expected_distance}."
             )
+        return info
+
+    def _missing_payload_indexes(self, info: Any) -> list[str]:
+        """Validate authoritative metadata before issuing any schema mutation."""
+        schema = getattr(info, "payload_schema", None)
+        if not isinstance(schema, Mapping):
+            raise ValueError("Qdrant repository payload index schema is unavailable")
+        missing = []
+        for field in QDRANT_PAYLOAD_INDEX_FIELDS:
+            if field not in schema:
+                missing.append(field)
+                continue
+            actual = schema[field]
+            if isinstance(actual, Mapping):
+                actual = actual.get("data_type")
+            else:
+                actual = getattr(actual, "data_type", actual)
+            actual = getattr(actual, "value", actual)
+            expected = QDRANT_PAYLOAD_INDEX_SCHEMA[field]
+            if not isinstance(actual, str) or actual.casefold() != expected:
+                raise ValueError(
+                    f"Qdrant payload index {field!r} has type {actual!r}, "
+                    f"expected {expected!r}; explicit schema migration is required"
+                )
+        return missing
 
     def _validate_store_config(self) -> None:
         for field_name, value in (

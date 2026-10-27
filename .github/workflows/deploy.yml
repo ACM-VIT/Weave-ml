@@ -1,24 +1,19 @@
 name: Deploy to AWS
 
+# Called only after the same trusted run has completed every verification gate.
+# Same-run artifact access needs no new repository permissions or registry.
 on:
-  workflow_run:
-    workflows: ["Test Trending Service"]
-    types: [completed]
-
-concurrency:
-  group: gh-social-ml-production
-  cancel-in-progress: false
+  workflow_call:
 
 permissions:
   contents: read
 
 jobs:
   deploy:
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: gh-social-ml-production
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 60
     environment:
@@ -28,40 +23,29 @@ jobs:
       - name: Check out source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: '3.12'
 
-      - name: Verify ML service
+      - name: Download the verified image from this run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-${{ github.sha }}-${{ github.run_attempt }}
+
+      - name: Verify exact source and image binding
         run: |
-          python -m pip install uv==0.13.4
-          uv sync --locked --dev
-          uv run pytest -q
-          docker build \
-            --build-arg ML_RELEASE_ID=${{ github.event.workflow_run.head_sha }} \
-            -t gh-social-ml:${{ github.event.workflow_run.head_sha }} .
-          docker save gh-social-ml:${{ github.event.workflow_run.head_sha }} | gzip > gh-social-ml.tar.gz
-          docker image inspect \
-            --format '{{.Size}}' \
-            gh-social-ml:${{ github.event.workflow_run.head_sha }} \
-            > deployment.image-size
-          sha256sum \
-            gh-social-ml.tar.gz \
-            deployment.image-size \
-            deploy/systemd/gh-social-ml.service \
-            deploy/systemd/gh-social-ml-feedback.service \
-            scripts/validate_production_config.py \
-            scripts/production_smoke.py \
-            > deployment.sha256
+          set -euo pipefail
+          sha256sum --check deployment.sha256
+          python scripts/release_artifact.py verify --sha "${{ github.sha }}"
 
       - name: Guard against stale workflow completion
         id: release_guard
         run: |
           git fetch --no-tags origin main
-          if [ "$(git rev-parse origin/main)" = "${{ github.event.workflow_run.head_sha }}" ]; then
+          if [ "$(git rev-parse origin/main)" = "${{ github.sha }}" ]; then
             echo "current=true" >> "$GITHUB_OUTPUT"
           else
             echo "current=false" >> "$GITHUB_OUTPUT"
@@ -78,7 +62,7 @@ jobs:
           fingerprint: ${{ secrets.AWS_HOST_FINGERPRINT }}
           timeout: 1m
           command_timeout: 20m
-          source: "gh-social-ml.tar.gz,deployment.image-size,deployment.sha256,deploy/systemd/*.service,scripts/validate_production_config.py,scripts/production_smoke.py"
+          source: "gh-social-ml.tar.gz,deployment.image-size,deployment.image-id,deployment.release.json,deployment.sha256,deploy/systemd/*.service,scripts/validate_production_config.py,scripts/production_smoke.py"
           target: /tmp/gh-social-ml-deploy
 
       - name: Deploy using SSH
@@ -94,7 +78,7 @@ jobs:
           script: |
             /usr/bin/env bash <<'GH_SOCIAL_DEPLOY'
             set -Eeuo pipefail
-            release_sha='${{ github.event.workflow_run.head_sha }}'
+            release_sha='${{ github.sha }}'
             transaction_id="${release_sha}-${{ github.run_id }}-${{ github.run_attempt }}"
             staging_dir=/tmp/gh-social-ml-deploy
             archive_path="$staging_dir/gh-social-ml.tar.gz"
@@ -137,6 +121,8 @@ jobs:
             for artifact in \
               "$archive_path" \
               "$staging_dir/deployment.image-size" \
+              "$staging_dir/deployment.image-id" \
+              "$staging_dir/deployment.release.json" \
               "$staging_dir/deployment.sha256" \
               "$staging_dir/deploy/systemd/gh-social-ml.service" \
               "$staging_dir/deploy/systemd/gh-social-ml-feedback.service" \
@@ -184,7 +170,13 @@ jobs:
             fi
 
             sudo docker load -i "$archive_path"
-            sudo docker image inspect "$image_ref" >/dev/null
+            expected_image_id=$(cat "$staging_dir/deployment.image-id")
+            [[ "$expected_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+            test "$(sudo docker image inspect --format '{{.Id}}' "$image_ref")" = "$expected_image_id"
+            test "$(sudo docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_ref")" = "$release_sha"
+            image_environment=$(sudo docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image_ref")
+            test "$(printf '%s\n' "$image_environment" | grep '^ML_RELEASE_ID=')" = "ML_RELEASE_ID=$release_sha"
+            test "$(printf '%s\n' "$image_environment" | grep '^BAKED_ML_RELEASE_ID=')" = "BAKED_ML_RELEASE_ID=$release_sha"
 
             sudo install -d -m 0755 "$library_root" "$library_root/releases"
             sudo install -d -m 0755 "$candidate_helper_dir"

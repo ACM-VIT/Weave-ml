@@ -58,6 +58,8 @@ REPOSITORY_COLLECTION_CONTRACT = VectorCollectionContract(
 # Retrieval can therefore avoid transferring every candidate vector on the
 # default hybrid path while still filtering to points written atomically by the
 # validated ingestion path.
+# This technical marker is not product-quality approval or a decision under
+# the observation-only repository admission proposal (contracts/admission.py).
 REPOSITORY_SERVING_ELIGIBILITY_FIELD = "serving_eligibility_version"
 REPOSITORY_SERVING_ELIGIBILITY_VERSION = "repository-vector-v2"
 

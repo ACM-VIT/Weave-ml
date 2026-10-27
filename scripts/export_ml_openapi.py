@@ -10,6 +10,8 @@ PRODUCT_PATHS = (
     '/api/v2/recommendations/generate', '/api/v2/feedback/batch',
     '/api/v2/repositories/embed', '/api/v2/repositories/refresh',
     '/api/v2/users/onboard', '/api/v2/search/repositories',
+    '/api/v2/model-operations', '/api/v2/model-authority',
+    '/api/v2/model-operation-withdrawals', '/api/v2/model-operation-status',
 )
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / 'contracts/ml-v2.openapi.json'
 
@@ -25,9 +27,16 @@ def build_schema() -> dict:
     schema['info']['x-online-product-database-access'] = False
     schema['components']['securitySchemes'] = {
         'InternalSecret': {'type': 'apiKey', 'in': 'header', 'name': 'x-internal-secret'},
+        'ScoringCaptureCapability': {'type': 'apiKey', 'in': 'header',
+            'name': 'x-scoring-capture-capability',
+            'description': 'Required in addition to InternalSecret only for explicitly negotiated scoring_capture requests.'},
     }
     for path in PRODUCT_PATHS:
         schema['paths'][path]['post']['security'] = [{'InternalSecret': []}]
+    schema['paths']['/api/v2/recommendations/generate']['post']['x-scoring-capture-security'] = {
+        'required_when': 'scoring_capture is provided',
+        'security': [{'InternalSecret': [], 'ScoringCaptureCapability': []}],
+    }
     return schema
 
 
