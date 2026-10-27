@@ -15,6 +15,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from huggingface_hub.constants import HF_HUB_CACHE
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -46,13 +48,15 @@ SUPPORTED_MINILM_NAMES = {"all-MiniLM-L6-v2", "sentence-transformers/all-MiniLM-
 
 def _default_model_snapshot() -> Path:
     return (
-        Path.home()
-        / ".cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots"
+        Path(HF_HUB_CACHE)
+        / "models--sentence-transformers--all-MiniLM-L6-v2/snapshots"
         / EXPECTED_MODEL_REVISION
     )
 
 
-def _read_snapshot(path: Path, *, limit: int) -> list[dict[str, Any]]:
+def _read_snapshot(
+    path: Path, *, limit: int,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_EXPORT_REPOSITORIES:
         raise ValueError(f"limit must be between 1 and {MAX_EXPORT_REPOSITORIES}")
     with path.open("rb") as source_file:
@@ -61,12 +65,13 @@ def _read_snapshot(path: Path, *, limit: int) -> list[dict[str, Any]]:
         raise ValueError(f"input snapshot exceeds {MAX_INPUT_BYTES} bytes")
     document = json.loads(raw)
     if not isinstance(document, dict) or not isinstance(document.get("repositories"), list):
-        raise ValueError("input must be a frozen snapshot object with a repositories list")
+        raise ValueError("input must be a frozen JSON snapshot with a repositories list")
     rows = document["repositories"]
     if not 1 <= len(rows) <= MAX_EXPORT_REPOSITORIES:
         raise ValueError(f"snapshot must contain 1 to {MAX_EXPORT_REPOSITORIES} repositories")
 
     sources: list[dict[str, Any]] = []
+    frozen_payloads: dict[str, dict[str, Any]] = {}
     seen_ids: set[str] = set()
     for row in rows[:limit]:
         if not isinstance(row, dict):
@@ -91,7 +96,8 @@ def _read_snapshot(path: Path, *, limit: int) -> list[dict[str, Any]]:
         source = dict(payload)
         source["repo_id"] = repo_id
         sources.append(source)
-    return sources
+        frozen_payloads[repo_id] = dict(payload)
+    return sources, frozen_payloads
 
 
 def _build_local_pipeline(model_snapshot: Path) -> RepositoryEmbeddingPipeline:
@@ -166,7 +172,7 @@ def export_snapshot(
         raise ValueError("candidate output cannot overwrite its input snapshot")
     if output_path.exists():
         raise FileExistsError(f"candidate output already exists: {output_path}")
-    sources = _read_snapshot(input_path, limit=limit)
+    sources, frozen_payloads = _read_snapshot(input_path, limit=limit)
     active_pipeline = pipeline or _build_local_pipeline(model_snapshot or _default_model_snapshot())
     if active_pipeline.config.version != STABLE_METADATA_EMBEDDING_VERSION:
         raise ValueError("export requires the stable-metadata candidate recipe")
@@ -185,15 +191,30 @@ def export_snapshot(
         ):
             raise ValueError("embedding pipeline returned an incompatible candidate result")
         emitted_ids.add(result.repo_id)
-        payload = dict(result.payload)
-        if payload.get("embedding_version") != STABLE_METADATA_EMBEDDING_VERSION:
+        computed_payload = dict(result.payload)
+        if computed_payload.get("embedding_version") != STABLE_METADATA_EMBEDDING_VERSION:
             raise ValueError("candidate payload recipe does not match its vector")
-        if REPOSITORY_SERVING_ELIGIBILITY_FIELD in payload:
-            raise ValueError("candidate export must not include serving eligibility")
+        computed_identity = {
+            "embedding_dim": len(result.final_embedding),
+            "embedding_model": result.embedding_model,
+            "embedding_model_revision": EMBEDDING_MODEL_REVISION,
+            "embedding_version": result.embedding_version,
+            "source_hash": result.source_hash,
+        }
+        if (
+            result.repo_id != computed_payload.get("repo_id")
+            or result.source_hash != computed_payload.get("source_hash")
+            or result.embedding_version != STABLE_METADATA_EMBEDDING_VERSION
+            or any(computed_payload.get(key) != value for key, value in computed_identity.items())
+        ):
+            raise ValueError("candidate payload identity does not match its computed vector")
+        payload = dict(frozen_payloads[result.repo_id])
+        payload.pop(REPOSITORY_SERVING_ELIGIBILITY_FIELD, None)
+        payload.update(computed_identity)
         source = {
             **source_by_id[result.repo_id],
-            "repo_id": payload["repo_id"],
-            "full_name": payload["full_name"],
+            "repo_id": computed_payload["repo_id"],
+            "full_name": computed_payload["full_name"],
         }
         records.append({
             "schema": OUTPUT_SCHEMA,

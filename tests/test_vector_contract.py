@@ -577,3 +577,117 @@ def test_stable_metadata_candidate_is_rejected_by_qdrant_point_validation():
 
     with pytest.raises(ValueError):
         store._validated_point(candidate, point_id=REPO_ID)
+
+
+def _issue25_write_snapshot(path, repositories):
+    import json
+    path.write_text(json.dumps({"repositories": repositories}), encoding="utf-8")
+    return path
+
+
+def test_stable_metadata_export_preserves_frozen_payload_fields(tmp_path):
+    import json
+    from pathlib import Path
+
+    from config import EMBEDDING_MODEL_REVISION, STABLE_METADATA_EMBEDDING_VERSION
+    from scripts.export_stable_metadata_candidate import export_snapshot
+
+    fixture_path = Path(__file__).parent / "fixtures/recommendation_public_catalog/snapshot.json"
+    source_row = json.loads(fixture_path.read_text(encoding="utf-8"))["repositories"][0]
+    frozen_payload = dict(source_row["payload"])
+    input_path = _issue25_write_snapshot(tmp_path / "snapshot.json", [source_row])
+    output_path = tmp_path / "candidate.jsonl"
+
+    assert export_snapshot(
+        input_path, output_path,
+        pipeline=_issue25_pipeline(STABLE_METADATA_EMBEDDING_VERSION),
+    ) == 1
+    record = json.loads(output_path.read_text(encoding="utf-8"))
+    exported_payload = record["payload"]
+    expected_payload = dict(frozen_payload)
+    expected_payload.pop(REPOSITORY_SERVING_ELIGIBILITY_FIELD)
+    expected_payload.update({
+        "embedding_dim": REPOSITORY_EMBEDDING_DIM,
+        "embedding_model": REPOSITORY_EMBEDDING_MODEL,
+        "embedding_model_revision": EMBEDDING_MODEL_REVISION,
+        "embedding_version": STABLE_METADATA_EMBEDDING_VERSION,
+        "source_hash": record["source_hash"],
+    })
+
+    assert exported_payload == expected_payload
+    assert exported_payload["doc_quality"] == frozen_payload["doc_quality"]
+    assert exported_payload["category"] == frozen_payload["category"]
+    assert len(record["vector"]) == REPOSITORY_EMBEDDING_DIM
+    assert record["recipe_id"] == STABLE_METADATA_EMBEDDING_VERSION
+
+
+def test_stable_metadata_export_rejects_malformed_snapshot_without_output(tmp_path):
+    from scripts.export_stable_metadata_candidate import export_snapshot
+
+    input_path = tmp_path / "malformed.json"
+    input_path.write_text('{"repositories": null}', encoding="utf-8")
+    output_path = tmp_path / "candidate.jsonl"
+
+    with pytest.raises(ValueError, match="frozen JSON snapshot"):
+        export_snapshot(input_path, output_path, pipeline=_issue25_pipeline(
+            "repo-embedding-v3-stable-metadata-v1",
+        ))
+
+    assert not output_path.exists()
+
+
+def test_stable_metadata_export_does_not_overwrite_a_racing_destination(tmp_path, monkeypatch):
+    from scripts import export_stable_metadata_candidate as exporter
+
+    input_path = _issue25_write_snapshot(
+        tmp_path / "snapshot.json",
+        [{"repo_id": REPO_ID, "payload": _issue25_source()}],
+    )
+    output_path = tmp_path / "candidate.jsonl"
+    write_exclusive = exporter._write_jsonl_exclusive
+
+    def publish_racing_destination(path, records):
+        path.write_text("created concurrently", encoding="utf-8")
+        write_exclusive(path, records)
+
+    monkeypatch.setattr(exporter, "_write_jsonl_exclusive", publish_racing_destination)
+    with pytest.raises(FileExistsError):
+        exporter.export_snapshot(
+            input_path, output_path,
+            pipeline=_issue25_pipeline("repo-embedding-v3-stable-metadata-v1"),
+        )
+
+    assert output_path.read_text(encoding="utf-8") == "created concurrently"
+
+
+def test_stable_metadata_export_uses_configured_hf_cache_and_local_only(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+
+    from config import EMBEDDING_MODEL_REVISION
+    from scripts import export_stable_metadata_candidate as exporter
+
+    cache_root = tmp_path / "hf-cache"
+    monkeypatch.setattr(exporter, "HF_HUB_CACHE", str(cache_root))
+    model_snapshot = exporter._default_model_snapshot()
+    model_snapshot.mkdir(parents=True)
+    for name in ("modules.json", "config.json", "model.safetensors", "tokenizer.json"):
+        (model_snapshot / name).touch()
+
+    model = MagicMock()
+    model.get_embedding_dimension.return_value = REPOSITORY_EMBEDDING_DIM
+    constructor = MagicMock(return_value=model)
+    pipeline_factory = MagicMock(return_value=object())
+    monkeypatch.setattr("sentence_transformers.SentenceTransformer", constructor)
+    monkeypatch.setattr(exporter, "RepositoryEmbeddingPipeline", pipeline_factory)
+
+    exporter._build_local_pipeline(model_snapshot)
+
+    assert model_snapshot == (
+        cache_root
+        / "models--sentence-transformers--all-MiniLM-L6-v2"
+        / "snapshots"
+        / EMBEDDING_MODEL_REVISION
+    )
+    constructor.assert_called_once_with(
+        str(model_snapshot), device="cpu", local_files_only=True,
+    )
