@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contracts.repository_languages import language_observation
+
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 import json
@@ -335,6 +337,7 @@ def repository_upsert_record(source: Any) -> dict[str, Any]:
         "readme_base_url": readme_base_url,
         "primary_language": str(payload.get("primary_language") or "Unknown"),
         "languages": list(payload.get("languages") or []),
+        **language_observation(payload),
         "topics": list(payload.get("topics") or []),
         "star_count": max(int(payload.get("star_count") or 0), 0),
         "fork_count": max(int(payload.get("fork_count") or 0), 0),

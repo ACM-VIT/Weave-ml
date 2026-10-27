@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from numbers import Integral, Real
 from typing import Any
 
+from contracts.repository_languages import language_observation
 from contracts.admission import ADMISSION_OBSERVATION_FIELD, observe_repository_admission
 from summarization.contracts import CardSummaryArtifact, card_summary_payload
 from summarization.pipeline import description_fallback_artifact
@@ -376,6 +377,7 @@ def build_vector_payload(
         normalized_repo,
     )
     payload.update({key: value for key, value in validate_diversity_metadata(normalized_repo).items() if value is not None})
+    payload.update(language_observation(repo))
     payload.update(merge_lifecycle({}, repo.get("lifecycle")))
     payload.update(card_summary_payload(artifact))
     # Recompute from source; supplied admission claims are never trusted.

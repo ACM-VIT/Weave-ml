@@ -325,12 +325,31 @@ class RepositoryEnricher:
 
         # Reconstruct languages
         languages = {}
-        lang_edges = data.get("languages", {}).get("edges", [])
+        language_data = data.get("languages")
+        language_data = language_data if isinstance(language_data, dict) else {}
+        lang_edges = language_data.get("edges")
+        lang_edges = lang_edges if isinstance(lang_edges, list) else []
         for edge in lang_edges:
             size = edge.get("size", 0)
             lang_name = edge.get("node", {}).get("name")
             if lang_name:
                 languages[lang_name] = size
+
+        # GitHub's first ten languages may omit bytes. Only totalSize is an
+        # authoritative percentage denominator, never the returned edge sum.
+        raw_total = language_data.get("totalSize")
+        total = raw_total if type(raw_total) is int and 0 <= raw_total <= 2**53 - 1 else None
+        breakdown = []
+        for name, size in languages.items():
+            edge = next(edge for edge in lang_edges if edge.get("node", {}).get("name") == name)
+            observed_size = size if type(size) is int and 0 <= size <= 2**53 - 1 else None
+            color = edge.get("node", {}).get("color")
+            breakdown.append(dict(name=name, color=color if isinstance(color, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", color) else None,
+                size=observed_size, percentage=100 * observed_size / total
+                if total and observed_size is not None and observed_size <= total else None))
+        language_details = dict(language_breakdown=breakdown, language_total_size=total,
+            language_breakdown_complete=(all(row["size"] is not None for row in breakdown)
+                and sum(row["size"] for row in breakdown) == total) if total is not None else None)
 
         # Primary language
         primary_language = None
@@ -443,6 +462,10 @@ class RepositoryEnricher:
             recent_commits=recent_commits,
         )
         
+        # Missing/null/ambiguous empty metadata is unknown. Only a returned
+        # nonempty breakdown or confirmed zero-byte response supplies evidence.
+        if breakdown or (language_data.get("edges") == [] and total == 0):
+            payload.update(language_details)
         return EnrichmentResult(
             repo_id=payload["id"],
             payload=payload,

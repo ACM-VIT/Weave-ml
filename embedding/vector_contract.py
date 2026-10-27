@@ -263,6 +263,8 @@ def validate_repository_payload(
         raise TypeError("repository payload must be a mapping")
 
     validate_diversity_metadata(payload)
+    from contracts.repository_languages import language_observation
+    language_observation(payload)
 
     required_fields = (
         REPOSITORY_PAYLOAD_REQUIRED_FIELDS

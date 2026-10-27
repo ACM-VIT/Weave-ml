@@ -564,3 +564,56 @@ def test_snapshot_http_retry_cannot_start_after_observation_window(monkeypatch, 
     with pytest.raises(BackendIngestionError, match='observation_expired'):
         client.publish_trending_snapshot({'computed_at': observed})
     assert len(calls) == 1
+
+
+def test_graphql_language_breakdown_keeps_authoritative_partial_denominator():
+    from acquisition.repository_enricher import RepositoryEnricher
+    data = dict(nameWithOwner="owner/repo", databaseId=123, id="R_fixture",
+        owner={"login": "owner", "databaseId": 456},
+        languages={"totalSize": 1000, "edges": [
+            {"size": 300, "node": {"name": "Python", "color": "#3572A5"}},
+            {"size": 200, "node": {"name": "Rust", "color": "#dea584"}}]},
+        repositoryTopics={"nodes": []}, defaultBranchRef={"name": "main"})
+    result = RepositoryEnricher(graphql_client=object())._process_graphql_data(data, None, None, readme_text="")
+    record = repository_upsert_record(result)
+    assert record["languages"] == ["Python", "Rust"] and record["primary_language"] == "Python"
+    assert record["language_breakdown"] == [
+        {"name": "Python", "color": "#3572A5", "size": 300, "percentage": 30.0},
+        {"name": "Rust", "color": "#dea584", "size": 200, "percentage": 20.0}]
+    assert record["language_total_size"] == 1000
+    assert record["language_breakdown_complete"] is False
+    del data["languages"]["totalSize"]
+    unknown = repository_upsert_record(RepositoryEnricher(graphql_client=object())._process_graphql_data(data, None, None, readme_text=""))
+    assert unknown["language_total_size"] is None and unknown["language_breakdown_complete"] is None
+    assert all(row["percentage"] is None for row in unknown["language_breakdown"])
+    assert "language_breakdown" not in repository_upsert_record(_source())
+    for observed in (None, {}, {"edges": []}, {"edges": [], "totalSize": 1000}):
+        data["languages"] = observed
+        sparse = repository_upsert_record(RepositoryEnricher(graphql_client=object())._process_graphql_data(data, None, None, readme_text=""))
+        assert "language_breakdown" not in sparse
+    del data["languages"]
+    missing = repository_upsert_record(RepositoryEnricher(graphql_client=object())._process_graphql_data(data, None, None, readme_text=""))
+    assert "language_breakdown" not in missing
+    data["languages"] = {"edges": [], "totalSize": 0}
+    empty = repository_upsert_record(RepositoryEnricher(graphql_client=object())._process_graphql_data(data, None, None, readme_text=""))
+    assert empty["language_breakdown"] == []
+    assert empty["language_total_size"] == 0 and empty["language_breakdown_complete"] is True
+
+
+def test_provider_language_observation_is_optional_bounded_and_strict():
+    from api.contracts import RepositorySource
+    from pydantic import ValidationError
+    value = dict(full_name="owner/repo", languages=["Python"], primary_language="Python",
+        language_breakdown=[dict(name="Python", color="#3572A5", size=300, percentage=30)],
+        language_total_size=1000, language_breakdown_complete=False)
+    assert RepositorySource(**value).model_dump()["language_breakdown"][0]["percentage"] == 30
+    assert RepositorySource(full_name="owner/repo", languages=["Python"]).languages == ["Python"]
+    for patch in ({"size": True}, {"size": 2 ** 53}, {"percentage": float("nan")},
+                  {"percentage": 101}, {"name": "0"}, {"color": "not-a-color"}):
+        invalid = {**value, "language_breakdown": [{**value["language_breakdown"][0], **patch}]}
+        with pytest.raises(ValidationError):
+            RepositorySource(**invalid)
+    distinct = [dict(name=f"Language{number}") for number in range(101)]
+    assert len(RepositorySource(**{**value, "language_breakdown": distinct[:100]}).language_breakdown) == 100
+    with pytest.raises(ValidationError):
+        RepositorySource(**{**value, "language_breakdown": distinct})
