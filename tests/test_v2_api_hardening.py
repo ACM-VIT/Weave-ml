@@ -631,10 +631,21 @@ def test_feedback_auth_rotation_keeps_rejections_outside_enqueue(monkeypatch, ca
     oversized = client.post("/api/v2/feedback/batch", headers={"x-ml-service-secret": rotated},
                             content=b"x" * (api_main.MAX_REQUEST_BODY_BYTES + 1))
     assert oversized.status_code == 413 and len(accepted) == 1
-    for events in ([{**payload["events"][0], "user_id": "not-a-uuid"}], payload["events"] * 51):
-        assert client.post("/api/v2/feedback/batch", headers={"x-ml-service-secret": rotated},
-                           json={"schema_version": 2, "events": events}).status_code == 422
+    distinct_events = [{**payload["events"][0], "event_id": str(uuid.uuid4()),
+                        "feedback_version": version} for version in range(2, 103)]
+    for events in ([{**payload["events"][0], "user_id": "not-a-uuid"}], distinct_events):
+        rejected = client.post("/api/v2/feedback/batch", headers={"x-ml-service-secret": rotated},
+                               json={"schema_version": 2, "events": events})
+        assert rejected.status_code == 422
+        if events is distinct_events:
+            assert any(error["type"] == "too_long" for error in rejected.json()["details"])
     assert len(accepted) == 1
+    at_limit = distinct_events[:100]
+    response = client.post("/api/v2/feedback/batch", headers={"x-ml-service-secret": rotated},
+                           json={"schema_version": 2, "events": at_limit})
+    assert response.status_code == 202
+    assert response.json()["acknowledged_event_ids"] == [event["event_id"] for event in at_limit]
+    assert response.json()["accepted"] == 100 and len(accepted) == 101
     assert secret not in caplog.text and rotated not in caplog.text
 
 
