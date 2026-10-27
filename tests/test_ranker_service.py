@@ -1,9 +1,12 @@
 import json
 import hashlib
+import math
+import sys
 from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from torch.utils.data import DataLoader, TensorDataset
 from config import EMBEDDING_MODEL_REVISION, REPOSITORY_EMBEDDING_MODEL
 from inference.feature_spec import EMBEDDING_DIM, FEATURE_COUNT, FEATURE_SPEC_VERSION, INPUT_DIM
 from inference.ranker_service import MMoEHeavyRanker, RankerService, _cached_repository_keywords, _repository_keywords, calculate_match_score
@@ -11,6 +14,7 @@ from inference.value_function import VALUE_WEIGHTS, compute_value_score
 from pathlib import Path
 from inference.ranker_service import RankerService
 from retrieval.v2_retriever import QdrantV2Retriever
+from Ranking_Training_module import train_ranker
 
 
 # Ranker service
@@ -466,6 +470,182 @@ def test_direct_ranker_training_still_supports_autograd():
     loss.backward()
     assert inputs.grad is not None and torch.all(torch.isfinite(inputs.grad))
     assert torch.count_nonzero(inputs.grad) > 0
+
+
+class _MetricFixtureRanker(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer(
+            "probabilities", torch.tensor([0.2, 0.4, 0.6, 0.3, 0.8])
+        )
+
+    def forward(self, features):
+        return tuple(
+            self.probabilities[index].expand(features.shape[0])
+            for index in range(5)
+        )
+
+
+def _metric_fixture_loader():
+    return DataLoader(
+        TensorDataset(
+            torch.zeros((3, 2)),
+            torch.tensor([0.0, 1.0, 1.0]),
+            torch.tensor([1.0, 0.0, 0.0]),
+            torch.tensor([0.0, 1.0, 0.0]),
+            torch.tensor([0.1, 0.9, 0.5]),
+            torch.tensor([1.0, 0.0, 1.0]),
+        ),
+        batch_size=2,
+        shuffle=False,
+    )
+
+
+def _track_training_module_items(monkeypatch):
+    calls = []
+    module_name = train_ranker.__name__
+    original_item = torch.Tensor.item
+
+    def track_item(tensor, *args, **kwargs):
+        caller = sys._getframe(1)
+        if caller.f_globals.get("__name__") == module_name:
+            calls.append(caller.f_code.co_name)
+        return original_item(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "item", track_item)
+    return calls
+
+
+def _expected_fixture_loss():
+    # Hand-calculated per-example BCE/MSE means for the three fixture rows.
+    return (
+        (-math.log(0.8) - 2 * math.log(0.2)) / 3
+        + (-math.log(0.4) - 2 * math.log(0.6)) / 3
+        + (-2 * math.log(0.4) - math.log(0.6)) / 3
+        + (0.04 + 0.36 + 0.04) / 3
+        + (-2 * math.log(0.8) - math.log(0.2)) / 3
+    )
+
+
+def _expected_fixture_calibration():
+    return {
+        "ctr_brier": (0.04 + 0.64 + 0.64) / 3,
+        "save_brier": (0.36 + 0.16 + 0.16) / 3,
+        "github_open_brier": (0.36 + 0.16 + 0.36) / 3,
+        "dwell_mse": (0.04 + 0.36 + 0.04) / 3,
+        "follow_brier": (0.04 + 0.64 + 0.04) / 3,
+    }
+
+
+def test_weighted_metric_accumulator_detaches_and_preserves_example_weights():
+    total = torch.zeros((), dtype=torch.float64)
+    first_loss = torch.tensor(0.25, requires_grad=True)
+    second_loss = torch.tensor(0.75, requires_grad=True)
+
+    train_ranker._add_detached_metric(total, first_loss, 3)
+    train_ranker._add_detached_metric(total, second_loss, 1)
+
+    assert total.dtype == torch.float64
+    assert total.item() == pytest.approx(1.5, rel=1e-7, abs=1e-9)
+    assert not total.requires_grad
+    assert total.grad_fn is None
+
+
+def test_cpu_metric_paths_preserve_weighting_and_calibration_values(monkeypatch):
+    model = _MetricFixtureRanker()
+    loader = list(_metric_fixture_loader())
+    cpu_shapes = []
+    original_cpu = torch.Tensor.cpu
+
+    def track_cpu(tensor, *args, **kwargs):
+        cpu_shapes.append(tuple(tensor.shape))
+        return original_cpu(tensor, *args, **kwargs)
+
+    actual_loss = train_ranker.evaluate(
+        model, loader, torch.device("cpu"), torch.nn.BCELoss(), torch.nn.MSELoss()
+    )
+    monkeypatch.setattr(torch.Tensor, "cpu", track_cpu)
+    actual_calibration = train_ranker.calibration_metrics(
+        model, loader, torch.device("cpu")
+    )
+
+    # Preserve example weighting and per-head metrics within explicit tolerances.
+    assert actual_loss == pytest.approx(_expected_fixture_loss(), rel=1e-7, abs=1e-7)
+    assert actual_calibration == pytest.approx(
+        _expected_fixture_calibration(), rel=1e-7, abs=1e-9
+    )
+    assert cpu_shapes == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_cuda_metric_paths_extract_only_at_reporting_boundaries(monkeypatch):
+    model = _MetricFixtureRanker()
+    loader = list(_metric_fixture_loader())
+    expected_loss = _expected_fixture_loss()
+    item_calls = _track_training_module_items(monkeypatch)
+    actual_loss = train_ranker.evaluate(
+        model.cuda(), loader, torch.device("cuda"), torch.nn.BCELoss(), torch.nn.MSELoss()
+    )
+    assert actual_loss == pytest.approx(expected_loss, rel=1e-7, abs=1e-9)
+    assert item_calls == ["evaluate"]
+
+    cpu_shapes = []
+    original_cpu = torch.Tensor.cpu
+
+    def track_cpu(tensor, *args, **kwargs):
+        cpu_shapes.append(tuple(tensor.shape))
+        return original_cpu(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", track_cpu)
+    actual_calibration = train_ranker.calibration_metrics(
+        model, loader, torch.device("cuda")
+    )
+    assert actual_calibration == pytest.approx(
+        _expected_fixture_calibration(), rel=1e-7, abs=1e-9
+    )
+    assert cpu_shapes == [(5,)]
+    assert item_calls == ["evaluate"]
+
+
+def test_train_preserves_small_cpu_training_path(tmp_path, monkeypatch):
+    class TinyTrainableRanker(torch.nn.Module):
+        def __init__(self, input_dim):
+            super().__init__()
+            self.logits = torch.nn.Parameter(
+                torch.tensor([-1.0, -0.4, 0.2, -0.8, 0.7])
+            )
+
+        def forward(self, features):
+            probabilities = torch.sigmoid(self.logits)
+            return tuple(
+                probabilities[index].expand(features.shape[0])
+                for index in range(5)
+            )
+
+    data_path = tmp_path / "training.npz"
+    labels = np.array([0, 1, 0, 1, 0], dtype=np.float32)
+    np.savez(
+        data_path,
+        user_embs=np.zeros((5, EMBEDDING_DIM), dtype=np.float32),
+        repo_embs=np.zeros((5, EMBEDDING_DIM), dtype=np.float32),
+        dense_features=np.zeros((5, FEATURE_COUNT), dtype=np.float32),
+        y_ctr=labels,
+        y_save=1 - labels,
+        y_gh=labels,
+        y_dwell=labels,
+        y_follow=1 - labels,
+    )
+    monkeypatch.setattr(train_ranker, "MMoEHeavyRanker", TinyTrainableRanker)
+    manifest = train_ranker.train(
+        data_path=data_path,
+        epochs=1,
+        lr=1e-3,
+        batch_size=2,
+        output_dir=tmp_path / "artifacts",
+    )
+
+    assert np.isfinite(manifest["offline_metrics"]["final_train_loss"])
+    assert np.isfinite(manifest["offline_metrics"]["final_validation_loss"])
 
 def test_score_batch_empty_candidates_returns_empty(loaded_ranker_service):
     assert loaded_ranker_service.score_batch(
