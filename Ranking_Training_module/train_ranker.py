@@ -286,6 +286,15 @@ def compute_batch_loss(
     return loss, x.shape[0]
 
 
+def _add_detached_metric(
+    total: torch.Tensor,
+    value: torch.Tensor,
+    weight: int = 1,
+) -> None:
+    """Accumulate a detached scalar in the total's wider reporting dtype."""
+    total.add_(value.detach().to(dtype=total.dtype) * weight)
+
+
 def evaluate(
     model: MMoEHeavyRanker,
     data_loader: DataLoader,
@@ -295,7 +304,11 @@ def evaluate(
 ) -> float:
     """Return the example-weighted validation loss."""
     model.eval()
-    total_loss = 0.0
+    use_device_totals = device.type == "cuda"
+    total_loss = (
+        torch.zeros((), dtype=torch.float64, device=device)
+        if use_device_totals else 0.0
+    )
     total_examples = 0
     with torch.no_grad():
         for batch in data_loader:
@@ -306,11 +319,16 @@ def evaluate(
                 bce_loss,
                 mse_loss,
             )
-            total_loss += loss.item() * batch_count
+            if use_device_totals:
+                _add_detached_metric(total_loss, loss, batch_count)
+            else:
+                total_loss += loss.item() * batch_count
             total_examples += batch_count
 
     if total_examples == 0:
         raise ValueError("Validation split is empty")
+    if use_device_totals:
+        return float((total_loss / total_examples).item())
     return total_loss / total_examples
 
 
@@ -321,23 +339,38 @@ def calibration_metrics(
 ) -> dict[str, float]:
     """Compute validation Brier/MSE metrics for artifact qualification."""
     names = ("ctr", "save", "github_open", "dwell", "follow")
-    squared_error = {name: 0.0 for name in names}
+    use_device_totals = device.type == "cuda"
+    squared_error = (
+        torch.zeros(len(names), dtype=torch.float64, device=device)
+        if use_device_totals else {name: 0.0 for name in names}
+    )
     total_examples = 0
     model.eval()
     with torch.no_grad():
         for batch in data_loader:
             x, *targets = (tensor.to(device) for tensor in batch)
             predictions = [value.reshape(-1) for value in model(x)]
-            for name, prediction, target in zip(names, predictions, targets):
-                squared_error[name] += float(
-                    torch.sum((prediction - target.reshape(-1)) ** 2).item()
+            for index, (prediction, target) in enumerate(zip(predictions, targets)):
+                batch_error = torch.sum(
+                    (prediction - target.reshape(-1)) ** 2
                 )
+                if use_device_totals:
+                    _add_detached_metric(squared_error[index], batch_error)
+                else:
+                    squared_error[names[index]] += float(batch_error.item())
             total_examples += int(x.shape[0])
     if total_examples == 0:
         raise ValueError("Validation split is empty")
+    if use_device_totals:
+        means = zip(names, (squared_error / total_examples).cpu().tolist())
+    else:
+        means = (
+            (name, value / total_examples)
+            for name, value in squared_error.items()
+        )
     return {
-        f"{name}_brier" if name != "dwell" else "dwell_mse": value / total_examples
-        for name, value in squared_error.items()
+        f"{name}_brier" if name != "dwell" else "dwell_mse": float(value)
+        for name, value in means
     }
 
 
@@ -402,9 +435,13 @@ def train(
 
     final_train_loss = 0.0
     final_val_loss = 0.0
+    use_device_totals = device.type == "cuda"
     for epoch in range(1, epochs + 1):
         model.train()
-        total_train_loss = 0.0
+        total_train_loss = (
+            torch.zeros((), dtype=torch.float64, device=device)
+            if use_device_totals else 0.0
+        )
         total_train_examples = 0
         for batch in train_loader:
             optimizer.zero_grad()
@@ -417,12 +454,20 @@ def train(
             )
             loss.backward()
             optimizer.step()
-            total_train_loss += loss.item() * batch_count
+            if use_device_totals:
+                _add_detached_metric(total_train_loss, loss, batch_count)
+            else:
+                total_train_loss += loss.item() * batch_count
             total_train_examples += batch_count
 
         if total_train_examples == 0:
             raise ValueError("Training split did not produce any batches")
-        final_train_loss = total_train_loss / total_train_examples
+        if use_device_totals:
+            final_train_loss = float(
+                (total_train_loss / total_train_examples).item()
+            )
+        else:
+            final_train_loss = total_train_loss / total_train_examples
         final_val_loss = evaluate(
             model,
             val_loader,
