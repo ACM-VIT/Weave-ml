@@ -740,7 +740,9 @@ def test_vector_mmr_weight_changes_selection_and_recent_duplicates_cannot_refill
     assert diverse.candidates == (rows[0], rows[2])
     assert diverse.intra_list_similarity == pytest.approx(0)
     assert relevant.intra_list_similarity > .9
-    duplicate = _diversity_candidate(4, (100, 0, 0))
+    duplicate = _diversity_candidate(4, (100, 1, 0))
+    cosine = 100 / (100 ** 2 + 1) ** .5
+    assert .98 < cosine < 1
     sparse = rerank_diverse([rows[0], duplicate, rows[2]], target_size=3, seed="generation",
         policy=DiversityPolicy(dimensions=3, minimum_exploration=0),
         recent_repo_ids=frozenset({rows[2].repo_id}))
@@ -792,17 +794,20 @@ def test_diversity_assembler_preserves_selected_source_evidence_and_rejects_quot
     from inference.feed_assembly import DiversityUnavailableError
     rows = [_diversity_candidate(1, (1, 0, 0)),
             _diversity_candidate(2, (0, 1, 0), bucket="trending")]
-    inputs = [dict(repo_id=row.repo_id, score=row.score, source=row.bucket,
+    inputs = [dict(repo_id=row.repo_id, score=row.score,
+        source="semantic" if row.bucket == "personalized" else "trend",
         candidate_bucket=row.bucket, owner_github_id=row.owner_github_id,
         fork_family_github_id=row.fork_family_github_id,
-        retrieval_scores={row.bucket: row.score}) for row in rows]
+        retrieval_scores={"semantic" if row.bucket == "personalized" else "trend": row.score}) for row in rows]
     vectors = {row.repo_id: list(row.vector) for row in rows}
     assembler = FeedAssemblySystem(freshness_boost=0)
     policy = DiversityPolicy(dimensions=3, minimum_exploration=1)
     output = assembler.shape_batch(inputs, target_size=2, diversity_policy=policy,
                                    diversity_vectors=vectors, diversity_seed="assembly")
     assert len(output) == 2
-    assert next(row for row in output if row["candidate_bucket"] == "trending")["retrieval_scores"] == {"trending": rows[1].score}
+    expected_sources = {rows[0].repo_id: ("semantic", {"semantic": rows[0].score}),
+                        rows[1].repo_id: ("trend", {"trend": rows[1].score})}
+    assert {row["repo_id"]: (row["source"], row["retrieval_scores"]) for row in output} == expected_sources
     with pytest.raises(DiversityUnavailableError, match="exploration"):
         assembler.shape_batch(inputs[:1], target_size=2, diversity_policy=policy,
                               diversity_vectors=vectors, diversity_seed="assembly")
