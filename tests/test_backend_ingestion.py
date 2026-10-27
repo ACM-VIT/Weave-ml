@@ -587,6 +587,17 @@ def test_graphql_language_breakdown_keeps_authoritative_partial_denominator():
     assert unknown["language_total_size"] is None and unknown["language_breakdown_complete"] is None
     assert all(row["percentage"] is None for row in unknown["language_breakdown"])
     assert "language_breakdown" not in repository_upsert_record(_source())
+    for observed in (None, {}, {"edges": []}, {"edges": [], "totalSize": 1000}):
+        data["languages"] = observed
+        sparse = repository_upsert_record(RepositoryEnricher(graphql_client=object())._process_graphql_data(data, None, None, readme_text=""))
+        assert "language_breakdown" not in sparse
+    del data["languages"]
+    missing = repository_upsert_record(RepositoryEnricher(graphql_client=object())._process_graphql_data(data, None, None, readme_text=""))
+    assert "language_breakdown" not in missing
+    data["languages"] = {"edges": [], "totalSize": 0}
+    empty = repository_upsert_record(RepositoryEnricher(graphql_client=object())._process_graphql_data(data, None, None, readme_text=""))
+    assert empty["language_breakdown"] == []
+    assert empty["language_total_size"] == 0 and empty["language_breakdown_complete"] is True
 
 
 def test_provider_language_observation_is_optional_bounded_and_strict():
@@ -602,5 +613,7 @@ def test_provider_language_observation_is_optional_bounded_and_strict():
         invalid = {**value, "language_breakdown": [{**value["language_breakdown"][0], **patch}]}
         with pytest.raises(ValidationError):
             RepositorySource(**invalid)
+    distinct = [dict(name=f"Language{number}") for number in range(101)]
+    assert len(RepositorySource(**{**value, "language_breakdown": distinct[:100]}).language_breakdown) == 100
     with pytest.raises(ValidationError):
-        RepositorySource(**{**value, "language_breakdown": value["language_breakdown"] * 101})
+        RepositorySource(**{**value, "language_breakdown": distinct})

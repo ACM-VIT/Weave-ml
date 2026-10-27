@@ -9,6 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_vali
 SafeBytes = Annotated[int, Field(strict=True, ge=0, le=2**53 - 1)]
 Percentage = Annotated[float, Field(strict=True, ge=0, le=100, allow_inf_nan=False)]
 LanguageName = Annotated[str, StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=128)]
+PERCENTAGE_ROUNDING_TOLERANCE = 0.01
+PERCENTAGE_EPSILON = 1e-8
 
 
 class RepositoryLanguage(BaseModel):
@@ -38,10 +40,17 @@ class RepositoryLanguageObservation(BaseModel):
         if rows is not None and len({row.name.casefold() for row in rows}) != len(rows):
             raise ValueError("language breakdown names must be unique")
         if rows is not None:
-            if sum(row.percentage or 0 for row in rows) > 100 + 1e-8:
+            # Each published row may be rounded independently to two decimals.
+            if sum(row.percentage or 0 for row in rows) > 100 + len(rows) * PERCENTAGE_ROUNDING_TOLERANCE + PERCENTAGE_EPSILON:
                 raise ValueError("language percentages exceed the full repository")
             if self.language_total_size is not None and sum(row.size or 0 for row in rows) > self.language_total_size:
                 raise ValueError("language byte sizes exceed the observed total")
+            if self.language_total_size is not None and self.language_total_size > 0:
+                for row in rows:
+                    if row.size is not None and row.percentage is not None:
+                        expected = 100 * row.size / self.language_total_size
+                        if abs(row.percentage - expected) > PERCENTAGE_ROUNDING_TOLERANCE + PERCENTAGE_EPSILON:
+                            raise ValueError("language percentage contradicts observed byte size and total")
         if self.language_breakdown_complete is True:
             if rows is None or self.language_total_size is None or any(row.size is None for row in rows):
                 raise ValueError("complete language breakdown requires observed byte sizes and total")

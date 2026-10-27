@@ -232,3 +232,25 @@ def test_language_numeric_metadata_does_not_change_semantic_towers_or_source_has
     from contracts.repository_languages import language_observation
     assert language_observation(dict(language_breakdown=None, language_total_size=None,
                                     language_breakdown_complete=None)) == {}
+
+
+def test_language_percentage_rejects_contradictory_observed_bytes():
+    from contracts.repository_languages import language_observation
+    with pytest.raises(ValueError, match="percentage.*byte"):
+        language_observation(dict(language_total_size=1000,
+            language_breakdown=[dict(name="Python", size=300, percentage=99.)]))
+
+
+def test_language_percentage_accepts_rounded_rows_without_inventing_unknowns():
+    from contracts.repository_languages import language_observation
+    rows = [dict(name=f"language{number}", size=1, percentage=16.67) for number in range(6)]
+    observed = language_observation(dict(language_total_size=6, language_breakdown_complete=True,
+                                        language_breakdown=rows))
+    assert observed["language_breakdown"] == rows
+    assert observed["language_breakdown_complete"] is True
+    for total, row in [(3, dict(name="Python", size=1, percentage=33.33)),
+                       (3, dict(name="Python", size=1, percentage=None)),
+                       (None, dict(name="Python", size=1, percentage=None)),
+                       (0, dict(name="Python", size=0, percentage=None))]:
+        result = language_observation(dict(language_total_size=total, language_breakdown=[row]))
+        assert result["language_breakdown"] == [row]

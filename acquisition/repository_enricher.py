@@ -325,7 +325,10 @@ class RepositoryEnricher:
 
         # Reconstruct languages
         languages = {}
-        lang_edges = data.get("languages", {}).get("edges", [])
+        language_data = data.get("languages")
+        language_data = language_data if isinstance(language_data, dict) else {}
+        lang_edges = language_data.get("edges")
+        lang_edges = lang_edges if isinstance(lang_edges, list) else []
         for edge in lang_edges:
             size = edge.get("size", 0)
             lang_name = edge.get("node", {}).get("name")
@@ -334,7 +337,7 @@ class RepositoryEnricher:
 
         # GitHub's first ten languages may omit bytes. Only totalSize is an
         # authoritative percentage denominator, never the returned edge sum.
-        raw_total = data.get("languages", {}).get("totalSize")
+        raw_total = language_data.get("totalSize")
         total = raw_total if type(raw_total) is int and 0 <= raw_total <= 2**53 - 1 else None
         breakdown = []
         for name, size in languages.items():
@@ -459,7 +462,10 @@ class RepositoryEnricher:
             recent_commits=recent_commits,
         )
         
-        payload.update(language_details)
+        # Missing/null/ambiguous empty metadata is unknown. Only a returned
+        # nonempty breakdown or confirmed zero-byte response supplies evidence.
+        if breakdown or (language_data.get("edges") == [] and total == 0):
+            payload.update(language_details)
         return EnrichmentResult(
             repo_id=payload["id"],
             payload=payload,
