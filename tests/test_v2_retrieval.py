@@ -720,6 +720,94 @@ def test_v2_retrieval_applies_diversity_freshness_and_deterministic_exploration(
     assert first[0].repo_id == client.repo_ids[7]
 
 
+def _diversity_candidate(number, vector, **overrides):
+    from inference.diversity import DiversityCandidate
+    values = dict(repo_id=str(uuid.UUID(int=number)), score=1 - number / 100,
+                  vector=tuple(vector), owner_github_id=str(number),
+                  fork_family_github_id=str(100 + number))
+    return DiversityCandidate(**{**values, **overrides})
+
+
+def test_vector_mmr_weight_changes_selection_and_recent_duplicates_cannot_refill():
+    from inference.diversity import DiversityPolicy, rerank_diverse
+    rows = [_diversity_candidate(1, (1, 0, 0)),
+            _diversity_candidate(2, (.95, .31, 0)), _diversity_candidate(3, (0, 1, 0))]
+    def select(weight):
+        return rerank_diverse(rows, target_size=2, seed="generation",
+            policy=DiversityPolicy(dimensions=3, minimum_exploration=0, relevance_weight=weight))
+    relevant, diverse = select(1), select(.1)
+    assert relevant.candidates == tuple(rows[:2])
+    assert diverse.candidates == (rows[0], rows[2])
+    assert diverse.intra_list_similarity == pytest.approx(0)
+    assert relevant.intra_list_similarity > .9
+    duplicate = _diversity_candidate(4, (100, 0, 0))
+    sparse = rerank_diverse([rows[0], duplicate, rows[2]], target_size=3, seed="generation",
+        policy=DiversityPolicy(dimensions=3, minimum_exploration=0),
+        recent_repo_ids=frozenset({rows[2].repo_id}))
+    assert sparse.candidates == (rows[0],)
+    assert sparse.excluded_recent == 1 and sparse.shortfall == 2
+
+
+@pytest.mark.parametrize(("shared", "bound"), [
+    ({"owner_github_id": "1"}, {"max_per_owner": 1}),
+    ({"fork_family_github_id": "101"}, {"max_per_fork_family": 1}),
+    ({"topics": ("python",)}, {"max_per_topic": 1}),
+    ({"category": "tools"}, {"max_per_category": 1}),
+])
+def test_diversity_hard_caps_preserve_sparse_shortfall(shared, bound):
+    from inference.diversity import DiversityPolicy, rerank_diverse
+    rows = [_diversity_candidate(1, (1, 0, 0), **shared),
+            _diversity_candidate(2, (0, 1, 0), **shared)]
+    result = rerank_diverse(rows, target_size=2, seed="caps",
+        policy=DiversityPolicy(dimensions=3, minimum_exploration=0, **bound))
+    assert result.candidates == (rows[0],)
+    assert result.shortfall == 1
+
+
+def test_exploration_quota_adds_new_sources_and_seeded_ties_ignore_input_order():
+    from dataclasses import replace
+    from inference.diversity import DiversityPolicy, rerank_diverse
+    rows = [_diversity_candidate(1, (1, 0, 0)), _diversity_candidate(2, (0, 1, 0)),
+            _diversity_candidate(3, (0, 0, 1), bucket="trending"),
+            _diversity_candidate(4, (-1, 0, 0), bucket="adjacent")]
+    policy = DiversityPolicy(dimensions=3, minimum_exploration=2)
+    personal = frozenset(row.repo_id for row in rows[:2])
+    result = rerank_diverse(rows, target_size=3, seed="quota", policy=policy,
+                            personalized_top_ids=personal)
+    assert result.exploration_count == 2 and result.exploration_shortfall == 0
+    assert {row.repo_id for row in rows[2:]} <= {row.repo_id for row in result.candidates}
+    relabeled = rerank_diverse([replace(rows[0], bucket="exploration")], target_size=1,
+        seed="quota", policy=policy, personalized_top_ids=personal)
+    assert relabeled.exploration_count == 0 and relabeled.exploration_shortfall == 1
+    tied = [replace(row, score=1) for row in rows[:3]]
+    def choose(values, seed):
+        return rerank_diverse(values, target_size=1, seed=seed,
+            policy=replace(policy, minimum_exploration=0)).candidates
+    assert choose(tied, "same") == choose(list(reversed(tied)), "same")
+    assert len({choose(tied, str(seed))[0].repo_id for seed in range(10)}) > 1
+
+
+def test_diversity_assembler_preserves_selected_source_evidence_and_rejects_quota_loss():
+    from inference.diversity import DiversityPolicy
+    from inference.feed_assembly import DiversityUnavailableError
+    rows = [_diversity_candidate(1, (1, 0, 0)),
+            _diversity_candidate(2, (0, 1, 0), bucket="trending")]
+    inputs = [dict(repo_id=row.repo_id, score=row.score, source=row.bucket,
+        candidate_bucket=row.bucket, owner_github_id=row.owner_github_id,
+        fork_family_github_id=row.fork_family_github_id,
+        retrieval_scores={row.bucket: row.score}) for row in rows]
+    vectors = {row.repo_id: list(row.vector) for row in rows}
+    assembler = FeedAssemblySystem(freshness_boost=0)
+    policy = DiversityPolicy(dimensions=3, minimum_exploration=1)
+    output = assembler.shape_batch(inputs, target_size=2, diversity_policy=policy,
+                                   diversity_vectors=vectors, diversity_seed="assembly")
+    assert len(output) == 2
+    assert next(row for row in output if row["candidate_bucket"] == "trending")["retrieval_scores"] == {"trending": rows[1].score}
+    with pytest.raises(DiversityUnavailableError, match="exploration"):
+        assembler.shape_batch(inputs[:1], target_size=2, diversity_policy=policy,
+                              diversity_vectors=vectors, diversity_seed="assembly")
+
+
 @pytest.mark.parametrize("compact", [False, True])
 def test_v2_heavy_ranker_reranks_full_vector_candidates_and_reports_served_model(compact):
     client = HeavyRankerQdrant()
