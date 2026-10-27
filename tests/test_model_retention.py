@@ -367,6 +367,21 @@ def test_local_qdrant_actual_runtime_reversal_withdrawal_and_replay(r):
         q.close()
 
 
+def test_head_bound_status_index_remains_readable_after_verified_archive_routing(r):
+    from tests.test_model_operations import status_history
+    history=status_history(40);store=tier(r,hot=2,cold=500)
+    rows=list(history.records.rows.items())
+    assert any(b'"kind":"status_index"' in raw for _,raw in rows)
+    for key,raw in rows:
+        assert store.put_once(key,raw)==raw
+        store.compact(key)
+    history.journal.records=store
+    for version in (1,16,17,32,39,40):
+        proof=history.coordinator.original_status(history.users.snapshot,history.headers[version])
+        assert proof['status']=='applied' and proof['operation_head']==history.snapshots[version].head
+    assert store.metrics()['hot_records']==0
+
+
 def test_timed_out_write_retains_fence_until_remote_request_is_quiescent(r, monkeypatch):
     store = tier(r)
     original = store.records.put_once
