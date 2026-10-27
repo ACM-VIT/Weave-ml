@@ -194,23 +194,28 @@ def export_snapshot(
         computed_payload = dict(result.payload)
         if computed_payload.get("embedding_version") != STABLE_METADATA_EMBEDDING_VERSION:
             raise ValueError("candidate payload recipe does not match its vector")
-        computed_identity = {
+        computed_vector_fields = {
             "embedding_dim": len(result.final_embedding),
             "embedding_model": result.embedding_model,
             "embedding_model_revision": EMBEDDING_MODEL_REVISION,
             "embedding_version": result.embedding_version,
+            # This count describes the candidate vector, while ranking fields stay frozen.
+            "readme_chunks": result.readme_chunks,
             "source_hash": result.source_hash,
         }
         if (
             result.repo_id != computed_payload.get("repo_id")
             or result.source_hash != computed_payload.get("source_hash")
             or result.embedding_version != STABLE_METADATA_EMBEDDING_VERSION
-            or any(computed_payload.get(key) != value for key, value in computed_identity.items())
+            or any(
+                computed_payload.get(key) != value
+                for key, value in computed_vector_fields.items()
+            )
         ):
             raise ValueError("candidate payload identity does not match its computed vector")
         payload = dict(frozen_payloads[result.repo_id])
         payload.pop(REPOSITORY_SERVING_ELIGIBILITY_FIELD, None)
-        payload.update(computed_identity)
+        payload.update(computed_vector_fields)
         source = {
             **source_by_id[result.repo_id],
             "repo_id": computed_payload["repo_id"],

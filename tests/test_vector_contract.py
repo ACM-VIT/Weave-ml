@@ -585,7 +585,9 @@ def _issue25_write_snapshot(path, repositories):
     return path
 
 
-def test_stable_metadata_export_preserves_frozen_payload_fields(tmp_path):
+def test_stable_metadata_export_preserves_frozen_payload_and_computed_readme_chunks(
+    tmp_path,
+):
     import json
     from pathlib import Path
 
@@ -595,6 +597,7 @@ def test_stable_metadata_export_preserves_frozen_payload_fields(tmp_path):
     fixture_path = Path(__file__).parent / "fixtures/recommendation_public_catalog/snapshot.json"
     source_row = json.loads(fixture_path.read_text(encoding="utf-8"))["repositories"][0]
     frozen_payload = dict(source_row["payload"])
+    assert not frozen_payload.get("readme")
     input_path = _issue25_write_snapshot(tmp_path / "snapshot.json", [source_row])
     output_path = tmp_path / "candidate.jsonl"
 
@@ -606,6 +609,7 @@ def test_stable_metadata_export_preserves_frozen_payload_fields(tmp_path):
     exported_payload = record["payload"]
     expected_payload = dict(frozen_payload)
     expected_payload.pop(REPOSITORY_SERVING_ELIGIBILITY_FIELD)
+    expected_payload["readme_chunks"] = 0
     expected_payload.update({
         "embedding_dim": REPOSITORY_EMBEDDING_DIM,
         "embedding_model": REPOSITORY_EMBEDDING_MODEL,
@@ -617,6 +621,7 @@ def test_stable_metadata_export_preserves_frozen_payload_fields(tmp_path):
     assert exported_payload == expected_payload
     assert exported_payload["doc_quality"] == frozen_payload["doc_quality"]
     assert exported_payload["category"] == frozen_payload["category"]
+    assert exported_payload["readme_chunks"] == 0
     assert len(record["vector"]) == REPOSITORY_EMBEDDING_DIM
     assert record["recipe_id"] == STABLE_METADATA_EMBEDDING_VERSION
 
