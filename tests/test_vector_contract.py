@@ -143,23 +143,24 @@ def test_streamed_towers_match_serial_empty_mixed_sources_and_cache(offline_embe
     streamed = list(pipeline.iter_embed(iter(sources)))
     materialized = pipeline.embed_batch(iter(sources))
     assert model.calls == []
-    assert [row.repo_id for row in streamed] == [row["repo_id"] for row in sources]
-    for expected, actual, compatible in zip(serial, streamed, materialized):
-        assert actual.final_embedding == pytest.approx(expected.final_embedding, abs=1e-7)
-        assert compatible.final_embedding == actual.final_embedding
-        assert actual.source_hash == expected.source_hash == compatible.source_hash
-        assert actual.card_summary == expected.card_summary == compatible.card_summary
-        # Each execution stamps its real indexing time; all semantic/provenance fields match.
-        payloads = [{key: value for key, value in row.payload.items() if key != "indexed_at"}
-                    for row in (actual, expected, compatible)]
-        assert payloads[0] == payloads[1] == payloads[2]
-        assert math.fsum(value * value for value in actual.final_embedding) == pytest.approx(1)
     assert serial[2].readme_embedding == [] and serial[0].readme_embedding
     assert serial[0].card_summary.source == "description_fallback"
     # Cold streaming exercises grouping rather than merely cached outputs.
     pipeline.tower_cache = None
     cold = list(pipeline.iter_embed(iter(sources)))
-    assert [row.final_embedding for row in cold] == [row.final_embedding for row in serial]
+    expected_ids = [row["repo_id"] for row in sources]
+    for results in (serial, streamed, materialized, cold):
+        assert len(results) == len(sources)
+        assert [row.repo_id for row in results] == expected_ids
+        for expected, actual in zip(serial, results, strict=True):
+            for field in ("readme_embedding", "metadata_embedding", "topic_embedding", "final_embedding"):
+                assert getattr(actual, field) == pytest.approx(getattr(expected, field), abs=1e-7)
+            assert actual.source_hash == expected.source_hash
+            assert actual.card_summary == expected.card_summary
+            # Execution time is the only deliberately different payload field.
+            assert {key: value for key, value in actual.payload.items() if key != "indexed_at"} == {
+                key: value for key, value in expected.payload.items() if key != "indexed_at"}
+            assert math.fsum(value * value for value in actual.final_embedding) == pytest.approx(1)
     assert all(len(group) <= 8 and len(group) * model.max_seq_length <= 2048 for group in model.calls)
     assert any(len(group) == 8 for group in model.calls)
 
