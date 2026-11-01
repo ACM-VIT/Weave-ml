@@ -189,7 +189,7 @@ class GitHubDiscoveryEngine:
         created_recent = (now - timedelta(days=180)).date().isoformat()
         # Randomize search query to get new repositories instead of duplicate top results
         rand_char = self.random.choice("abcdefghijklmnopqrstuvwxyz")
-        base = f'{term} {rand_char} in:name,description,readme fork:false archived:false'
+        base = f'{term} {rand_char} in:name,description,readme fork:false archived:false is:public'
         if band == "high_star":
             return f"{base} stars:>500"
         if band == "recently_active":

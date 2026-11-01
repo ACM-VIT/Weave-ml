@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 import logging
 from pathlib import PurePosixPath
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import requests
 
@@ -48,7 +48,8 @@ class GitHubGraphQLClientError(RuntimeError):
         # Log only controlled diagnostic fields, never the exception message:
         # legacy messages may contain response bodies or transport URLs.
         self.category = category if category in {
-            "response", "transport", "rate_limit", "server", "http", "invalid_json", "graphql",
+            "response", "transport", "rate_limit", "server", "http", "authorization",
+            "invalid_json", "graphql",
         } else "response"
         self.status_code = status_code if type(status_code) is int and 100 <= status_code <= 599 else None
 
@@ -301,6 +302,7 @@ class GitHubGraphQLClient:
         )
         if token:
             self.session.headers["Authorization"] = f"Bearer {token}"
+        self._public_scope_verified_for: str | None = None
         self.coordination_key = self._authorization_key()
         self.rate_limits = shared_github_coordinator(self.coordination_key)
 
@@ -313,6 +315,81 @@ class GitHubGraphQLClient:
         if auth is not None:
             credential = f"{credential or ''}\0session-auth:{id(self.session)}:{id(auth)}"
         return github_coordination_key(self.url, credential)
+
+    def _rate_limit_url(self) -> str:
+        endpoint = urlsplit(self.url)
+        path = endpoint.path.rstrip("/")
+        if endpoint.scheme != "https" or not endpoint.netloc or not path.endswith("/graphql"):
+            raise GitHubClientError(
+                "GitHub endpoint cannot verify public-only authorization", category="authorization",
+            )
+        return urlunsplit((endpoint.scheme, endpoint.netloc, f"{path[:-7]}rate_limit", "", ""))
+
+    def _verify_public_repository_scope(self, authorization_scope: str, budget: GitHubRequestBudget) -> None:
+        """Prove the configured classic/OAuth credential cannot read private repos."""
+        if self._public_scope_verified_for == authorization_scope:
+            return
+        if self.session.auth is not None:
+            raise GitHubClientError(
+                "Opaque GitHub authentication cannot be verified as public-only", category="authorization",
+            )
+
+        authorization = self.session.headers.get("Authorization")
+        if not isinstance(authorization, str):
+            raise GitHubClientError("GitHub public-only authorization is missing", category="authorization")
+        parts = authorization.split(None, 1)
+        if len(parts) != 2 or not parts[1].strip():
+            raise GitHubClientError("GitHub public-only authorization is malformed", category="authorization")
+        token = parts[1].strip()
+        if token.startswith("github_pat_"):
+            raise GitHubClientError(
+                "Fine-grained GitHub credentials are not scope-verifiable", category="authorization",
+            )
+        if not token.startswith(("ghp_", "gho_")):
+            raise GitHubClientError(
+                "GitHub credential type is not scope-verifiable", category="authorization",
+            )
+
+        budget.check()
+        timeout = self.timeout_seconds
+        if budget.deadline is not None:
+            timeout = min(timeout, max(0.001, budget.deadline - time.monotonic()))
+        response = None
+        try:
+            response = self.session.get(
+                self._rate_limit_url(),
+                timeout=timeout,
+                allow_redirects=False,
+            )
+            budget.check()
+            if response.status_code != 200:
+                raise GitHubClientError(
+                    "GitHub public-only credential verification failed",
+                    category="authorization", status_code=response.status_code,
+                )
+
+            scope_header = response.headers.get("X-OAuth-Scopes")
+            if scope_header is None:
+                raise GitHubClientError("GitHub credential scopes are unavailable", category="authorization")
+            scopes = {value.strip().casefold() for value in scope_header.split(",") if value.strip()}
+            safe_scopes = {"public_repo", "read:user", "user:email"}
+            # A present but empty list is allowed only for the classic/OAuth
+            # token prefixes validated above; those tokens have public-only
+            # access when no repository scope is granted.
+            if scopes and ("public_repo" not in scopes or not scopes <= safe_scopes):
+                raise GitHubClientError("GitHub credential is not verified public-only", category="authorization")
+            if self._authorization_key() != authorization_scope:
+                raise GitHubClientError(
+                    "GitHub authorization changed during scope verification", category="authorization",
+                )
+        except requests.RequestException as exc:
+            raise GitHubClientError(
+                "GitHub public-only credential verification failed", category="transport",
+            ) from exc
+        finally:
+            if response is not None:
+                response.close()
+        self._public_scope_verified_for = authorization_scope
 
     @staticmethod
     def _lineage_enabled() -> bool:
@@ -663,6 +740,9 @@ class GitHubGraphQLClient:
             self.rate_limits = shared_github_coordinator(current_scope)
         deferred = scheduled is not None and budget.defer_retries
         budget.check()
+        # This check is before cached-response replay and every repository
+        # GraphQL query, including direct README/enrichment retries.
+        self._verify_public_repository_scope(current_scope, budget)
         # Opaque auth can change in place without changing its object ID. Do
         # not replay earlier successful access/content under that new state.
         allow_response_replay = self.session.auth is None
