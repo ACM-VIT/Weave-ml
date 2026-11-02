@@ -134,6 +134,52 @@ def test_readme_job_verifies_current_scopes_before_a_cached_readme_can_be_return
     assert session.post_calls == []
 
 
+def test_rotated_readme_token_does_not_inherit_previous_token_cooldown(monkeypatch):
+    session = _Session("ghp_old_readme_quota", "public_repo")
+    client = GitHubGraphQLClient(
+        token="ghp_old_readme_quota", session=session, sleep_on_rate_limit=False,
+    )
+    old_coordinator = client.rate_limits
+    old_coordinator.throttle({"Retry-After": "3600"})
+    session.headers["Authorization"] = "Bearer ghp_new_readme_quota"
+    original_post = session.post
+
+    def public_readme(*args, **kwargs):
+        response = original_post(*args, **kwargs)
+        response.json = lambda: {"data": {"repository": {"readme1": {"text": "# Public README"}}}}
+        return response
+
+    monkeypatch.setattr(session, "post", public_readme)
+
+    assert str(client.get_readme("owner", "repo")) == "# Public README"
+    assert client.rate_limits is not old_coordinator
+    assert len(session.get_calls) == len(session.post_calls) == 1
+    assert session.get_calls[0][2] == "Bearer ghp_new_readme_quota"
+    assert session.post_calls[0][2] == "Bearer ghp_new_readme_quota"
+    assert old_coordinator.admit() is not None
+
+
+def test_rest_probe_reset_does_not_extend_shared_secondary_cooldown(monkeypatch):
+    from acquisition import github_rate_limit as quota
+
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(quota, "time", SimpleNamespace(
+        monotonic=lambda: clock.now, time=lambda: clock.now + 1000,
+    ))
+    coordinator = quota.GitHubRateLimitCoordinator()
+    coordinator.observe({"X-RateLimit-Remaining": "12", "X-RateLimit-Reset": "5000"})
+
+    retry_at = coordinator.scope_probe_retry_at({
+        "Retry-After": "60", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "4700",
+    }, share_secondary=True)
+
+    assert 3700.0 <= retry_at <= 3700.3, "the probe job must honor its own REST reset"
+    assert coordinator.admit() is not None, "GraphQL must honor the secondary delay"
+    clock.now = 161.0
+    assert coordinator.admit() is None, "verified GraphQL work can resume before the REST reset"
+    assert coordinator.snapshot()["remaining"] == 11
+
+
 def test_scope_probe_never_replaces_the_graphql_primary_quota():
     session = _Session(
         "ghp_quota_isolation",

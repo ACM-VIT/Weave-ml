@@ -503,6 +503,9 @@ class GitHubGraphQLClient:
         if budget.authorization_scope is not None and budget.authorization_scope != current_scope:
             raise GitHubClientError("GitHub authorization changed during acquisition", category="authorization")
         budget.authorization_scope = current_scope
+        if self.coordination_key != current_scope:
+            self.coordination_key = current_scope
+            self.rate_limits = shared_github_coordinator(current_scope)
         previous_defer_retries = budget.defer_retries
         if self.session.auth is not None:
             # Opaque auth cannot safely replay successful earlier stages.

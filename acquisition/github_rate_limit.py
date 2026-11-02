@@ -206,6 +206,9 @@ class GitHubRateLimitCoordinator:
                 delays.append(max(0.0, parsedate_to_datetime(retry_after).timestamp() - wall_now))
             except (TypeError, ValueError, OverflowError):
                 pass
+        # Only the secondary delay is shared with already-verified GraphQL
+        # work. The REST primary reset still constrains this probe's retry.
+        secondary_ready_at = now + max(delays or [60.0])
         if _nonnegative_int(headers.get("X-RateLimit-Remaining")) == 0:
             reset = _number(headers.get("X-RateLimit-Reset"))
             if reset is not None:
@@ -216,8 +219,8 @@ class GitHubRateLimitCoordinator:
         with _registry_lock, self._lock:
             self._retain_locked(now)
             self._counters["throttled"] += 1
-            self._block_locked(ready_at)
-            return self._blocked_until
+            self._block_locked(secondary_ready_at)
+            return max(ready_at, self._blocked_until)
 
     def _block_locked(self, ready_at: float) -> None:
         # First admission after reset is jittered too, not just its followers.
