@@ -414,7 +414,12 @@ class GitHubGraphQLClient:
                             "GitHub scope verification server retries exhausted",
                             category="server", status_code=status_code,
                         )
-                    self._retry(identity, attempt, budget, deferred)
+                    retry_at = None
+                    if response.headers.get("Retry-After") is not None:
+                        retry_at = self.rate_limits.scope_probe_retry_at(
+                            response.headers, share_secondary=False,
+                        )
+                    self._retry(identity, attempt, budget, deferred, ready_at=retry_at)
                     continue
                 if status_code != 200:
                     raise GitHubClientError(

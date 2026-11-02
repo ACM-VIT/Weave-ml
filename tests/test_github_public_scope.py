@@ -11,7 +11,7 @@ import requests
 
 import main
 from acquisition.github_discovery import DiscoveryConfig, GitHubDiscoveryEngine
-from acquisition.github_rate_limit import GitHubRequestBudget
+from acquisition.github_rate_limit import GitHubRequestBudget, GitHubRetryLater
 from acquisition.github_graphql_client import FetchedReadme, GitHubClientError, GitHubGraphQLClient
 from acquisition.models import github_failure_disposition
 
@@ -195,6 +195,58 @@ def test_temporary_scope_probe_failures_retry_before_repository_graphql(monkeypa
     assert len(session.get_calls) == 2
     assert retry_response.closed
     assert len(session.post_calls) == 1
+
+
+def test_scope_probe_503_retry_after_is_deferred_resumed_and_deadline_bounded():
+    server_error = _Response(503, headers={"Retry-After": "0.04"})
+    success = _Response(scopes="public_repo")
+    session = _Session(
+        "ghp_probe_retry_after",
+        "public_repo",
+        scope_responses=[server_error, success],
+    )
+    client = GitHubGraphQLClient(token="ghp_probe_retry_after", session=session, max_retries=1)
+    budget = GitHubRequestBudget(deadline=time.monotonic() + 1)
+    identity = f"public-scope:{client._authorization_key()}"
+    started = time.monotonic()
+
+    with client.retry_scope(budget), pytest.raises(GitHubRetryLater) as deferred:
+        client.execute("query RetryAfter { viewer { login } }")
+
+    ready_at = deferred.value.not_before
+    assert started + 0.035 <= ready_at <= started + 0.3
+    assert budget.not_before[identity] == ready_at
+    assert server_error.closed
+    assert session.post_calls == []
+
+    time.sleep(max(0.0, ready_at - time.monotonic() + 0.01))
+    with client.retry_scope(budget):
+        client.execute("query RetryAfter { viewer { login } }")
+
+    assert len(session.get_calls) == 2
+    assert success.closed
+    assert len(session.post_calls) == 1
+    budget.finish()
+
+    # A server-directed delay beyond this new job's deadline never retries or
+    # reaches repository GraphQL.
+    timed_response = _Response(503, headers={"Retry-After": "1"})
+    timed_session = _Session(
+        "ghp_probe_retry_after_deadline",
+        "public_repo",
+        scope_responses=[timed_response],
+    )
+    timed_client = GitHubGraphQLClient(
+        token="ghp_probe_retry_after_deadline", session=timed_session, max_retries=1,
+    )
+    timed_budget = GitHubRequestBudget(deadline=time.monotonic() + 0.05)
+    with timed_client.retry_scope(timed_budget), pytest.raises(TimeoutError):
+        timed_client.execute("query RetryAfterDeadline { viewer { login } }")
+
+    assert timed_response.closed
+    assert len(timed_session.get_calls) == 1
+    assert timed_session.post_calls == []
+    timed_budget.finish()
 
 
 @pytest.mark.parametrize(
