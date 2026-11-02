@@ -49,6 +49,7 @@ def fixture_clock(clock, *, observe_admissions=True):
     fake_time = SimpleNamespace(monotonic=clock.monotonic, time=clock.wall,
                                 sleep=clock.forbidden_worker_sleep)
     original_admit = quota.GitHubRateLimitCoordinator.admit
+    original_scope_admit = quota.GitHubRateLimitCoordinator.admit_scope_probe
     original_throttle = quota.GitHubRateLimitCoordinator.throttle
     def observe_admit(coordinator):
         # Extend the real registry critical section only through its fixture
@@ -56,6 +57,12 @@ def fixture_clock(clock, *, observe_admissions=True):
         with quota._registry_lock, clock.lock:
             result = original_admit(coordinator)
             clock.quota_events.append({'event': 'admit', 'at': clock.monotonic(),
+                                       'granted': result is None})
+            return result
+    def observe_scope_admit(coordinator):
+        with quota._registry_lock, clock.lock:
+            result = original_scope_admit(coordinator)
+            clock.quota_events.append({'event': 'scope_admit', 'at': clock.monotonic(),
                                        'granted': result is None})
             return result
     def observe_throttle(coordinator, headers):
@@ -69,6 +76,7 @@ def fixture_clock(clock, *, observe_admissions=True):
         # Benchmark timestamp observation deliberately extends the critical section.
         if observe_admissions:
             stack.enter_context(patch.object(quota.GitHubRateLimitCoordinator, 'admit', observe_admit))
+            stack.enter_context(patch.object(quota.GitHubRateLimitCoordinator, 'admit_scope_probe', observe_scope_admit))
             stack.enter_context(patch.object(quota.GitHubRateLimitCoordinator, 'throttle', observe_throttle))
         for module in (quota, graphql, scheduling):
             stack.enter_context(patch.object(module, 'time', fake_time))
@@ -86,6 +94,7 @@ class Transport:
         self.lock = threading.Lock()
         self.records = []
         self.throttled = False
+        self.scope_checks = 0
         self.coordinators = []
         self.sessions = []
 
@@ -109,6 +118,11 @@ class Transport:
         class Session:
             def __init__(self):
                 self.headers, self.auth, self.closed = {}, None, False
+            def get(self, *args, **kwargs):
+                with transport.lock:
+                    transport.scope_checks += 1
+                return SimpleNamespace(status_code=200, headers={'X-OAuth-Scopes': 'public_repo'},
+                                       text='', close=lambda: None)
             def post(self, *args, **kwargs):
                 return transport.post(*args, **kwargs)
             def close(self):
@@ -124,7 +138,7 @@ class Transport:
                 self.execute('metadata', {'name': name})
                 result = self.execute('blob', {'name': name})
                 return graphql.FetchedReadme(result['data']['text'], source_path='README.md', default_branch='main')
-        client = Client(token='isolated-fixture-token', base_url='https://fixture.invalid/graphql',
+        client = Client(token='ghp_isolated-fixture-token', base_url='https://fixture.invalid/graphql',
                         session=transport.session(), max_retries=2)
         self.coordinators.append(client.rate_limits)
         return client
@@ -179,13 +193,15 @@ def measure(*, jobs=8, workers=2):
     throttle_index = next(i for i, event in enumerate(clock.quota_events) if event['event'] == 'throttle')
     first_reset = clock.quota_events[throttle_index]['ready_at']
     after_reset = [e['at'] for e in clock.quota_events[throttle_index + 1:]
-                   if e['event'] == 'admit' and e['granted']]
+                   if e['event'] in {'admit', 'scope_admit'} and e['granted']]
     metadata_counts = {name: sum(r['name'] == name and r['stage'] == 'metadata' for r in transport.records)
                        for name in {r['name'] for r in transport.records}}
     return {'scope': __doc__, 'jobs': jobs, 'workers': workers, 'completed_jobs': len(values),
         'wall_seconds': elapsed, 'virtual_seconds': clock.monotonic(),
         'virtual_useful_jobs_per_second': len(values) / clock.monotonic(),
-        'transport_requests': len(transport.records), 'injected_429s': len(throttles),
+        'transport_requests': len(transport.records) + transport.scope_checks,
+        'graphql_requests': len(transport.records), 'public_scope_probe_requests': transport.scope_checks,
+        'injected_429s': len(throttles),
         'max_metadata_attempts_per_job': max(metadata_counts.values()),
         'maximum_admitted_jobs': max(s['admitted'] for s in samples),
         'maximum_queued_jobs': max(s['queued'] for s in samples),
