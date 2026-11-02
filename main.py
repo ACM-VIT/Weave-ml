@@ -124,7 +124,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--validate-config",
         action="store_true",
-        help="Validate offline-worker configuration without opening network connections",
+        help=(
+            "Check static configuration without network access. Use a ghp_ classic or gho_ OAuth token; "
+            "only public_repo/read:user/user:email scopes (or none) are accepted, and scopes are checked at runtime."
+        ),
     )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
@@ -156,7 +159,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _configuration_errors(args: argparse.Namespace) -> list[str]:
     """Return configuration errors without contacting external services."""
     errors: list[str] = []
-    from acquisition.config import metadata_batch_size, readme_workers
+    from acquisition.config import github_public_token_type_error, metadata_batch_size, readme_workers
 
     for validate_setting in (metadata_batch_size, readme_workers):
         try:
@@ -164,8 +167,9 @@ def _configuration_errors(args: argparse.Namespace) -> list[str]:
         except ValueError as exc:
             errors.append(str(exc))
     token = os.getenv("GITHUB_TOKEN")
-    if not token or token == "your_github_token_here":
-        errors.append("GITHUB_TOKEN is missing or still uses the placeholder value")
+    token_error = github_public_token_type_error(token)
+    if token_error:
+        errors.append(token_error)
     if not os.getenv("BACKEND_URL"):
         errors.append("BACKEND_URL is required for production corpus ingestion")
     if not os.getenv("INTERNAL_API_SECRET"):
@@ -189,12 +193,17 @@ def main(argv: list[str] | None = None) -> int:
             for error in errors:
                 logger.error("Configuration error: %s", error)
             return 1
-        logger.info("Corpus worker configuration is valid; no connections were opened.")
+        logger.info(
+            "Static corpus configuration is valid; no connections were opened. "
+            "Granted GitHub scopes are checked before repository access at runtime."
+        )
         return 0
 
     token = os.getenv("GITHUB_TOKEN")
-    if not token or token == "your_github_token_here":
-        logger.error("Set GITHUB_TOKEN in your environment or .env file first.")
+    from acquisition.config import github_public_token_type_error
+    token_error = github_public_token_type_error(token)
+    if token_error:
+        logger.error("Configuration error: %s", token_error)
         return 1
 
     from acquisition.checkpoint import CorpusCheckpoint

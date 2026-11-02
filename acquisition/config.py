@@ -7,6 +7,26 @@ import os
 from pathlib import Path
 
 
+def github_public_token_type_error(token: object) -> str | None:
+    """Explain which offline-worker credential formats can be scope-verified."""
+    if not isinstance(token, str) or not token.strip() or token.strip() == "your_github_token_here":
+        return (
+            "GITHUB_TOKEN is required; use a classic or OAuth token starting with ghp_ or gho_ "
+            "with only public_repo, read:user, and user:email scopes, or no scopes"
+        )
+    normalized = token.strip()
+    if normalized.startswith(("ghp_", "gho_")):
+        return None
+    if normalized.startswith("github_pat_"):
+        reason = "fine-grained github_pat_ tokens cannot be scope-verified as public-only"
+    else:
+        reason = "this credential type cannot be scope-verified as public-only"
+    return (
+        f"GITHUB_TOKEN {reason}; use a classic or OAuth token starting with ghp_ or gho_ "
+        "with only public_repo, read:user, and user:email scopes, or no scopes"
+    )
+
+
 def positive_int(value: object, *, name: str) -> int:
     try:
         parsed = int(str(value).strip())

@@ -45,6 +45,7 @@ class GitHubRequestBudget:
     deadline: float | None = None
     defer_retries: bool = True
     authorization_scope: str | None = None
+    _verified_public_scope: str | None = field(default=None, init=False, repr=False)
     cancelled: Callable[[], bool] = lambda: False
     attempts: dict[str, int] = field(default_factory=dict)
     not_before: dict[str, float] = field(default_factory=dict)
@@ -60,6 +61,7 @@ class GitHubRequestBudget:
             callback()
         self.shared_flights.clear()
         self.responses.clear()
+        self._verified_public_scope = None
 
     def check(self) -> None:
         if self.cancelled():
@@ -113,6 +115,20 @@ class GitHubRateLimitCoordinator:
             if now < self._stagger_until:
                 self._next_admission = now + random.uniform(0.05, 0.25)
             self._counters["requests"] += 1
+            return None
+
+    def admit_scope_probe(self) -> float | None:
+        """Admit a REST scope probe without consuming GraphQL primary points."""
+        now = time.monotonic()
+        with _registry_lock, self._lock:
+            self._retain_locked(now)
+            ready_at = max(self._blocked_until, self._next_admission)
+            if now < ready_at:
+                self._counters["admission_deferred"] += 1
+                return ready_at
+            if now < self._stagger_until:
+                self._next_admission = now + random.uniform(0.05, 0.25)
+            self._counters["scope_probe_requests"] += 1
             return None
 
     def observe(self, headers: Any, rate_limit: Any = None) -> None:
@@ -171,6 +187,40 @@ class GitHubRateLimitCoordinator:
             self._counters["throttled"] += 1
             self._block_locked(ready_at)
             return self._blocked_until
+
+    def scope_probe_retry_at(self, headers: Any, *, share_secondary: bool) -> float:
+        """Compute a probe retry without importing REST primary quota state.
+
+        Secondary throttles share their cooldown with GraphQL. A REST primary
+        reset delays only this scope-verification job and never overwrites the
+        coordinator's GraphQL primary remaining/reset values.
+        """
+        now, wall_now = time.monotonic(), time.time()
+        delays = []
+        retry_after = headers.get("Retry-After")
+        seconds = _number(retry_after)
+        if seconds is not None:
+            delays.append(max(0.0, seconds))
+        elif isinstance(retry_after, str):
+            try:
+                delays.append(max(0.0, parsedate_to_datetime(retry_after).timestamp() - wall_now))
+            except (TypeError, ValueError, OverflowError):
+                pass
+        # Only the secondary delay is shared with already-verified GraphQL
+        # work. The REST primary reset still constrains this probe's retry.
+        secondary_ready_at = now + max(delays or [60.0])
+        if _nonnegative_int(headers.get("X-RateLimit-Remaining")) == 0:
+            reset = _number(headers.get("X-RateLimit-Reset"))
+            if reset is not None:
+                delays.append(max(0.0, reset - wall_now))
+        ready_at = now + max(delays or [60.0])
+        if not share_secondary:
+            return ready_at
+        with _registry_lock, self._lock:
+            self._retain_locked(now)
+            self._counters["throttled"] += 1
+            self._block_locked(secondary_ready_at)
+            return max(ready_at, self._blocked_until)
 
     def _block_locked(self, ready_at: float) -> None:
         # First admission after reset is jittered too, not just its followers.

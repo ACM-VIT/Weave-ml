@@ -90,7 +90,10 @@ Examples:
     parser.add_argument(
         "--validate-config",
         action="store_true",
-        help="Validate configuration and exit without running",
+        help=(
+            "Check static configuration without network access. Use a ghp_ classic or gho_ OAuth token; "
+            "only public_repo/read:user/user:email scopes (or none) are accepted, and scopes are checked at runtime."
+        ),
     )
 
     args = parser.parse_args(argv)
@@ -126,11 +129,14 @@ def main(argv: list[str] | None = None):
 
     # Validate configuration (after CLI overrides)
     config_errors = validate_config()
-    from acquisition.config import readme_workers
+    from acquisition.config import github_public_token_type_error, readme_workers
     try:
         readme_workers()
     except ValueError as exc:
         config_errors.append(str(exc))
+    token_error = github_public_token_type_error(os.getenv("GITHUB_TOKEN"))
+    if token_error:
+        config_errors.append(token_error)
     state_path = os.getenv("TRENDING_STATE_PATH", "").strip()
     if os.getenv("TRENDING_COORDINATION_MODE") != "singleton_file" or not state_path:
         config_errors.append(
@@ -144,15 +150,15 @@ def main(argv: list[str] | None = None):
         sys.exit(1)
 
     if args.validate_config:
-        missing = [
-            name for name in ("GITHUB_TOKEN", "BACKEND_URL", "INTERNAL_API_SECRET")
-            if not os.getenv(name)
-        ]
+        missing = [name for name in ("BACKEND_URL", "INTERNAL_API_SECRET") if not os.getenv(name)]
         if missing:
             for name in missing:
                 logger.error("  - %s is required", name)
             sys.exit(1)
-        logger.info("Configuration validation passed.")
+        logger.info(
+            "Static configuration validation passed. Granted GitHub scopes are checked "
+            "before repository access at runtime."
+        )
         sys.exit(0)
 
     # Check if mode is specified

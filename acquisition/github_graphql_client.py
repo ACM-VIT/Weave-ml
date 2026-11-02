@@ -18,13 +18,14 @@ from datetime import datetime, timezone
 from typing import Any
 import logging
 from pathlib import PurePosixPath
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import requests
 
 from .github_rate_limit import (
     GitHubRequestBudget, GitHubRetryLater, github_coordination_key, shared_github_coordinator,
 )
+from .config import github_public_token_type_error
 
 from .graphql_queries import (
     GET_README_QUERY,
@@ -48,7 +49,8 @@ class GitHubGraphQLClientError(RuntimeError):
         # Log only controlled diagnostic fields, never the exception message:
         # legacy messages may contain response bodies or transport URLs.
         self.category = category if category in {
-            "response", "transport", "rate_limit", "server", "http", "invalid_json", "graphql",
+            "response", "transport", "rate_limit", "server", "http", "authorization",
+            "invalid_json", "graphql",
         } else "response"
         self.status_code = status_code if type(status_code) is int and 100 <= status_code <= 599 else None
 
@@ -314,6 +316,136 @@ class GitHubGraphQLClient:
             credential = f"{credential or ''}\0session-auth:{id(self.session)}:{id(auth)}"
         return github_coordination_key(self.url, credential)
 
+    def _rate_limit_url(self) -> str:
+        endpoint = urlsplit(self.url)
+        path = endpoint.path.rstrip("/")
+        if endpoint.scheme != "https" or not endpoint.netloc or not path.endswith("/graphql"):
+            raise GitHubClientError(
+                "GitHub endpoint cannot verify public-only authorization", category="authorization",
+            )
+        return urlunsplit((endpoint.scheme, endpoint.netloc, f"{path[:-7]}rate_limit", "", ""))
+
+    def _verify_public_repository_scope(self, authorization_scope: str, budget: GitHubRequestBudget) -> None:
+        """Verify permission once per logical acquisition/README job."""
+        if budget._verified_public_scope == authorization_scope:
+            return
+        if self.session.auth is not None:
+            raise GitHubClientError(
+                "Opaque GitHub authentication cannot be verified as public-only", category="authorization",
+            )
+
+        authorization = self.session.headers.get("Authorization")
+        if not isinstance(authorization, str):
+            raise GitHubClientError("GitHub public-only authorization is missing", category="authorization")
+        parts = authorization.split(None, 1)
+        if len(parts) != 2 or not parts[1].strip():
+            raise GitHubClientError("GitHub public-only authorization is malformed", category="authorization")
+        token = parts[1].strip()
+        token_error = github_public_token_type_error(token)
+        if token_error:
+            raise GitHubClientError(token_error, category="authorization")
+
+        identity = f"public-scope:{authorization_scope}"
+        deferred = getattr(self._retry_local, "budget", None) is budget and budget.defer_retries
+        while True:
+            budget.check()
+            ready_at = budget.not_before.get(identity, 0.0)
+            if ready_at > time.monotonic():
+                self._wait_or_defer(ready_at, budget, deferred)
+            ready_at = self.rate_limits.admit_scope_probe()
+            if ready_at is not None:
+                if not self.sleep_on_rate_limit:
+                    raise GitHubClientError("GitHub scope verification quota admission deferred", category="rate_limit")
+                self._wait_or_defer(ready_at, budget, deferred)
+                continue
+
+            attempt = budget.attempts.get(identity, 0)
+            if attempt > self.max_retries:
+                raise GitHubClientError("GitHub public-only credential verification exhausted retries", category="transport")
+            budget.attempts[identity] = attempt + 1
+            timeout = self.timeout_seconds
+            if budget.deadline is not None:
+                timeout = min(timeout, max(0.001, budget.deadline - time.monotonic()))
+            response = None
+            try:
+                response = self.session.get(
+                    self._rate_limit_url(),
+                    timeout=timeout,
+                    allow_redirects=False,
+                )
+            except requests.RequestException as exc:
+                if attempt >= self.max_retries:
+                    raise GitHubClientError(
+                        "GitHub public-only credential verification transport retries exhausted",
+                        category="transport",
+                    ) from exc
+                self._retry(identity, attempt, budget, deferred)
+                continue
+
+            try:
+                budget.check()
+                status_code = response.status_code
+                if status_code == 429 or (status_code == 403 and self._is_rate_limited(response)):
+                    headers = response.headers
+                    header_names = {name.lower() for name in headers}
+                    remaining = headers.get("X-RateLimit-Remaining")
+                    response_text = response.text.lower()
+                    secondary = (
+                        "retry-after" in header_names
+                        or "secondary rate limit" in response_text
+                        or remaining != "0"
+                    )
+                    # REST core remaining/reset values belong only to this
+                    # verifier. Explicit secondary limits also pause shared
+                    # GitHub traffic through the existing coordinator.
+                    ready_at = self.rate_limits.scope_probe_retry_at(
+                        headers, share_secondary=secondary,
+                    )
+                    if attempt >= self.max_retries or not self.sleep_on_rate_limit:
+                        raise GitHubClientError(
+                            "GitHub scope verification rate limit exceeded",
+                            category="rate_limit", status_code=status_code,
+                        )
+                    self._retry(identity, attempt, budget, deferred, ready_at=ready_at)
+                    continue
+                if status_code in {500, 502, 503, 504}:
+                    if attempt >= self.max_retries:
+                        raise GitHubClientError(
+                            "GitHub scope verification server retries exhausted",
+                            category="server", status_code=status_code,
+                        )
+                    retry_at = None
+                    if response.headers.get("Retry-After") is not None:
+                        retry_at = self.rate_limits.scope_probe_retry_at(
+                            response.headers, share_secondary=False,
+                        )
+                    self._retry(identity, attempt, budget, deferred, ready_at=retry_at)
+                    continue
+                if status_code != 200:
+                    raise GitHubClientError(
+                        "GitHub public-only credential verification failed",
+                        category="authorization", status_code=status_code,
+                    )
+
+                scope_header = response.headers.get("X-OAuth-Scopes")
+                if scope_header is None:
+                    raise GitHubClientError("GitHub credential scopes are unavailable", category="authorization")
+                scopes = {value.strip().casefold() for value in scope_header.split(",") if value.strip()}
+                safe_scopes = {"public_repo", "read:user", "user:email"}
+                # A present but empty list is allowed only for the classic/OAuth
+                # token prefixes validated above; those tokens have public-only
+                # access when no repository scope is granted.
+                if not scopes <= safe_scopes:
+                    raise GitHubClientError("GitHub credential is not verified public-only", category="authorization")
+                if self._authorization_key() != authorization_scope:
+                    raise GitHubClientError(
+                        "GitHub authorization changed during scope verification", category="authorization",
+                    )
+                budget._verified_public_scope = authorization_scope
+                return
+            finally:
+                response.close()
+
     @staticmethod
     def _lineage_enabled() -> bool:
         raw = os.getenv('ACQUISITION_LINEAGE_ENABLED', 'false').strip().casefold()
@@ -369,8 +501,11 @@ class GitHubGraphQLClient:
         )
         current_scope = self._authorization_key()
         if budget.authorization_scope is not None and budget.authorization_scope != current_scope:
-            raise GitHubClientError("GitHub authorization changed during acquisition", category="http")
+            raise GitHubClientError("GitHub authorization changed during acquisition", category="authorization")
         budget.authorization_scope = current_scope
+        if self.coordination_key != current_scope:
+            self.coordination_key = current_scope
+            self.rate_limits = shared_github_coordinator(current_scope)
         previous_defer_retries = budget.defer_retries
         if self.session.auth is not None:
             # Opaque auth cannot safely replay successful earlier stages.
@@ -380,10 +515,13 @@ class GitHubGraphQLClient:
             budget.defer_retries = False
         try:
             with self.retry_scope(budget):
+                # Keep the public-only permission check at this job boundary
+                # too, so an early README cache return cannot bypass it.
+                self._verify_public_repository_scope(current_scope, budget)
                 result = self._get_readme_cached(owner, name, budget)
                 budget.check()
                 if budget.authorization_scope != self._authorization_key():
-                    raise GitHubClientError("GitHub authorization changed during README acquisition", category="http")
+                    raise GitHubClientError("GitHub authorization changed during README acquisition", category="authorization")
                 return result
         finally:
             budget.defer_retries = previous_defer_retries
@@ -656,13 +794,16 @@ class GitHubGraphQLClient:
         )
         current_scope = self._authorization_key()
         if budget.authorization_scope is not None and budget.authorization_scope != current_scope:
-            raise GitHubClientError("GitHub authorization changed during acquisition", category="http")
+            raise GitHubClientError("GitHub authorization changed during acquisition", category="authorization")
         budget.authorization_scope = current_scope
         if self.coordination_key != current_scope:
             self.coordination_key = current_scope
             self.rate_limits = shared_github_coordinator(current_scope)
         deferred = scheduled is not None and budget.defer_retries
         budget.check()
+        # This check is before cached-response replay and every repository
+        # GraphQL query, including direct README/enrichment retries.
+        self._verify_public_repository_scope(current_scope, budget)
         # Opaque auth can change in place without changing its object ID. Do
         # not replay earlier successful access/content under that new state.
         allow_response_replay = self.session.auth is None

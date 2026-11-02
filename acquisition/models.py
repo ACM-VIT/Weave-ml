@@ -11,10 +11,12 @@ class AcquisitionConfigurationError(RuntimeError):
 
 
 def github_failure_disposition(error: object) -> str:
-    return (
-        "configuration" if getattr(error, "category", None) == "http"
-        and getattr(error, "status_code", None) in (401, 403) else "retryable"
-    )
+    category = getattr(error, "category", None)
+    if category == "authorization":
+        return "configuration"
+    if category == "http" and getattr(error, "status_code", None) in (401, 403):
+        return "configuration"
+    return "retryable"
 
 
 @dataclass(frozen=True, slots=True)

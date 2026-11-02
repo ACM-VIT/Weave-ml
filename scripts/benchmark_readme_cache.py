@@ -13,6 +13,7 @@ import statistics
 import sys
 import threading
 import time
+from urllib.parse import urlsplit, urlunsplit
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -129,6 +130,17 @@ class GraphQLFixture:
             def log_message(self, *_args):
                 pass
 
+            def do_GET(self):
+                if urlsplit(self.path).path != "/rate_limit":
+                    self.send_error(404)
+                    return
+                with fixture.lock:
+                    fixture.calls["scope"] += 1
+                self.send_response(200)
+                self.send_header("X-OAuth-Scopes", "public_repo")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
             def do_POST(self):
                 length = int(self.headers.get("content-length", "0"))
                 assert 0 < length < 64_000
@@ -167,10 +179,26 @@ class GraphQLFixture:
         assert not self.thread.is_alive()
 
     def client(self, token="fixture-readme-token"):
-        session = requests.Session()
+        fixture = self
+
+        class LogicalHTTPSFixtureSession(requests.Session):
+            """Map the client's HTTPS-only fixture origin to local HTTP."""
+
+            def request(self, method, url, **kwargs):
+                logical = urlsplit(url)
+                if logical.scheme != "https" or logical.netloc != "fixture.invalid":
+                    raise AssertionError("benchmark client attempted a non-fixture request")
+                if logical.path not in {"/graphql", "/rate_limit"}:
+                    raise AssertionError("benchmark client used an unexpected fixture endpoint")
+                local = urlsplit(fixture.origin)
+                target = urlunsplit((local.scheme, local.netloc, logical.path, logical.query, ""))
+                return super().request(method, target, **kwargs)
+
+        session = LogicalHTTPSFixtureSession()
         session.trust_env = False
-        return GitHubGraphQLClient(token=token, base_url=self.origin, session=session, max_retries=0,
-                                   timeout_seconds=3, deadline=time.monotonic() + 10)
+        synthetic_token = token if token.startswith(("ghp_", "gho_")) else f"ghp_{token}"
+        return GitHubGraphQLClient(token=synthetic_token, base_url="https://fixture.invalid/graphql", session=session,
+                                   max_retries=0, timeout_seconds=3, deadline=time.monotonic() + 10)
 
 
 def run_benchmark(*, iterations: int = 10, delay: float = .005):
