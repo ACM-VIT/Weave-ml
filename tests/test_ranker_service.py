@@ -986,3 +986,29 @@ def test_invalid_runtime_device_is_a_configuration_error(monkeypatch):
     with pytest.raises(ValueError, match="V2_HEAVY_RANKER_DEVICE"):
         QdrantV2Retriever(client=object(), heavy_ranker_enabled=False,
                           minimum_eligible_repositories=0)
+
+@pytest.mark.parametrize('digest_field', ['model_sha256', 'scaler_sha256'])
+def test_manual_qualification_cannot_override_artifact_identity(tmp_path, digest_field):
+    model_path = tmp_path / 'heavy_ranker.pt'
+    scaler_path = tmp_path / 'feature_scaler.json'
+    manifest_path = tmp_path / 'model_manifest.json'
+    model_path.write_bytes((ARTIFACTS / 'heavy_ranker.pt').read_bytes())
+    _write_scaler(scaler_path)
+    _write_production_manifest(
+        manifest_path, model_path=model_path, scaler_path=scaler_path,
+        production_qualified=True, qualification_method='manual_override',
+        training_data={'identity': 'generator-v1', 'type': 'synthetic'},
+        **{digest_field: '0' * 64},
+    )
+    with pytest.raises(RuntimeError, match=digest_field):
+        RankerService(model_path=str(model_path), scaler_path=str(scaler_path),
+                      manifest_path=str(manifest_path), require_production_manifest=True,
+                      device='cpu')
+    inspected = RankerService(model_path=str(model_path), scaler_path=str(scaler_path),
+                              manifest_path=str(manifest_path), device='cpu')
+    assert not inspected.production_qualified
+    retriever = QdrantV2Retriever(client=object(), ranker=inspected,
+                                  heavy_ranker_enabled=True, heavy_ranker_required=True,
+                                  allow_unqualified_ranker=False, minimum_eligible_repositories=0)
+    assert retriever.ranker is None
+    assert not retriever.heavy_ranker_production_qualified
