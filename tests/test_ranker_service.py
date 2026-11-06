@@ -987,8 +987,16 @@ def test_invalid_runtime_device_is_a_configuration_error(monkeypatch):
         QdrantV2Retriever(client=object(), heavy_ranker_enabled=False,
                           minimum_eligible_repositories=0)
 
-@pytest.mark.parametrize('digest_field', ['model_sha256', 'scaler_sha256'])
-def test_manual_qualification_cannot_override_artifact_identity(tmp_path, digest_field):
+@pytest.mark.parametrize('field,value', [
+    ('model_sha256', '0' * 64),
+    ('scaler_sha256', '0' * 64),
+    ('model_file', 'another-model.pt'),
+    ('scaler_file', 'another-scaler.json'),
+    ('embedding_model', 'another-encoder'),
+    ('embedding_model_revision', 'another-revision'),
+    ('value_weights', {}),
+])
+def test_manual_qualification_cannot_override_artifact_identity(tmp_path, field, value):
     model_path = tmp_path / 'heavy_ranker.pt'
     scaler_path = tmp_path / 'feature_scaler.json'
     manifest_path = tmp_path / 'model_manifest.json'
@@ -998,17 +1006,50 @@ def test_manual_qualification_cannot_override_artifact_identity(tmp_path, digest
         manifest_path, model_path=model_path, scaler_path=scaler_path,
         production_qualified=True, qualification_method='manual_override',
         training_data={'identity': 'generator-v1', 'type': 'synthetic'},
-        **{digest_field: '0' * 64},
+        **{field: value},
     )
-    with pytest.raises(RuntimeError, match=digest_field):
+    serving_contract = dict(expected_embedding_model=REPOSITORY_EMBEDDING_MODEL,
+                            expected_embedding_model_revision=EMBEDDING_MODEL_REVISION)
+    with pytest.raises(RuntimeError, match=field):
         RankerService(model_path=str(model_path), scaler_path=str(scaler_path),
                       manifest_path=str(manifest_path), require_production_manifest=True,
-                      device='cpu')
+                      device='cpu', **serving_contract)
     inspected = RankerService(model_path=str(model_path), scaler_path=str(scaler_path),
-                              manifest_path=str(manifest_path), device='cpu')
+                              manifest_path=str(manifest_path), device='cpu', **serving_contract)
     assert not inspected.production_qualified
     retriever = QdrantV2Retriever(client=object(), ranker=inspected,
                                   heavy_ranker_enabled=True, heavy_ranker_required=True,
                                   allow_unqualified_ranker=False, minimum_eligible_repositories=0)
     assert retriever.ranker is None
     assert not retriever.heavy_ranker_production_qualified
+
+
+def test_ranker_loads_the_exact_model_and_scaler_bytes_that_passed_validation(tmp_path, monkeypatch):
+    model_path = tmp_path / 'heavy_ranker.pt'
+    scaler_path = tmp_path / 'feature_scaler.json'
+    manifest_path = tmp_path / 'model_manifest.json'
+    model_path.write_bytes((ARTIFACTS / 'heavy_ranker.pt').read_bytes())
+    _write_scaler(scaler_path)
+    original_model = torch.load(model_path, map_location='cpu', weights_only=True)
+    original_hashes = {'model_sha256': _sha256(model_path), 'scaler_sha256': _sha256(scaler_path)}
+    _write_production_manifest(manifest_path, model_path=model_path, scaler_path=scaler_path)
+    validate = RankerService._production_manifest_errors
+
+    def replace_after_validation(*args, **kwargs):
+        result = validate(*args, **kwargs)
+        assert result == ([], [])
+        torch.save({name: torch.zeros_like(value) for name, value in original_model.items()}, model_path)
+        scaler_path.write_text(json.dumps({'mean': [7.0] * FEATURE_COUNT, 'scale': [3.0] * FEATURE_COUNT}))
+        return result
+
+    monkeypatch.setattr(RankerService, '_production_manifest_errors', staticmethod(replace_after_validation))
+    service = RankerService(model_path=str(model_path), scaler_path=str(scaler_path),
+                            manifest_path=str(manifest_path), require_production_manifest=True, device='cpu')
+    assert service.ready and service.production_qualified
+    for name, value in service.model.state_dict().items():
+        torch.testing.assert_close(value, original_model[name], rtol=0, atol=0)
+    np.testing.assert_array_equal(service.scaler_mean, np.zeros(FEATURE_COUNT))
+    np.testing.assert_array_equal(service.scaler_scale, np.ones(FEATURE_COUNT))
+    for field, artifact in [('model_sha256', model_path), ('scaler_sha256', scaler_path)]:
+        assert service.loaded_artifact_sha256[field] == original_hashes[field]
+        assert _sha256(artifact) != original_hashes[field]
