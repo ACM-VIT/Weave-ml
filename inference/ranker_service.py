@@ -193,6 +193,15 @@ class RankerService:
                 os.path.dirname(os.path.abspath(model_path)),
                 "model_manifest.json",
             )
+        # Qualify and deserialize the same immutable byte snapshots. Reopening
+        # a path after hashing it could load a different artifact during rollout.
+        model_bytes = Path(model_path).read_bytes() if Path(model_path).is_file() else None
+        scaler_bytes = Path(scaler_path).read_bytes() if Path(scaler_path).is_file() else None
+        artifact_sha256 = {
+            name: hashlib.sha256(contents).hexdigest()
+            for name, contents in (("model_sha256", model_bytes), ("scaler_sha256", scaler_bytes))
+            if contents is not None
+        }
         if os.path.exists(manifest_path):
             manifest_bytes = Path(manifest_path).read_bytes()
             manifest = json.loads(manifest_bytes)
@@ -248,27 +257,27 @@ class RankerService:
             self.compatible_embedding_versions = {
                 version.strip() for version in raw_compatible_versions
             }
-            self.qualification_errors = tuple(
-                self._production_manifest_errors(
-                    manifest,
-                    model_path=Path(model_path),
-                    scaler_path=Path(scaler_path),
-                    expected_embedding_model=expected_embedding_model,
-                    expected_embedding_model_revision=expected_embedding_model_revision,
-                )
+            integrity_errors, quality_errors = self._production_manifest_errors(
+                manifest,
+                model_path=Path(model_path),
+                scaler_path=Path(scaler_path),
+                artifact_sha256=artifact_sha256,
+                expected_embedding_model=expected_embedding_model,
+                expected_embedding_model_revision=expected_embedding_model_revision,
             )
+            self.qualification_errors = tuple(integrity_errors + quality_errors)
             self.qualification_overridden = (
                 manifest.get("production_qualified") is True
                 and manifest.get("qualification_method") == "manual_override"
             )
             self.production_qualified = (
-                self.qualification_overridden or not self.qualification_errors
+                not integrity_errors
+                and (self.qualification_overridden or not quality_errors)
             )
-            if self.qualification_overridden and self.qualification_errors:
+            if self.production_qualified and self.qualification_overridden and quality_errors:
                 logger.warning(
-                    "Heavy ranker is manually production-qualified despite "
-                    "automatic qualification failures: %s",
-                    "; ".join(self.qualification_errors),
+                    "Heavy ranker quality qualification is manually overridden: %s",
+                    "; ".join(quality_errors),
                 )
             logger.info("Model manifest loaded successfully from %s", manifest_path)
 
@@ -295,8 +304,7 @@ class RankerService:
         # Load Model
         self.model = MMoEHeavyRanker(self.input_dim).to(self.device)
         self._model_loaded = False
-        if os.path.exists(model_path):
-            model_bytes = Path(model_path).read_bytes()
+        if model_bytes is not None:
             self.model.load_state_dict(torch.load(io.BytesIO(model_bytes), map_location=self.device, weights_only=True))
             self.loaded_artifact_sha256['model_sha256'] = hashlib.sha256(model_bytes).hexdigest()
             self._model_loaded = True
@@ -306,8 +314,7 @@ class RankerService:
         self.model.eval()
             
         # Load Scaler safely from JSON
-        if os.path.exists(scaler_path):
-            scaler_bytes = Path(scaler_path).read_bytes()
+        if scaler_bytes is not None:
             scaler_params = json.loads(scaler_bytes)
             self.loaded_artifact_sha256['scaler_sha256'] = hashlib.sha256(scaler_bytes).hexdigest()
             self.scaler_mean, self.scaler_scale = load_scaler_document(scaler_params)
@@ -319,29 +326,22 @@ class RankerService:
             raise RuntimeError(f"{scaler_path} not found; refusing to use unscaled features")
 
     @staticmethod
-    def _sha256(path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as artifact:
-            for block in iter(lambda: artifact.read(1024 * 1024), b""):
-                digest.update(block)
-        return digest.hexdigest()
-
-    @classmethod
     def _production_manifest_errors(
-        cls,
         manifest: dict,
         *,
         model_path: Path,
         scaler_path: Path,
+        artifact_sha256: dict[str, str],
         expected_embedding_model: str | None,
         expected_embedding_model_revision: str | None,
-    ) -> list[str]:
-        """Return bounded, non-secret production qualification failures.
+    ) -> tuple[list[str], list[str]]:
+        """Return mandatory integrity errors separately from quality failures.
 
         Loading an artifact and qualifying it for broad production traffic are
         intentionally separate.  Development can inspect older artifacts,
         while serving keeps them disabled until provenance, evaluation, and
-        calibration are all explicit and verifiable.
+        calibration are qualified. Manual qualification may waive only the
+        quality failures; artifact identity and serving compatibility remain mandatory.
         """
         errors: list[str] = []
 
@@ -386,7 +386,7 @@ class RankerService:
                 or any(character not in "0123456789abcdef" for character in normalized)
             ):
                 errors.append("model_sha256 must be a 64-character hex digest")
-            elif not model_path.is_file() or cls._sha256(model_path) != normalized:
+            elif artifact_sha256.get("model_sha256") != normalized:
                 errors.append("model_sha256 does not match the model artifact")
         if scaler_hash is not None:
             normalized = scaler_hash.casefold()
@@ -395,7 +395,7 @@ class RankerService:
                 or any(character not in "0123456789abcdef" for character in normalized)
             ):
                 errors.append("scaler_sha256 must be a 64-character hex digest")
-            elif not scaler_path.is_file() or cls._sha256(scaler_path) != normalized:
+            elif artifact_sha256.get("scaler_sha256") != normalized:
                 errors.append("scaler_sha256 does not match the scaler artifact")
 
         if expected_embedding_model and embedding_model != expected_embedding_model:
@@ -411,6 +411,9 @@ class RankerService:
         weights = manifest.get("value_weights")
         if weights != VALUE_WEIGHTS:
             errors.append("value_weights do not match the serving value function")
+
+        integrity_errors = list(dict.fromkeys(errors))
+        errors = []
 
         training_data = manifest.get("training_data")
         if not isinstance(training_data, dict):
@@ -451,7 +454,7 @@ class RankerService:
             ):
                 errors.append(f"{key} values must be finite numbers")
 
-        return list(dict.fromkeys(errors))
+        return integrity_errors, list(dict.fromkeys(errors))
 
     @property
     def ready(self) -> bool:
