@@ -37,6 +37,13 @@ _SHA256_HEX_LENGTH = 64
 _KEYWORD_CACHE_MAX_ELEMENTS = 64
 _KEYWORD_CACHE_MAX_CHARACTERS = 1024
 
+def _canonical_embedding_model(model: str | None) -> str | None:
+    """Resolve the supported MiniLM shorthand to its exact Hub repository."""
+    if model == "all-MiniLM-L6-v2":
+        return "sentence-transformers/all-MiniLM-L6-v2"
+    return model
+
+
 class MMoEHeavyRanker(nn.Module):
     def __init__(self, input_dim, num_experts=4):
         super().__init__()
@@ -265,6 +272,12 @@ class RankerService:
                 expected_embedding_model=expected_embedding_model,
                 expected_embedding_model_revision=expected_embedding_model_revision,
             )
+            # Keep capture/evaluation provenance aligned with the selected serving
+            # spelling only after verifying that it identifies the same encoder.
+            if (expected_embedding_model
+                    and _canonical_embedding_model(self.embedding_model)
+                    == _canonical_embedding_model(expected_embedding_model)):
+                self.embedding_model = expected_embedding_model
             self.qualification_errors = tuple(integrity_errors + quality_errors)
             self.qualification_overridden = (
                 manifest.get("production_qualified") is True
@@ -398,7 +411,9 @@ class RankerService:
             elif artifact_sha256.get("scaler_sha256") != normalized:
                 errors.append("scaler_sha256 does not match the scaler artifact")
 
-        if expected_embedding_model and embedding_model != expected_embedding_model:
+        if (expected_embedding_model
+                and _canonical_embedding_model(embedding_model)
+                != _canonical_embedding_model(expected_embedding_model)):
             errors.append("embedding_model does not match the serving contract")
         if (
             expected_embedding_model_revision

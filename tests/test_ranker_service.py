@@ -957,6 +957,22 @@ def load_ranker(**kwargs):
                          manifest_path=str(ARTIFACTS / "model_manifest.json"),
                          require_production_manifest=True, **kwargs)
 
+@pytest.mark.parametrize("expected_model,qualified", [
+    ("sentence-transformers/all-MiniLM-L6-v2", True),
+    ("another-owner/all-MiniLM-L6-v2", False),
+])
+def test_strict_ranker_resolves_only_the_supported_encoder_alias(expected_model, qualified):
+    if not qualified:
+        with pytest.raises(RuntimeError, match="embedding_model"):
+            load_ranker(expected_embedding_model=expected_model, device="cpu")
+        return
+    service = load_ranker(expected_embedding_model=expected_model,
+                          expected_embedding_model_revision=EMBEDDING_MODEL_REVISION,
+                          device="cpu")
+    assert service.ready and service.production_qualified
+    assert service.embedding_model == expected_model
+
+
 def test_explicit_cpu_ignores_automatic_cuda_preference(monkeypatch):
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
     service = load_ranker(device="cpu")
