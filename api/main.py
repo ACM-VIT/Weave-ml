@@ -21,7 +21,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from config import constant_time_secret_matches, internal_api_header_name
+from config import internal_api_secret_matches, internal_api_header_name
 from api.metrics import record_api_request
 from utils.observability import authenticated_request_id, operation_for_path, span_scope
 
@@ -408,7 +408,7 @@ async def authenticate_non_health_routes(request: Request, call_next):
         )
     credentials = request.headers.getlist(internal_api_header_name())
     supplied = credentials[0] if len(credentials) == 1 else None
-    if not constant_time_secret_matches(supplied, secret):
+    if not internal_api_secret_matches(supplied):
         return _error_response(
             request,
             status_code=status.HTTP_401_UNAUTHORIZED,

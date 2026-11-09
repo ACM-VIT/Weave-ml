@@ -47,7 +47,7 @@ from api.health import HealthDiagnostics, HealthSettings
 from api.metrics import record_health_dependency, record_recommendation, render_prometheus
 from config import (
     QDRANT_COLLECTION_NAME, QDRANT_VECTOR_NAME,
-    constant_time_secret_matches, internal_api_header_name,
+    internal_api_secret_matches, internal_api_header_name,
 )
 from embedding.corpus_revision import authority_from_environment
 from retrieval.discovery_cache import DiscoveryRevision
@@ -374,7 +374,7 @@ async def require_internal_secret(
     if not expected:
         raise HTTPException(status_code=503, detail="Internal API secret is not configured.")
     supplied = request.headers.get(internal_api_header_name())
-    if not constant_time_secret_matches(supplied, expected):
+    if not internal_api_secret_matches(supplied):
         raise HTTPException(status_code=401, detail="Invalid or missing internal secret.")
 
 

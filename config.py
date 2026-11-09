@@ -31,6 +31,17 @@ def constant_time_secret_matches(supplied: str | None, expected: str) -> bool:
         return False
 
 
+def internal_api_secret_matches(supplied: str | None) -> bool:
+    """Accept current/previous inbound keys while requiring a current key."""
+    current = os.getenv("INTERNAL_API_SECRET")
+    if not current:
+        return False
+    previous = os.getenv("INTERNAL_API_SECRET_PREVIOUS")
+    current_matches = constant_time_secret_matches(supplied, current)
+    previous_matches = constant_time_secret_matches(supplied, previous) if previous else False
+    return current_matches | previous_matches
+
+
 def _positive_int_env(name: str, default: int) -> int:
     raw_value = os.getenv(name)
     if raw_value is None:
