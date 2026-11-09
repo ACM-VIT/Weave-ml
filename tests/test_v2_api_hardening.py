@@ -625,6 +625,26 @@ def test_public_liveness_is_static_and_only_exact_get_bypasses_auth(monkeypatch)
         assert client.request(method, path, follow_redirects=False).status_code == 503
 
 
+def test_internal_secret_rotation_accepts_overlap_and_retires_previous_key(monkeypatch):
+    old, current = "previous-internal-key", "current-internal-key"
+    monkeypatch.setenv("INTERNAL_API_SECRET", current)
+    monkeypatch.setenv("INTERNAL_API_SECRET_PREVIOUS", old)
+    monkeypatch.setenv("INTERNAL_API_HEADER", "x-internal-secret")
+    client = TestClient(api_main.app)
+    path = "/api/v2/health/live"
+    for key in (old, current):
+        assert client.get(path, headers={"x-internal-secret": key}).status_code == 200
+    assert client.get(path, headers={"x-internal-secret": "unrelated"}).status_code == 401
+    assert client.get(path, headers=[("x-internal-secret", old),
+                                     ("x-internal-secret", current)]).status_code == 401
+    monkeypatch.delenv("INTERNAL_API_SECRET_PREVIOUS")
+    assert client.get(path, headers={"x-internal-secret": old}).status_code == 401
+    assert client.get(path, headers={"x-internal-secret": current}).status_code == 200
+    monkeypatch.setenv("INTERNAL_API_SECRET_PREVIOUS", old)
+    monkeypatch.delenv("INTERNAL_API_SECRET")
+    assert client.get(path, headers={"x-internal-secret": old}).status_code == 503
+
+
 def test_feedback_auth_rotation_keeps_rejections_outside_enqueue(monkeypatch, caplog):
     import json
     from api import v2

@@ -827,11 +827,20 @@ def validate_production_config(
         )
 
     secret = validator.raw("INTERNAL_API_SECRET", required=True)
-    if secret is not None and not re.fullmatch(r"[0-9a-f]{64}", secret):
+    if secret is not None and not re.fullmatch(r"[0-9a-f]{64}", env["INTERNAL_API_SECRET"]):
         validator.issue(
             "INTERNAL_API_SECRET",
             "must be exactly 64 lowercase hexadecimal characters",
         )
+
+    previous_secret = env.get("INTERNAL_API_SECRET_PREVIOUS", "")
+    if previous_secret:
+        if not re.fullmatch(r"[0-9a-f]{64}", previous_secret):
+            validator.issue("INTERNAL_API_SECRET_PREVIOUS",
+                            "must be exactly 64 lowercase hexadecimal characters")
+        if previous_secret == secret:
+            validator.issue("INTERNAL_API_SECRET_PREVIOUS",
+                            "must differ from the current secret")
 
     for name in sorted(FORBIDDEN_ONLINE_ENV_VARS):
         if env.get(name, "").strip():
@@ -856,22 +865,17 @@ def load_env_file(path: str | os.PathLike[str]) -> dict[str, str]:
     for line_number, raw_line in enumerate(
         source.read_text(encoding="utf-8").splitlines(), start=1
     ):
-        line = raw_line.strip()
+        # Docker run --env-file keeps value whitespace and quotes literally.
+        line = raw_line.lstrip()
         if not line or line.startswith("#"):
             continue
-        if line.startswith("export "):
-            line = line[7:].lstrip()
         if "=" not in line:
             raise ValueError(f"line {line_number} must use NAME=VALUE syntax")
         name, value = line.split("=", 1)
-        name = name.strip()
         if not _ENV_NAME.fullmatch(name):
             raise ValueError(f"line {line_number} has an invalid variable name")
         if name in values:
             raise ValueError(f"line {line_number} duplicates {name}")
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
         values[name] = value
     return values
 

@@ -10,6 +10,7 @@ import pytest
 
 from scripts.validate_production_config import (
     load_env_file,
+    IMAGE_OWNED_ENV_VARS,
     main,
     validate_production_config,
 )
@@ -234,10 +235,16 @@ def test_secret_error_never_contains_secret() -> None:
 
 
 def test_secret_requires_exact_lowercase_hex_contract() -> None:
-    for invalid in ("a" * 63, "A" * 64, "é" * 64, "g" * 64):
-        environment = valid_production_env()
-        environment["INTERNAL_API_SECRET"] = invalid
-        assert "INTERNAL_API_SECRET" in issue_names(environment)
+    for name in ("INTERNAL_API_SECRET", "INTERNAL_API_SECRET_PREVIOUS"):
+        for invalid in ("a" * 63, "A" * 64, "é" * 64, "g" * 64, "a" * 64 + " "):
+            environment = valid_production_env()
+            environment[name] = invalid
+            assert name in issue_names(environment)
+    environment = valid_production_env()
+    environment["INTERNAL_API_SECRET_PREVIOUS"] = environment["INTERNAL_API_SECRET"]
+    assert "INTERNAL_API_SECRET_PREVIOUS" in issue_names(environment)
+    environment["INTERNAL_API_SECRET_PREVIOUS"] = token_hex(32)
+    assert not issue_names(environment)
 
 
 def test_service_executor_capacity_is_bounded() -> None:
@@ -552,6 +559,21 @@ def test_feedback_thresholds_and_streams_are_consistent() -> None:
         "FEEDBACK_HEALTH_WARN_PENDING",
         "FEEDBACK_HEALTH_MAX_STREAM_LENGTH",
     } <= names
+
+
+def test_env_file_preflight_preserves_literal_secrets(tmp_path, capsys) -> None:
+    environment = valid_production_env()
+    for name in IMAGE_OWNED_ENV_VARS:
+        environment.pop(name, None)
+    environment["INTERNAL_API_SECRET_PREVIOUS"] = environment["INTERNAL_API_SECRET"] + " "
+    path = tmp_path / "ml.env"
+    path.write_text("\n".join(f"{name}={value}" for name, value in environment.items()) + "\n")
+    assert load_env_file(path)["INTERNAL_API_SECRET_PREVIOUS"] == environment["INTERNAL_API_SECRET_PREVIOUS"]
+    assert main(["--env-file", str(path), "--json"]) == 2
+    output = capsys.readouterr().out
+    errors = json.loads(output)["errors"]
+    assert len(errors) == 1 and errors[0].startswith("INTERNAL_API_SECRET_PREVIOUS:")
+    assert environment["INTERNAL_API_SECRET"] not in output
 
 
 def test_env_file_parser_rejects_duplicate_names(tmp_path) -> None:
